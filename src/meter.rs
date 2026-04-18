@@ -287,6 +287,9 @@ pub struct MeterScale {
     pub disp_min: f32,
     /// Display value at the **top** of the bar (hot end, just below clip LED).
     pub disp_max: f32,
+    /// Major ruler ticks in display units (dBFS/VU/K). Populated per-mode so K-20/K-14/K-12
+    /// each get their own Katz-correct layout instead of sharing one "+9 K max" fallback.
+    pub ticks: &'static [f32],
 }
 
 /// Major ticks in **display units** (dBFS, VU, or K).
@@ -296,7 +299,12 @@ pub const TICK_DBF: [f32; 11] = [
 pub const TICK_VU: [f32; 12] = [
     -20.0, -15.0, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0,
 ];
-pub const TICK_K: [f32; 8] = [-40.0, -30.0, -20.0, -10.0, 0.0, 3.0, 6.0, 9.0];
+// Bob Katz K-system meters: 0 K = the mode's reference (e.g. -20 dBFS for K-20), and the top
+// of the ruler is the mode's full-scale headroom (+20 K = 0 dBFS for K-20, +14 K for K-14,
+// +12 K for K-12). Each mode therefore has its own tick layout.
+pub const TICK_K20: [f32; 11] = [-40.0, -30.0, -20.0, -10.0, -5.0, 0.0, 4.0, 8.0, 12.0, 16.0, 20.0];
+pub const TICK_K14: [f32; 10] = [-30.0, -20.0, -14.0, -10.0, -5.0, 0.0, 3.0, 6.0, 10.0, 14.0];
+pub const TICK_K12: [f32; 10] = [-30.0, -20.0, -12.0, -10.0, -5.0, 0.0, 3.0, 6.0, 9.0, 12.0];
 
 impl MeterScale {
     pub fn for_mode(mode: MeterMode) -> Self {
@@ -307,18 +315,35 @@ impl MeterScale {
                 reference_dbfs: cfg.reference_db,
                 disp_min: -20.0,
                 disp_max: 3.0,
+                ticks: &TICK_VU,
             },
-            MeterMode::K20 | MeterMode::K14 | MeterMode::K12 => Self {
+            MeterMode::K20 => Self {
                 kind: MeterScaleKind::K,
                 reference_dbfs: cfg.reference_db,
                 disp_min: -42.0,
-                disp_max: 9.0,
+                disp_max: 20.0,
+                ticks: &TICK_K20,
+            },
+            MeterMode::K14 => Self {
+                kind: MeterScaleKind::K,
+                reference_dbfs: cfg.reference_db,
+                disp_min: -32.0,
+                disp_max: 14.0,
+                ticks: &TICK_K14,
+            },
+            MeterMode::K12 => Self {
+                kind: MeterScaleKind::K,
+                reference_dbfs: cfg.reference_db,
+                disp_min: -32.0,
+                disp_max: 12.0,
+                ticks: &TICK_K12,
             },
             _ => Self {
                 kind: MeterScaleKind::Dbf,
                 reference_dbfs: 0.0,
                 disp_min: MIN_DB,
                 disp_max: MAX_DB,
+                ticks: &TICK_DBF,
             },
         }
     }
@@ -351,11 +376,7 @@ impl MeterScale {
     }
 
     pub fn tick_display_values(&self) -> &'static [f32] {
-        match self.kind {
-            MeterScaleKind::Dbf => &TICK_DBF,
-            MeterScaleKind::Vu => &TICK_VU,
-            MeterScaleKind::K => &TICK_K,
-        }
+        self.ticks
     }
 
     pub fn tick_label(&self, display_val: f32) -> String {

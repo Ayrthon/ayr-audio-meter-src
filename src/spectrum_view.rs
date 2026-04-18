@@ -81,7 +81,7 @@ const GAUSS_SIGMA_LN_REF: f32 = 0.025;
 // Tradeoff: real-signal peaks also shift down by this amount on the ruler (a -3 dB peak reads
 // at -15 dB on the displayed axis). Tune to taste: -10 to -12 dB usually hides the slope while
 // keeping music well inside the visible band.
-const DISPLAY_OFFSET_DB: f32 = -10.0;
+const DISPLAY_OFFSET_DB: f32 = -16.0;
 
 pub const MIN_WIDTH: f32 = 360.0;
 pub const MIN_HEIGHT: f32 = 260.0;
