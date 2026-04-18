@@ -20,7 +20,7 @@ use crate::spectrum::{
 /// The axis is **piecewise-linear**: the top 0 â€¦ âˆ’12 dB band is zoomed (3 dB per major grid) and
 /// the remainder compresses from âˆ’12 dB down to âˆ’90 dB, matching Pro-Q 3â€™s ruler.
 const PRO_Q_ANALYZER_DB_TOP: f32 = 0.0;
-const PRO_Q_ANALYZER_DB_BOT: f32 = -90.0;
+const PRO_Q_ANALYZER_DB_BOT: f32 = -100.0;
 
 /// Normalised vertical break points for the piecewise-linear dB axis.
 /// `t = 0` is the very top of the plot (above 0 dB), `t = 1` is the very bottom (below âˆ’90 dB).
@@ -42,13 +42,13 @@ fn pro_q_t_from_db(db: f32) -> f32 {
         // 0 â€¦ âˆ’12 dB, uniform 3 dB/grid (zoomed EQ band).
         let u = (0.0 - d) / 12.0;
         PRO_Q_T_TOP_PAD + u * (PRO_Q_T_MINUS12 - PRO_Q_T_TOP_PAD)
-    } else if d >= -90.0 {
+    } else if d >= -100.0 {
         // âˆ’12 â€¦ âˆ’90 dB, compressed (all the low-level detail lives here).
-        let u = (-12.0 - d) / 78.0;
+        let u = (-12.0 - d) / 88.0;
         PRO_Q_T_MINUS12 + u * (PRO_Q_T_MINUS90 - PRO_Q_T_MINUS12)
     } else {
         // Below âˆ’90 dB: linear into the bottom padding band, saturating at âˆ’120 dB.
-        let u = ((-90.0 - d) / 30.0).clamp(0.0, 1.0);
+        let u = ((-100.0 - d) / 20.0).clamp(0.0, 1.0);
         PRO_Q_T_MINUS90 + u * (1.0 - PRO_Q_T_MINUS90)
     }
 }
@@ -71,6 +71,16 @@ const HOLD_COL: Color32 = Color32::from_rgba_premultiplied(0xb0, 0xb0, 0xb8, 0x6
 
 /// Mid-band Ïƒ reference in ln(Hz); [`gauss_sigma_ln_for_freq`] widens toward bass, narrows toward treble.
 const GAUSS_SIGMA_LN_REF: f32 = 0.025;
+
+// Purely cosmetic: shift the whole displayed trace down by this many dB. Used to push the
+// DAC/ADC idle-noise slope (which sits around -80 to -85 dB after the pink tilt, since the
+// tilt adds +14 dB at 20 kHz) below the -100 dB axis bottom so it falls off-screen. Does NOT
+// touch analyzer state, peak-hold ballistics, or the raw FFT data - only the pixels.
+//
+// Tradeoff: real-signal peaks also shift down by this amount on the ruler (a -3 dB peak reads
+// at -15 dB on the displayed axis). Tune to taste: -10 to -12 dB usually hides the slope while
+// keeping music well inside the visible band.
+const DISPLAY_OFFSET_DB: f32 = -16.0;
 
 pub const MIN_WIDTH: f32 = 360.0;
 pub const MIN_HEIGHT: f32 = 260.0;
@@ -181,7 +191,7 @@ pub fn show_spectrum(
         (-40.0, "-40"),
         (-50.0, "-50"),
         (-60.0, "-60"),
-        (-90.0, "-90"),
+        (-100.0, "-100"),
     ];
     for &(db, label) in db_ticks {
         let y = y_from_db(db);
@@ -236,7 +246,7 @@ pub fn show_spectrum(
                     floor_p,
                 );
 
-                let comp = spectrum_pro_q_display_db(f);
+                let comp = spectrum_pro_q_display_db(f) + DISPLAY_OFFSET_DB;
                 mags.push((m + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
                 holds.push((h + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
             }
