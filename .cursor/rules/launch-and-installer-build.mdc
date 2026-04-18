@@ -1,0 +1,18 @@
+---
+description: Use the repo target folder for run/installer builds when launching Audio Meter
+alwaysApply: true
+---
+
+# Audio Meter — launch and installer builds
+
+When the user asks to **launch** or **run** Audio Meter (or "my app" in this Rust project context), do **not** run a bare `cargo run` if the environment may set `CARGO_TARGET_DIR` to a sandbox path.
+
+Instead, from the `audio-meter-rs` repo root, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\launch-release.ps1
+```
+
+(with `required_permissions: ["all"]` in the agent shell tool when needed).
+
+That script sets `CARGO_TARGET_DIR` to this repo’s `target\`, runs `cargo build --release`, and starts `target\release\audio-meter-rs.exe` — the **same** binary path that `installer\build-installer.ps1` packages into the Inno installer.

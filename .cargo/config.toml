@@ -1,0 +1,12 @@
+# Default host `x86_64-pc-windows-gnullvm` links libunwind.dll unless the C runtime is static.
+# That DLL is not on a stock Windows install, so end users see "libunwind.dll was not found".
+# Static CRT bundles unwinding into the .exe (larger binary, no extra DLLs).
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Same issue if you build with the MinGW host triple.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# If you use MSVC (`rustup default stable-x86_64-pc-windows-msvc` + VS Build Tools with C++),
+# these flags are not used; the exe depends on the normal VC++ Redistributable instead.
