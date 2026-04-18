@@ -25,9 +25,9 @@ const PRO_Q_ANALYZER_DB_BOT: f32 = -100.0;
 /// Normalised vertical break points for the piecewise-linear dB axis.
 /// `t = 0` is the very top of the plot (above 0 dB), `t = 1` is the very bottom (below âˆ’90 dB).
 /// Pro-Q 3 leaves small gaps above 0 dB and below âˆ’90 dB; we mirror those here.
-const PRO_Q_T_TOP_PAD: f32 = 0.03; // 0 dB sits this fraction below the very top
-const PRO_Q_T_MINUS12: f32 = 0.33; // âˆ’12 dB ~ one third from the top (zoomed EQ band)
-const PRO_Q_T_MINUS90: f32 = 0.95; // âˆ’90 dB ~ 5 % above the very bottom
+const PRO_Q_T_TOP_PAD: f32 = 0.01; // 0 dB sits this fraction below the very top
+const PRO_Q_T_MINUS12: f32 = 0.12; // âˆ’12 dB ~ one third from the top (zoomed EQ band)
+const PRO_Q_T_MINUS90: f32 = 0.96; // âˆ’90 dB ~ 5 % above the very bottom
 
 #[inline]
 fn pro_q_t_from_db(db: f32) -> f32 {
@@ -59,7 +59,8 @@ const F_DISPLAY_MIN_HZ: f32 = 8.0;
 const F_DISPLAY_MAX_CAP_HZ: f32 = 29_000.0;
 
 // Pro-Q 3â€“inspired panel (dark graphite, soft grid, cool fill).
-const BG_COL: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2f);
+const BG_TOP: Color32 = Color32::from_rgb(0x13, 0x0e, 0x15);
+const BG_BOTTOM: Color32 = Color32::from_rgb(0x23, 0x21, 0x23);
 const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(0x12, 0x12, 0x14, 0x07);
 const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(0x12, 0x12, 0x14, 0x07);
 const LABEL_COL: Color32 = Color32::from_rgb(0xb4, 0xb4, 0xbc);
@@ -80,7 +81,7 @@ const GAUSS_SIGMA_LN_REF: f32 = 0.025;
 // Tradeoff: real-signal peaks also shift down by this amount on the ruler (a -3 dB peak reads
 // at -15 dB on the displayed axis). Tune to taste: -10 to -12 dB usually hides the slope while
 // keeping music well inside the visible band.
-const DISPLAY_OFFSET_DB: f32 = -16.0;
+const DISPLAY_OFFSET_DB: f32 = -10.0;
 
 pub const MIN_WIDTH: f32 = 360.0;
 pub const MIN_HEIGHT: f32 = 260.0;
@@ -99,15 +100,30 @@ pub fn show_spectrum(
     // `WINDOW_W_MIN_WITH_GRAPH`), so if the user has somehow shrunk
     // beyond the recommended width we still render inside our bounds
     // instead of painting past the right edge.
-    let desired = ui.available_size();
+    // Leave a gap between the analyzer's right edge and the window/content edge so the panel
+    // doesn't butt up against whatever's next to it.
+    const RIGHT_MARGIN: f32 = 16.0;
+    let mut desired = ui.available_size();
+    desired.x = (desired.x - RIGHT_MARGIN).max(MIN_WIDTH);
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
 
-    painter.rect_filled(rect, 6.0, BG_COL);
+    // Vertical gradient background: BG_TOP at the top fading to BG_BOTTOM at the bottom.
+    // Drawn as a 4-vertex mesh (egui's Shape::Rect only supports a single fill color); rounded
+    // corners dropped to 0 so the gradient's square edges match the fill cleanly.
+    {
+        let mut mesh = Mesh::default();
+        mesh.vertices.push(Vertex { pos: rect.left_top(),     uv: WHITE_UV, color: BG_TOP });
+        mesh.vertices.push(Vertex { pos: rect.right_top(),    uv: WHITE_UV, color: BG_TOP });
+        mesh.vertices.push(Vertex { pos: rect.right_bottom(), uv: WHITE_UV, color: BG_BOTTOM });
+        mesh.vertices.push(Vertex { pos: rect.left_bottom(),  uv: WHITE_UV, color: BG_BOTTOM });
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(Shape::mesh(mesh));
+    }
 
     // Inner plot area: compact left (freq labels below), right gutter for dB ticks like Pro-Q.
     let left_pad = 14.0;
-    let right_pad = 36.0;
+    let right_pad = 10.0;
     let top_pad = 10.0;
     let bottom_pad = 22.0;
     let plot = Rect::from_min_max(
@@ -179,36 +195,18 @@ pub fn show_spectrum(
             LABEL_COL,
         );
     }
-    // dB grid â€” Pro-Q 3 ruler: zoomed Â±12 dB EQ band at 3 dB/grid, then compressed below.
-    // Negative values are drawn without an explicit sign; positive values keep the leading '+'.
-    let db_ticks: &[(f32, &str)] = &[
-        (0.0, "0"),
-        (-3.0, "-3"),
-        (-6.0, "-6"),
-        (-9.0, "-9"),
-        (-12.0, "-12"),
-        (-30.0, "-30"),
-        (-40.0, "-40"),
-        (-50.0, "-50"),
-        (-60.0, "-60"),
-        (-100.0, "-100"),
-    ];
-    for &(db, label) in db_ticks {
+    // Horizontal grid lines at these dB breakpoints (labels intentionally omitted: the ruler was
+    // cosmetic - peak meters on the side are the source of truth for real signal level, and after
+    // the pink tilt + DISPLAY_OFFSET_DB the numbers here never mapped back to raw dB anyway).
+    let db_ticks: &[f32] = &[0.0, -3.0, -6.0, -9.0, -12.0, -30.0, -40.0, -50.0, -60.0, -100.0];
+    for &db in db_ticks {
         let y = y_from_db(db);
         if y < plot.top() - 0.5 || y > plot.bottom() + 0.5 {
             continue;
         }
-        let stroke = Stroke::new(1.0, GRID_MAJOR);
         painter.line_segment(
             [pos2(plot.left(), y), pos2(plot.right(), y)],
-            stroke,
-        );
-        painter.text(
-            pos2(plot.right() + 3.0, y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(10.0),
-            LABEL_COL,
+            Stroke::new(1.0, GRID_MAJOR),
         );
     }
 
