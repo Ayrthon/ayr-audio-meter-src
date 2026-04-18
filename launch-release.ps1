@@ -18,4 +18,4 @@ if (-not (Test-Path $Exe)) {
 }
 
 Write-Host ('==> Starting ' + $Exe) -ForegroundColor Cyan
-Start-Process -FilePath $Exe
+Start-Process -FilePath $Exe -WorkingDirectory $Root -WindowStyle Normal
