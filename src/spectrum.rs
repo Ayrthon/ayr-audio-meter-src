@@ -3,12 +3,12 @@
 //! * The audio thread writes mono-summed samples into a shared ring
 //!   buffer (`SpectrumRing`) — cheap, allocation-free, no analysis.
 //! * The UI thread runs the FFT (`SpectrumAnalyzer`) from the latest
-//!   N samples each frame, applies a Hann window, then **FabFilter-style**
-//!   **power-domain** smoothing (EMA of \|X\|² per bin) before dB conversion.
+//!   N samples each frame, applies a Hann window, then **power-domain** EMA of \|X\|² **per bin**
+//!   with **frequency-dependent τ** (slower in the bass for smooth motion, faster in the treble
+//!   for sharper peaks).
 //!
-//! FabFilter Pro-Q’s analyzer is proprietary; this stack (Hann STFT + power EMA +
-//! Gaussian constant-Q in the painter) is a **close functional analogue** — not a
-//! byte-identical clone.
+//! FabFilter Pro-Q’s analyzer is proprietary; this stack (Hann STFT + split-band power EMA +
+//! Gaussian width in the painter) is a **close functional analogue** — not a byte-identical clone.
 
 use std::sync::Arc;
 
@@ -18,14 +18,38 @@ use realfft::num_complex::Complex;
 
 /// FFT size — good balance of low-end resolution (48k / 4096 ≈ 11.7 Hz)
 /// and CPU cost.  Power of two for realfft.
-pub const FFT_SIZE: usize = 4096;
+/// FFT length (samples). At 48 kHz this is a 170 ms window, giving 5.86 Hz bin resolution —
+/// enough to distinguish ~6 Hz infrasonic rumble, the 20 Hz fundamental, and 60 Hz mains hum
+/// in separate bins. 4096 (85 ms / 11.7 Hz bins) was too coarse below 20 Hz; 16384 (341 ms)
+/// would start to visibly smear percussive transients because the FFT window integrates more
+/// history. 8192 is the sweet spot for full-range music.
+pub const FFT_SIZE: usize = 8192;
 
 /// Ring length — 2× FFT size so the UI thread can always pull a
 /// contiguous tail regardless of where the audio thread last wrote.
 pub const RING_LEN: usize = FFT_SIZE * 2;
 
-/// Power EMA time constant (~seconds). Higher = smoother, more “Pro-Q” silk, slower transients.
-const POWER_EMA_TAU_SEC: f32 = 0.14;
+/// Power EMA τ (seconds) at low FFT bins — smooth, slow crossovers.
+const POWER_EMA_TAU_BASS_SEC: f32 = 0.22;
+/// Power EMA τ (seconds) at high bins — snappier, more “teeth” on transients.
+const POWER_EMA_TAU_TREBLE_SEC: f32 = 0.05;
+const POWER_EMA_BLEND_F_LO: f32 = 60.0;
+const POWER_EMA_BLEND_F_HI: f32 = 5_000.0;
+
+#[inline]
+fn power_ema_tau_hz(f_hz: f32) -> f32 {
+    let f = f_hz.max(1.0);
+    if f <= POWER_EMA_BLEND_F_LO {
+        return POWER_EMA_TAU_BASS_SEC;
+    }
+    if f >= POWER_EMA_BLEND_F_HI {
+        return POWER_EMA_TAU_TREBLE_SEC;
+    }
+    let u = (f / POWER_EMA_BLEND_F_LO).ln() / (POWER_EMA_BLEND_F_HI / POWER_EMA_BLEND_F_LO).ln();
+    let u = u.clamp(0.0, 1.0);
+    let t = u * u * (3.0 - 2.0 * u);
+    POWER_EMA_TAU_BASS_SEC + (POWER_EMA_TAU_TREBLE_SEC - POWER_EMA_TAU_BASS_SEC) * t
+}
 
 pub struct SpectrumRing {
     pub buf: Vec<f32>,
@@ -201,7 +225,8 @@ impl SpectrumAnalyzer {
             return;
         }
 
-        let beta = 1.0 - (-dt / POWER_EMA_TAU_SEC).exp();
+        let sr = self.sample_rate.max(1.0);
+        let bin_hz = sr / FFT_SIZE as f32;
         let norm = 2.0 / (FFT_SIZE as f32 * self.window_gain.max(1e-6));
 
         for (i, c) in self.output.iter().enumerate() {
@@ -211,6 +236,8 @@ impl SpectrumAnalyzer {
             if i == 0 {
                 self.bin_power[i] = floor_p;
             } else {
+                let tau = power_ema_tau_hz(i as f32 * bin_hz);
+                let beta = 1.0 - (-dt / tau).exp();
                 self.bin_power[i] = self.bin_power[i] * (1.0 - beta) + p_inst * beta;
             }
 
@@ -222,8 +249,8 @@ impl SpectrumAnalyzer {
             if db >= hold {
                 self.peak_hold_db[i] = db;
                 self.peak_hold_set_at[i] = now;
-            } else if (now - self.peak_hold_set_at[i]) as f32 > 0.55 {
-                self.peak_hold_db[i] = (hold - 38.0 * dt).max(db);
+            } else if (now - self.peak_hold_set_at[i]) as f32 > 1.50 {
+                self.peak_hold_db[i] = (hold - 10.0 * dt).max(db);
             }
         }
     }
@@ -236,10 +263,13 @@ pub const SPECTRUM_FLOOR_DB: f32 = -120.0;
 /// Applied only in the painter so analyzer state stays in calibrated dBFS.
 #[inline]
 pub fn spectrum_pro_q_display_db(f_hz: f32) -> f32 {
-    if !f_hz.is_finite() || f_hz < 20.0 {
+    if !f_hz.is_finite() || f_hz <= 0.0 {
         return 0.0;
     }
     // ~3 dB/oct around 500 Hz: pulls sub-bass / bass down vs mids without nuking fundamentals.
+    // The tilt runs continuously all the way down to sub-20 Hz and is clamped at −18 dB, so the
+    // transition through 20 Hz is smooth instead of stepping from 0 dB → −13.7 dB (which used to
+    // manifest as a "wall" right at the 20 Hz ruler).
     const DB_PER_OCT: f32 = 2.95;
     const REF_HZ: f32 = 500.0;
     (DB_PER_OCT * (f_hz / REF_HZ).log2()).clamp(-18.0, 14.0)
