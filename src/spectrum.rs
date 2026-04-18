@@ -3,12 +3,19 @@
 //! * The audio thread writes mono-summed samples into a shared ring
 //!   buffer (`SpectrumRing`) — cheap, allocation-free, no analysis.
 //! * The UI thread runs the FFT (`SpectrumAnalyzer`) from the latest
-//!   N samples each frame, applies a Hann window, then **power-domain** EMA of \|X\|² **per bin**
-//!   with **frequency-dependent τ** (slower in the bass for smooth motion, faster in the treble
-//!   for sharper peaks).
+//!   `FFT_SIZE` samples each frame, applies a Hann window, computes \|X[k]\|²
+//!   per bin, then **aggregates bins into 251 log-spaced buckets by
+//!   mean-square** (ZLEqualizer `kAnalyzerPointNum`). Each bucket dB then
+//!   runs through a **fall-only EMA** (attack instant, release exponential)
+//!   with a **refresh-rate-normalized decay factor** (`0.95^(23.4375 / fps)`,
+//!   ≈ 0.83 s τ at 60 fps, uniform across all frequencies). Peak-hold is
+//!   maintained per bucket for the painter.
 //!
-//! FabFilter Pro-Q’s analyzer is proprietary; this stack (Hann STFT + split-band power EMA +
-//! Gaussian width in the painter) is a **close functional analogue** — not a byte-identical clone.
+//! This is a cherry-pick of ZLEqualizer's three most accurate ideas
+//! (bucket aggregation, fall-only dB EMA, refresh-normalized decay) grafted
+//! onto our existing FFT size, calibration, pink tilt, and peak-hold.
+//! FabFilter Pro-Q's analyzer is proprietary; this stack is a **close
+//! functional analogue**, not a byte-identical clone.
 
 use std::sync::Arc;
 
@@ -16,40 +23,35 @@ use parking_lot::RwLock;
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 
-/// FFT size — good balance of low-end resolution (48k / 4096 ≈ 11.7 Hz)
-/// and CPU cost.  Power of two for realfft.
 /// FFT length (samples). At 48 kHz this is a 170 ms window, giving 5.86 Hz bin resolution —
 /// enough to distinguish ~6 Hz infrasonic rumble, the 20 Hz fundamental, and 60 Hz mains hum
-/// in separate bins. 4096 (85 ms / 11.7 Hz bins) was too coarse below 20 Hz; 16384 (341 ms)
-/// would start to visibly smear percussive transients because the FFT window integrates more
-/// history. 8192 is the sweet spot for full-range music.
+/// in separate bins. 4096 (85 ms / 11.7 Hz bins) is too coarse below 20 Hz; 16384 (341 ms)
+/// would start to visibly smear percussive transients. 8192 is the sweet spot for full-range
+/// music.
 pub const FFT_SIZE: usize = 8192;
 
 /// Ring length — 2× FFT size so the UI thread can always pull a
 /// contiguous tail regardless of where the audio thread last wrote.
 pub const RING_LEN: usize = FFT_SIZE * 2;
 
-/// Power EMA τ (seconds) at low FFT bins — smooth, slow crossovers.
-const POWER_EMA_TAU_BASS_SEC: f32 = 0.22;
-/// Power EMA τ (seconds) at high bins — snappier, more “teeth” on transients.
-const POWER_EMA_TAU_TREBLE_SEC: f32 = 0.05;
-const POWER_EMA_BLEND_F_LO: f32 = 60.0;
-const POWER_EMA_BLEND_F_HI: f32 = 5_000.0;
+/// Number of log-spaced display buckets aggregated from FFT bins. Matches ZLEqualizer's
+/// `kAnalyzerPointNum = 251`: dense enough to look smooth on a log x-axis, sparse enough
+/// that each bucket covers several bins in the mids/highs for proper energy averaging.
+pub const POINT_NUM: usize = 251;
 
-#[inline]
-fn power_ema_tau_hz(f_hz: f32) -> f32 {
-    let f = f_hz.max(1.0);
-    if f <= POWER_EMA_BLEND_F_LO {
-        return POWER_EMA_TAU_BASS_SEC;
-    }
-    if f >= POWER_EMA_BLEND_F_HI {
-        return POWER_EMA_TAU_TREBLE_SEC;
-    }
-    let u = (f / POWER_EMA_BLEND_F_LO).ln() / (POWER_EMA_BLEND_F_HI / POWER_EMA_BLEND_F_LO).ln();
-    let u = u.clamp(0.0, 1.0);
-    let t = u * u * (3.0 - 2.0 * u);
-    POWER_EMA_TAU_BASS_SEC + (POWER_EMA_TAU_TREBLE_SEC - POWER_EMA_TAU_BASS_SEC) * t
-}
+/// Lower limit of the bucket grid (Hz). Matches ZL; the display can extend below this.
+pub const MIN_FREQ: f32 = 10.0;
+
+/// Fall-only EMA decay factor at the reference step rate, from ZL's
+/// `decay_rates_` default of 0.95 evaluated at 23.4375 Hz (≈ one FFT hop / 2048 at 48 kHz).
+/// At other refresh rates we rescale: `actual_decay = DECAY_REF ^ (DECAY_REF_HZ / refresh_hz)`.
+/// This keeps the perceived release time constant regardless of UI frame rate.
+const DECAY_REF: f32 = 0.95;
+const DECAY_REF_HZ: f32 = 23.4375;
+const REFRESH_HZ_DEFAULT: f32 = 60.0;
+
+/// Noise floor drawn on the spectrum — below this the line flattens.
+pub const SPECTRUM_FLOOR_DB: f32 = -120.0;
 
 pub struct SpectrumRing {
     pub buf: Vec<f32>,
@@ -110,7 +112,52 @@ pub fn configure(shared: &SharedSpectrum, sample_rate: u32, active: bool) {
     }
 }
 
-/// Smoothed, peak-held FFT magnitudes ready for display.
+/// Build the log-spaced bucket table. Walks a geometric frequency ladder from `MIN_FREQ` to
+/// ~Nyquist, forcing at least one FFT bin per bucket. Matches ZL's `prepareAkima` layout.
+///
+/// Returns `(bin_start[j], bin_end_exclusive[j], bucket_center_freq_hz[j])`.
+fn build_buckets(sample_rate: f32, fft_size: usize) -> (Vec<usize>, Vec<usize>, Vec<f32>) {
+    let max_freq = (sample_rate * 0.5 - 0.1).max(100.0);
+    let min_freq = MIN_FREQ.min(max_freq * 0.5).max(1.0);
+    let freq_delta = sample_rate / fft_size as f32;
+    let freq_mul = (max_freq / min_freq).powf(2.0 / POINT_NUM as f32);
+    let limit = fft_size / 2;
+
+    let mut starts: Vec<usize> = Vec::with_capacity(POINT_NUM / 2 + 4);
+    let mut ends: Vec<usize> = Vec::with_capacity(POINT_NUM / 2 + 4);
+
+    let mut freq = min_freq * freq_mul.sqrt();
+    starts.push(0);
+    ends.push(((freq / freq_delta).round() as usize).max(1));
+
+    for _ in 0..(POINT_NUM / 2 + 1) {
+        freq *= freq_mul;
+        let idx = ((freq / freq_delta).round() as usize).min(limit);
+        let last_end = *ends.last().unwrap();
+        if idx > last_end {
+            starts.push(last_end);
+            ends.push(idx);
+        }
+    }
+
+    if freq > sample_rate * 0.5 {
+        let last_start = *starts.last().unwrap();
+        let last_end = *ends.last().unwrap();
+        let half = (last_end - last_start) / 2;
+        starts.push(limit + 1 - half);
+        ends.push(limit + 1);
+    }
+
+    let freqs: Vec<f32> = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(&a, &b)| (a + b).saturating_sub(1) as f32 * 0.5 * freq_delta)
+        .collect();
+
+    (starts, ends, freqs)
+}
+
+/// Smoothed, peak-held FFT bucket magnitudes ready for display.
 pub struct SpectrumAnalyzer {
     fft: Arc<dyn realfft::RealToComplex<f32>>,
     window: Vec<f32>,
@@ -118,13 +165,25 @@ pub struct SpectrumAnalyzer {
     input: Vec<f32>,
     scratch: Vec<Complex<f32>>,
     output: Vec<Complex<f32>>,
-    /// EMA of \|X[k]\|² (linear power) — used by the painter for Gaussian constant-Q smoothing.
-    pub bin_power: Vec<f32>,
-    pub magnitudes_db: Vec<f32>,
+    /// Scratch: calibrated per-bin power (|X[k]|² × amplitude-normalisation²).
+    ms_buffer: Vec<f32>,
+
+    /// Inclusive-start / exclusive-end FFT bin range for each log bucket.
+    bucket_starts: Vec<usize>,
+    bucket_ends: Vec<usize>,
+
+    /// Geometric midpoint frequency of each bucket (Hz).
+    pub bucket_freqs: Vec<f32>,
+    /// Fall-only EMA dB per bucket (calibrated dBFS, pre-tilt). Attack is instant, release
+    /// uses the refresh-rate-normalized decay factor.
+    pub bucket_dbs: Vec<f32>,
+    /// Peak-hold dB per bucket with dwell + linear-dB release.
     pub peak_hold_db: Vec<f32>,
     pub peak_hold_set_at: Vec<f64>,
+
     last_tick: f64,
     pub sample_rate: f32,
+    prepared_sr: f32,
 }
 
 impl SpectrumAnalyzer {
@@ -141,8 +200,10 @@ impl SpectrumAnalyzer {
         // scale sine reads near 0 dBFS.
         let window_gain = window.iter().copied().sum::<f32>() / FFT_SIZE as f32;
 
-        let bins = output.len();
-        let floor_p = 10_f32.powf(SPECTRUM_FLOOR_DB / 10.0);
+        let sr = 48_000.0_f32;
+        let (starts, ends, freqs) = build_buckets(sr, FFT_SIZE);
+        let nb = freqs.len();
+
         Self {
             fft,
             window,
@@ -150,27 +211,23 @@ impl SpectrumAnalyzer {
             input,
             scratch,
             output,
-            bin_power: vec![floor_p; bins],
-            magnitudes_db: vec![SPECTRUM_FLOOR_DB; bins],
-            peak_hold_db: vec![SPECTRUM_FLOOR_DB; bins],
-            peak_hold_set_at: vec![0.0; bins],
+            ms_buffer: vec![0.0; FFT_SIZE / 2 + 1],
+            bucket_starts: starts,
+            bucket_ends: ends,
+            bucket_freqs: freqs,
+            bucket_dbs: vec![SPECTRUM_FLOOR_DB; nb],
+            peak_hold_db: vec![SPECTRUM_FLOOR_DB; nb],
+            peak_hold_set_at: vec![0.0; nb],
             last_tick: 0.0,
-            sample_rate: 48_000.0,
+            sample_rate: sr,
+            prepared_sr: sr,
         }
     }
 
-    pub fn bin_count(&self) -> usize {
-        self.magnitudes_db.len()
-    }
-
-    pub fn bin_hz(&self, bin: usize) -> f32 {
-        self.sample_rate * bin as f32 / FFT_SIZE as f32
-    }
-
-    /// Pull the latest FFT_SIZE samples from the ring, apply the window,
-    /// FFT, update power EMA, magnitudes (dB), and peak-hold.
+    /// Pull the latest `FFT_SIZE` samples from the ring, apply the window, FFT, aggregate bins
+    /// into log buckets, then apply the fall-only dB EMA and peak-hold per bucket.
     pub fn process(&mut self, shared: &SharedSpectrum, now: f64) {
-        let (active, write, sample_rate) = {
+        let (active, _write, sample_rate) = {
             let ring = shared.read();
             self.sample_rate = ring.sample_rate;
             let start = (ring.write + RING_LEN - FFT_SIZE) % RING_LEN;
@@ -184,36 +241,49 @@ impl SpectrumAnalyzer {
             }
             (ring.active, ring.write, ring.sample_rate)
         };
-        let _ = write;
         self.sample_rate = sample_rate;
 
+        if (sample_rate - self.prepared_sr).abs() > 1.0 {
+            let (s, e, f) = build_buckets(sample_rate, FFT_SIZE);
+            let nb = f.len();
+            self.bucket_starts = s;
+            self.bucket_ends = e;
+            self.bucket_freqs = f;
+            self.bucket_dbs.resize(nb, SPECTRUM_FLOOR_DB);
+            self.peak_hold_db.resize(nb, SPECTRUM_FLOOR_DB);
+            self.peak_hold_set_at.resize(nb, 0.0);
+            self.prepared_sr = sample_rate;
+        }
+
         let dt = if self.last_tick <= 0.0 {
-            0.016
+            1.0 / REFRESH_HZ_DEFAULT as f64
         } else {
-            (now - self.last_tick).clamp(0.0, 0.25) as f32
+            (now - self.last_tick).clamp(0.0, 0.25)
         };
         self.last_tick = now;
 
-        let bins = self.magnitudes_db.len();
-        let floor_p = 10_f32.powf(SPECTRUM_FLOOR_DB / 10.0);
+        // Refresh-normalized decay factor: `0.95 ^ (23.4375 / refresh)`. ZL formulation.
+        let refresh = (1.0 / dt.max(1e-6)) as f32;
+        let decay = DECAY_REF.powf(DECAY_REF_HZ / refresh.max(1.0));
+
+        let nb = self.bucket_dbs.len();
 
         if !active {
-            let decay = (-14.0_f32 * dt).exp();
-            for i in 0..bins {
-                self.bin_power[i] = (self.bin_power[i] * decay).max(floor_p);
-                let d = 10.0 * self.bin_power[i].max(floor_p).log10();
-                self.magnitudes_db[i] = d.clamp(SPECTRUM_FLOOR_DB, 12.0);
+            // Fast collapse to floor when capture is stopped — matches the pre-bucket
+            // behaviour which used an exp(-14·dt) on linear power (≈ 60 dB/s in dB terms).
+            let fast_rel_db = (60.0 * dt as f32).max(0.0);
+            for d in &mut self.bucket_dbs {
+                *d = (*d - fast_rel_db).max(SPECTRUM_FLOOR_DB);
             }
-            let release_db_per_sec = 120.0_f32;
-            for v in &mut self.peak_hold_db {
-                *v = (*v - release_db_per_sec * dt).max(SPECTRUM_FLOOR_DB);
-            }
-            for (i, v) in self.peak_hold_db.iter_mut().enumerate() {
-                *v = (*v).min(self.magnitudes_db[i]);
+            let peak_rel_db = (120.0 * dt as f32).max(0.0);
+            for j in 0..nb {
+                let v = (self.peak_hold_db[j] - peak_rel_db).max(SPECTRUM_FLOOR_DB);
+                self.peak_hold_db[j] = v.min(self.bucket_dbs[j]);
             }
             return;
         }
 
+        // Window (natural Hann amplitude, not pre-scaled — calibration folded into `p_scale`).
         for (x, w) in self.input.iter_mut().zip(self.window.iter()) {
             *x *= *w;
         }
@@ -225,41 +295,56 @@ impl SpectrumAnalyzer {
             return;
         }
 
-        let sr = self.sample_rate.max(1.0);
-        let bin_hz = sr / FFT_SIZE as f32;
+        // Amplitude calibration: a full-scale sine reads ≈ 0 dBFS through the peak bin.
+        // `norm = 2 / (N · window_gain)` on the magnitude; we need its square for power.
         let norm = 2.0 / (FFT_SIZE as f32 * self.window_gain.max(1e-6));
+        let p_scale = norm * norm;
 
         for (i, c) in self.output.iter().enumerate() {
-            let mag = (c.re * c.re + c.im * c.im).sqrt() * norm;
-            let p_inst = mag * mag;
+            self.ms_buffer[i] = (c.re * c.re + c.im * c.im) * p_scale;
+        }
+        // Kill DC so it never contaminates the 10 Hz bucket.
+        if !self.ms_buffer.is_empty() {
+            self.ms_buffer[0] = 0.0;
+        }
 
-            if i == 0 {
-                self.bin_power[i] = floor_p;
-            } else {
-                let tau = power_ema_tau_hz(i as f32 * bin_hz);
-                let beta = 1.0 - (-dt / tau).exp();
-                self.bin_power[i] = self.bin_power[i] * (1.0 - beta) + p_inst * beta;
+        let bins = self.ms_buffer.len();
+        let floor_ln = 1e-30_f32;
+        for j in 0..nb {
+            let s = self.bucket_starts[j].min(bins);
+            let e = self.bucket_ends[j].min(bins);
+            if e <= s {
+                continue;
             }
+            let mut sum = 0.0_f32;
+            for i in s..e {
+                sum += self.ms_buffer[i];
+            }
+            let ms = sum / (e - s) as f32;
+            let cur_db = 10.0 * ms.max(floor_ln).log10();
 
-            let d = 10.0 * self.bin_power[i].max(floor_p).log10();
-            let db = d.clamp(SPECTRUM_FLOOR_DB, 12.0);
-            self.magnitudes_db[i] = db;
+            // Fall-only EMA in dB: attack instant, release exponential.
+            let new_db = if cur_db < self.bucket_dbs[j] {
+                self.bucket_dbs[j] * decay + cur_db * (1.0 - decay)
+            } else {
+                cur_db
+            };
+            self.bucket_dbs[j] = new_db.clamp(SPECTRUM_FLOOR_DB, 12.0);
 
-            let hold = self.peak_hold_db[i];
-            if db >= hold {
-                self.peak_hold_db[i] = db;
-                self.peak_hold_set_at[i] = now;
-            } else if (now - self.peak_hold_set_at[i]) as f32 > 1.50 {
-                self.peak_hold_db[i] = (hold - 10.0 * dt).max(db);
+            // Peak-hold: 1.50 s dwell, then 10 dB/s linear release.
+            let b = self.bucket_dbs[j];
+            let hold = self.peak_hold_db[j];
+            if b >= hold {
+                self.peak_hold_db[j] = b;
+                self.peak_hold_set_at[j] = now;
+            } else if (now - self.peak_hold_set_at[j]) as f32 > 1.50 {
+                self.peak_hold_db[j] = (hold - 10.0 * dt as f32).max(b);
             }
         }
     }
 }
 
-/// Noise floor drawn on the spectrum — below this the line flattens.
-pub const SPECTRUM_FLOOR_DB: f32 = -120.0;
-
-/// Display compensation toward FabFilter-style “flattened” RTA (pink reference + mild lows trim).
+/// Display compensation toward FabFilter-style "flattened" RTA (pink reference + mild lows trim).
 /// Applied only in the painter so analyzer state stays in calibrated dBFS.
 #[inline]
 pub fn spectrum_pro_q_display_db(f_hz: f32) -> f32 {

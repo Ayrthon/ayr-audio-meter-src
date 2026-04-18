@@ -1,10 +1,11 @@
-//! Spectrum analyzer â€” rulers aligned with **FabFilter Pro-Q 3**â€™s EQ spectrum column (inset
-//! 20 Hzâ€“20 kHz, majors 20â€¦20k, 0â€¦âˆ’120 dB grid). The trace uses **Gaussian** smoothing in log-frequency
-//! on **linear power** with **frequency-dependent width** (smooth bass, increasingly defined / spikey
-//! treble) plus an Hz-based blend toward raw columns after horizontal smooth. Pro-Qâ€™s exact DSP is
-//! proprietary; this is a deliberate **approximation**, not a licensed clone.
+//! Spectrum analyzer — rulers aligned with **FabFilter Pro-Q 3**'s EQ spectrum column
+//! (inset 20 Hz–20 kHz, majors 20…20k, piecewise 0…−100 dB grid). The trace reads from the
+//! analyzer's 251 log-spaced buckets (ZL-style mean-square aggregation + fall-only dB EMA),
+//! then display-side applies pink tilt, vertical offset, and a single horizontal smoothing
+//! pass. Pro-Q's exact DSP is proprietary; this is a deliberate **approximation**, not a
+//! licensed clone.
 //!
-//! Includes gradient fill, main line, peak-hold outline, and decade frequency grid.
+//! Includes gradient fill, main line, and decade frequency grid.
 
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
@@ -15,50 +16,47 @@ use crate::spectrum::{
     SharedSpectrum, SpectrumAnalyzer, SPECTRUM_FLOOR_DB, spectrum_pro_q_display_db,
 };
 
-/// Pro-Q 3 analyzer vertical: 0 dB (top) â€¦ âˆ’90 dB (bottom).
-///
-/// The axis is **piecewise-linear**: the top 0 â€¦ âˆ’12 dB band is zoomed (3 dB per major grid) and
-/// the remainder compresses from âˆ’12 dB down to âˆ’90 dB, matching Pro-Q 3â€™s ruler.
+/// Pro-Q 3 analyzer vertical: 0 dB (top) … −100 dB (bottom), piecewise-linear.
 const PRO_Q_ANALYZER_DB_TOP: f32 = 0.0;
 const PRO_Q_ANALYZER_DB_BOT: f32 = -100.0;
 
 /// Normalised vertical break points for the piecewise-linear dB axis.
-/// `t = 0` is the very top of the plot (above 0 dB), `t = 1` is the very bottom (below âˆ’90 dB).
-/// Pro-Q 3 leaves small gaps above 0 dB and below âˆ’90 dB; we mirror those here.
+/// `t = 0` is the very top of the plot (above 0 dB), `t = 1` is the very bottom (below −90 dB).
+/// Pro-Q 3 leaves small gaps above 0 dB and below −90 dB; we mirror those here.
 const PRO_Q_T_TOP_PAD: f32 = 0.01; // 0 dB sits this fraction below the very top
-const PRO_Q_T_MINUS12: f32 = 0.12; // âˆ’12 dB ~ one third from the top (zoomed EQ band)
-const PRO_Q_T_MINUS90: f32 = 0.96; // âˆ’90 dB ~ 5 % above the very bottom
+const PRO_Q_T_MINUS12: f32 = 0.12; // −12 dB ~ one third from the top (zoomed EQ band)
+const PRO_Q_T_MINUS90: f32 = 0.96; // −90 dB ~ 5 % above the very bottom
 
 #[inline]
 fn pro_q_t_from_db(db: f32) -> f32 {
     // Clamp against a slightly wider range than the labelled ticks so the trace can extend into
-    // the top and bottom padding bands for Pro-Qâ€™s tapered look past 0 dB / âˆ’90 dB.
+    // the top and bottom padding bands for Pro-Q's tapered look past 0 dB / −90 dB.
     let d = db.clamp(-120.0, 6.0);
     if d >= 0.0 {
         // Above 0 dB: linear into the top padding band (saturates at +6 dB = t=0).
         let u = ((6.0 - d) / 6.0).clamp(0.0, 1.0);
         u * PRO_Q_T_TOP_PAD
     } else if d >= -12.0 {
-        // 0 â€¦ âˆ’12 dB, uniform 3 dB/grid (zoomed EQ band).
+        // 0 … −12 dB, uniform 3 dB/grid (zoomed EQ band).
         let u = (0.0 - d) / 12.0;
         PRO_Q_T_TOP_PAD + u * (PRO_Q_T_MINUS12 - PRO_Q_T_TOP_PAD)
     } else if d >= -100.0 {
-        // âˆ’12 â€¦ âˆ’90 dB, compressed (all the low-level detail lives here).
+        // −12 … −90 dB, compressed (all the low-level detail lives here).
         let u = (-12.0 - d) / 88.0;
         PRO_Q_T_MINUS12 + u * (PRO_Q_T_MINUS90 - PRO_Q_T_MINUS12)
     } else {
-        // Below âˆ’90 dB: linear into the bottom padding band, saturating at âˆ’120 dB.
+        // Below −90 dB: linear into the bottom padding band, saturating at −120 dB.
         let u = ((-100.0 - d) / 20.0).clamp(0.0, 1.0);
         PRO_Q_T_MINUS90 + u * (1.0 - PRO_Q_T_MINUS90)
     }
 }
 
-/// Log-frequency plot limits. Extended down to 8 Hz so the 10 Hz ruler tick is clearly inset â€”
+/// Log-frequency plot limits. Extended down to 8 Hz so the 10 Hz ruler tick is clearly inset —
 /// bin 1 at 48 kHz / 8192 samples sits at 5.86 Hz, so everything above 8 Hz is real FFT data.
 const F_DISPLAY_MIN_HZ: f32 = 8.0;
 const F_DISPLAY_MAX_CAP_HZ: f32 = 29_000.0;
 
-// Pro-Q 3â€“inspired panel (dark graphite, soft grid, cool fill).
+// Pro-Q 3–inspired panel (dark graphite, soft grid, cool fill).
 const BG_TOP: Color32 = Color32::from_rgb(0x13, 0x0e, 0x15);
 const BG_BOTTOM: Color32 = Color32::from_rgb(0x23, 0x21, 0x23);
 const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(0x12, 0x12, 0x14, 0x07);
@@ -68,10 +66,6 @@ const LABEL_COL: Color32 = Color32::from_rgb(0xb4, 0xb4, 0xbc);
 const FILL_TOP: Color32 = Color32::from_rgba_premultiplied(0x25, 0x27, 0x2c, 0x22);
 const FILL_BOT: Color32 = Color32::from_rgba_premultiplied(0x30, 0x32, 0x38, 0x00);
 const LINE_COL: Color32 = Color32::from_rgba_premultiplied(0x72, 0x72, 0x75, 0x5c);
-const HOLD_COL: Color32 = Color32::from_rgba_premultiplied(0xb0, 0xb0, 0xb8, 0x62);
-
-/// Mid-band Ïƒ reference in ln(Hz); [`gauss_sigma_ln_for_freq`] widens toward bass, narrows toward treble.
-const GAUSS_SIGMA_LN_REF: f32 = 0.025;
 
 // Purely cosmetic: shift the whole displayed trace down by this many dB. Used to push the
 // DAC/ADC idle-noise slope (which sits around -80 to -85 dB after the pink tilt, since the
@@ -95,11 +89,6 @@ pub fn show_spectrum(
     // `analyzer` is ticked in `AudioMeterApp::ui` so the spectrum decays when audio stops even
     // if the History tab is visible.
 
-    // Claim exactly what the container gives us â€” the outer window
-    // already enforces a sensible minimum size (see
-    // `WINDOW_W_MIN_WITH_GRAPH`), so if the user has somehow shrunk
-    // beyond the recommended width we still render inside our bounds
-    // instead of painting past the right edge.
     // Leave a gap between the analyzer's right edge and the window/content edge so the panel
     // doesn't butt up against whatever's next to it.
     const RIGHT_MARGIN: f32 = 16.0;
@@ -133,7 +122,7 @@ pub fn show_spectrum(
 
     // Plot the full labelled span even if the sample-rate Nyquist (e.g. 24 kHz @ 48 kHz) is below
     // `F_DISPLAY_MAX_CAP_HZ`: frequencies above Nyquist have no FFT data so the trace naturally
-    // tapers into the spectrum floor, producing Pro-Qâ€™s visible right-side padding past 20 kHz.
+    // tapers into the spectrum floor, producing Pro-Q's visible right-side padding past 20 kHz.
     let _nyquist = (analyzer.sample_rate * 0.5).max(1000.0);
     let f_min = F_DISPLAY_MIN_HZ;
     let f_max = F_DISPLAY_MAX_CAP_HZ;
@@ -211,15 +200,13 @@ pub fn show_spectrum(
     }
 
     // ----- spectrum path ------------------------------------------
-    let bins = analyzer.bin_count();
-    if bins > 2 {
+    let nb = analyzer.bucket_dbs.len();
+    if nb > 2 {
         let pixel_step = 1.0_f32;
         let pixel_count = (plot.width() / pixel_step).ceil() as usize;
         if pixel_count > 4 {
             let width = plot.width();
             let log_range = log_fmax - log_fmin;
-            let bin_hz = analyzer.sample_rate.max(1.0) / crate::spectrum::FFT_SIZE as f32;
-            let floor_p = 10_f32.powf(SPECTRUM_FLOOR_DB / 10.0);
 
             let mut mags: Vec<f32> = Vec::with_capacity(pixel_count + 1);
             let mut holds: Vec<f32> = Vec::with_capacity(pixel_count + 1);
@@ -227,37 +214,27 @@ pub fn show_spectrum(
             for px in 0..=pixel_count {
                 let t = px as f32 / pixel_count as f32;
                 let f = 10.0_f32.powf(log_fmin + t * log_range);
-                // Adaptive minimum Ïƒ (in ln-Hz) that guarantees the Gaussian's Â±2Ïƒ main lobe always
-                // spans â‰¥ ~1.5 bins in Hz terms. Below ~40 Hz the FFT has too few bins per octave
-                // for the static bass Ïƒ to produce a smooth curve â€” without this floor you get
-                // stair-steps where each pixel reads mostly one bin. Mids/highs are unaffected
-                // because `gauss_sigma_ln_for_freq` already returns Ïƒ wider than this minimum.
-                let min_sigma_ln = (0.75 * bin_hz / f.max(bin_hz)).min(0.9);
-                let sigma_ln = gauss_sigma_ln_for_freq(f).max(min_sigma_ln);
-                let (m, h) = gaussian_constant_q_db(
-                    f,
-                    bin_hz,
-                    bins,
-                    &analyzer.bin_power,
-                    &analyzer.peak_hold_db,
-                    sigma_ln,
-                    floor_p,
-                );
+
+                // Linear interpolation in log-frequency across the 251 analyzer buckets.
+                // Each bucket already represents a mean-square-averaged power-to-dB value
+                // (ZL's `kAnalyzerPointNum` aggregation), so no per-pixel smoothing kernel is
+                // needed — the lerp is enough to render a clean curve on a log x-axis.
+                let m = bucket_lerp_db(f, &analyzer.bucket_freqs, &analyzer.bucket_dbs);
+                let h = bucket_lerp_db(f, &analyzer.bucket_freqs, &analyzer.peak_hold_db);
 
                 let comp = spectrum_pro_q_display_db(f) + DISPLAY_OFFSET_DB;
                 mags.push((m + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
                 holds.push((h + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
             }
 
-            let raw_mags = mags.clone();
-            let raw_holds = holds.clone();
+            // Single light horizontal smoothing pass to soften any pixel-level kinks at bucket
+            // boundaries. We drop the old `blend_detail_hz` stage because bucket aggregation
+            // already preserves the natural "spikiness" at high frequencies.
             smooth_triple_1d(&mut mags);
             smooth_triple_1d(&mut holds);
-            blend_detail_hz(&mut mags, &raw_mags, log_fmin, log_fmax);
-            blend_detail_hz(&mut holds, &raw_holds, log_fmin, log_fmax);
 
             // Inset the path slightly from the plot left/right so 1px strokes are not half-clipped
-            // at the edges (which looked like a detached â€œghostâ€ line past 20k, especially with a
+            // at the edges (which looked like a detached "ghost" line past 20k, especially with a
             // wide halo stroke).
             let x_inset = 1.0_f32;
             let inner_w = (width - 2.0 * x_inset).max(1.0);
@@ -272,7 +249,7 @@ pub fn show_spectrum(
                     pos2(x_at(t), y_from_db(m))
                 })
                 .collect();
-            let pts_hold: Vec<Pos2> = holds
+            let _pts_hold: Vec<Pos2> = holds
                 .iter()
                 .enumerate()
                 .map(|(px, &m)| {
@@ -313,8 +290,6 @@ pub fn show_spectrum(
                 for w in pts.windows(2) {
                     painter.line_segment([w[0], w[1]], line_stroke);
                 }
-
-
             }
         }
     }
@@ -331,116 +306,38 @@ pub fn show_spectrum(
     response
 }
 
-/// Wider kernel (smooth lows) â†’ narrower kernel (defined highs), uniform in log-frequency.
-/// Curve is super-linear in `u` so Ïƒ drops fast through the low-mids (200 Hz â€“ 1 kHz),
-/// matching Pro-Qâ€™s behaviour where individual partials start resolving well before 1 kHz.
-#[inline]
-fn gauss_sigma_ln_for_freq(f_hz: f32) -> f32 {
-    const F_LO: f32 = 8.0;
-    const F_HI: f32 = 22_000.0;
-    let f = f_hz.clamp(F_LO, F_HI);
-    let u = (f / F_LO).log10() / (F_HI / F_LO).log10();
-    let u = u.clamp(0.0, 1.0);
-    // `u.powf(0.35)` rises VERY fast early so the kernel tightens sharply through the low-mids.
-    // Bass scale (5.5Ã—) keeps the sub-bass hump smooth by blurring across the FFT's coarse low bins
-    // (~11.7 Hz @ 48 kHz / 4096). The Ïƒ floor is tight (0.004) so the 8â€“20 kHz band shows very
-    // defined individual partials â€” matching Pro-Qâ€™s crisp treble spikes.
-    let t = u.powf(0.35);
-    let scale = 5.5 - 5.3 * t;
-    (GAUSS_SIGMA_LN_REF * scale).clamp(0.004, 0.22)
-}
-
-/// 0 = fully smoothed (deep sub), 1 = mostly raw columns. Ramps in across the **low-mids**
-/// (~70 Hz â†’ 2.5 kHz) so partials start resolving around 200-300 Hz and mids/highs are
-/// fully detailed â€” matching Pro-Qâ€™s RTA where lows are a smooth hump but 500 Hz already
-/// shows individual peaks.
-#[inline]
-fn detail_blend_for_freq(f_hz: f32) -> f32 {
-    const F0: f32 = 70.0;
-    const F1: f32 = 2_500.0;
-    if f_hz <= F0 {
-        return 0.0;
+/// Piecewise-linear interpolation of `bucket_vals` in log-frequency at `f_hz`. Clamps to the
+/// first/last bucket value outside the bucket range.
+fn bucket_lerp_db(f_hz: f32, bucket_freqs: &[f32], bucket_vals: &[f32]) -> f32 {
+    let n = bucket_freqs.len().min(bucket_vals.len());
+    if n == 0 {
+        return SPECTRUM_FLOOR_DB;
     }
-    if f_hz >= F1 {
-        return 1.0;
+    if f_hz <= bucket_freqs[0] {
+        return bucket_vals[0];
     }
-    let u = (f_hz / F0).ln() / (F1 / F0).ln();
-    let t = u.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Mix pre-smooth column values back in toward high frequencies so the trace **opens up** into spikes.
-fn blend_detail_hz(out: &mut [f32], raw: &[f32], log_fmin: f32, log_fmax: f32) {
-    let n = out.len();
-    if n == 0 || raw.len() != n {
-        return;
+    let last = n - 1;
+    if f_hz >= bucket_freqs[last] {
+        return bucket_vals[last];
     }
-    let lr = (log_fmax - log_fmin).max(1e-6);
-    let nm1 = (n.saturating_sub(1)).max(1) as f32;
-    for i in 0..n {
-        let t = i as f32 / nm1;
-        let f = 10.0_f32.powf(log_fmin + t * lr);
-        let k = detail_blend_for_freq(f).min(1.0);
-        out[i] = out[i] * (1.0 - k) + raw[i] * k;
-    }
-}
-
-/// Gaussian band in log-frequency on **linear power** (main trace) and on power derived from
-/// peak-hold dB (outline), matching how polished RTAs avoid jagged bin-to-bin dB averaging.
-fn gaussian_constant_q_db(
-    f_center: f32,
-    bin_hz: f32,
-    bins: usize,
-    bin_power: &[f32],
-    peak_db: &[f32],
-    sigma_ln: f32,
-    floor_p: f32,
-) -> (f32, f32) {
-    // Clamp the kernel center to just above DC so the sub-20 Hz display pixels follow their own
-    // log-frequency position instead of collapsing onto a fixed 22 Hz center (which used to
-    // produce a flat plateau between 8 Hz and the FFTâ€™s first usable bin).
-    let ln_fc = f_center.max(bin_hz.max(1.0)).ln();
-    let f_lo = (ln_fc - 4.2 * sigma_ln).exp();
-    let f_hi = (ln_fc + 4.2 * sigma_ln).exp();
-    let i0 = (f_lo / bin_hz).floor() as isize;
-    let i1 = (f_hi / bin_hz).ceil() as isize;
-    // Bin 0 is DC and is force-floored inside the analyzer; start at bin 1 (â‰ˆ 5.86 Hz at 48 kHz /
-    // 8192). Do NOT add a Hz-based lower cutoff â€” we want real FFT content from 6 Hz up so that
-    // sub-20 Hz transients (kick tails, room rumble) roll smoothly into the 20 Hz region.
-    let i0 = i0.max(1) as usize;
-    let i1 = (i1 as usize).min(bins.saturating_sub(1));
-
-    let mut sum_wp = 0.0_f32;
-    let mut sum_wph = 0.0_f32;
-    let mut sum_w = 0.0_f32;
-
-    for i in i0..=i1 {
-        let fi = i as f32 * bin_hz;
-        let ln_f = fi.ln();
-        let u = (ln_f - ln_fc) / sigma_ln;
-        let w = (-0.5 * u * u).exp();
-        if i < bin_power.len() {
-            sum_wp += w * bin_power[i];
-        }
-        let ph = if i < peak_db.len() {
-            10_f32.powf(peak_db[i].clamp(SPECTRUM_FLOOR_DB, 12.0) / 10.0)
+    // Binary search for the bracketing indices. Buckets are monotonically increasing.
+    let mut lo = 0usize;
+    let mut hi = last;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if bucket_freqs[mid] <= f_hz {
+            lo = mid;
         } else {
-            floor_p
-        };
-        sum_wph += w * ph;
-        sum_w += w;
+            hi = mid;
+        }
     }
-
-    if sum_w < 1e-20 {
-        return (SPECTRUM_FLOOR_DB, SPECTRUM_FLOOR_DB);
-    }
-
-    let m = 10.0 * (sum_wp / sum_w).max(floor_p).log10();
-    let h = 10.0 * (sum_wph / sum_w).max(floor_p).log10();
-    (
-        m.clamp(SPECTRUM_FLOOR_DB, 12.0),
-        h.clamp(SPECTRUM_FLOOR_DB, 12.0),
-    )
+    let f0 = bucket_freqs[lo];
+    let f1 = bucket_freqs[hi];
+    let ln0 = f0.max(1e-6).ln();
+    let ln1 = f1.max(1e-6).ln();
+    let denom = (ln1 - ln0).abs().max(1e-9);
+    let t = ((f_hz.max(1e-6).ln() - ln0) / denom).clamp(0.0, 1.0);
+    bucket_vals[lo] * (1.0 - t) + bucket_vals[hi] * t
 }
 
 fn smooth_triple_1d(v: &mut [f32]) {
