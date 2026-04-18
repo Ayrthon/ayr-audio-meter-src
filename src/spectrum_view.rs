@@ -1,7 +1,7 @@
-//! Spectrum analyzer â€” rulers aligned with **FabFilter Pro-Q 3**â€™s EQ spectrum column (inset
-//! 20 Hzâ€“20 kHz, majors 20â€¦20k, 0â€¦âˆ’120 dB grid). The trace uses **Gaussian** smoothing in log-frequency
+//! Spectrum analyzer — rulers aligned with **FabFilter Pro-Q 3**’s EQ spectrum column (inset
+//! 20 Hz–20 kHz, majors 20…20k, 0…−120 dB grid). The trace uses **Gaussian** smoothing in log-frequency
 //! on **linear power** with **frequency-dependent width** (smooth bass, increasingly defined / spikey
-//! treble) plus an Hz-based blend toward raw columns after horizontal smooth. Pro-Qâ€™s exact DSP is
+//! treble) plus an Hz-based blend toward raw columns after horizontal smooth. Pro-Q’s exact DSP is
 //! proprietary; this is a deliberate **approximation**, not a licensed clone.
 //!
 //! Includes gradient fill, main line, peak-hold outline, and decade frequency grid.
@@ -15,50 +15,57 @@ use crate::spectrum::{
     SharedSpectrum, SpectrumAnalyzer, SPECTRUM_FLOOR_DB, spectrum_pro_q_display_db,
 };
 
-/// Pro-Q 3 analyzer vertical: 0 dB (top) â€¦ âˆ’90 dB (bottom).
+/// Pro-Q 3 analyzer vertical: 0 dB (top) … PRO_Q_ANALYZER_DB_BOT (bottom).
 ///
-/// The axis is **piecewise-linear**: the top 0 â€¦ âˆ’12 dB band is zoomed (3 dB per major grid) and
-/// the remainder compresses from âˆ’12 dB down to âˆ’90 dB, matching Pro-Q 3â€™s ruler.
+/// The axis is **piecewise-linear**: the top 0 … −12 dB band is zoomed (3 dB per major grid) and
+/// the remainder compresses from −12 dB down to the bottom, matching Pro-Q 3’s ruler.
+///
+/// The bottom was raised from −90 dB to −78 dB to crop the idle noise floor: with the +14 dB pink
+/// tilt at 20 kHz, DAC/ADC self-noise sits around −85 to −95 dB displayed. Moving the floor up
+/// puts that ghost slope below the visible range while the real signal stretches to fill the
+/// same pixel space (the whole compressed band rescales). Anything you’d have seen below −78 dB
+/// was barely distinguishable from noise anyway.
 const PRO_Q_ANALYZER_DB_TOP: f32 = 0.0;
-const PRO_Q_ANALYZER_DB_BOT: f32 = -90.0;
+const PRO_Q_ANALYZER_DB_BOT: f32 = -78.0;
 
 /// Normalised vertical break points for the piecewise-linear dB axis.
-/// `t = 0` is the very top of the plot (above 0 dB), `t = 1` is the very bottom (below âˆ’90 dB).
-/// Pro-Q 3 leaves small gaps above 0 dB and below âˆ’90 dB; we mirror those here.
+/// `t = 0` is the very top of the plot (above 0 dB), `t = 1` is the very bottom (below the axis).
+/// Pro-Q 3 leaves small gaps above 0 dB and below the bottom tick; we mirror those here.
 const PRO_Q_T_TOP_PAD: f32 = 0.03; // 0 dB sits this fraction below the very top
-const PRO_Q_T_MINUS12: f32 = 0.33; // âˆ’12 dB ~ one third from the top (zoomed EQ band)
-const PRO_Q_T_MINUS90: f32 = 0.95; // âˆ’90 dB ~ 5 % above the very bottom
+const PRO_Q_T_MINUS12: f32 = 0.33; // −12 dB ~ one third from the top (zoomed EQ band)
+const PRO_Q_T_BOT: f32 = 0.95; // axis bottom tick ~ 5 % above the very bottom
 
 #[inline]
 fn pro_q_t_from_db(db: f32) -> f32 {
     // Clamp against a slightly wider range than the labelled ticks so the trace can extend into
-    // the top and bottom padding bands for Pro-Qâ€™s tapered look past 0 dB / âˆ’90 dB.
+    // the top and bottom padding bands for Pro-Q’s tapered look past 0 dB / the bottom tick.
     let d = db.clamp(-120.0, 6.0);
     if d >= 0.0 {
         // Above 0 dB: linear into the top padding band (saturates at +6 dB = t=0).
         let u = ((6.0 - d) / 6.0).clamp(0.0, 1.0);
         u * PRO_Q_T_TOP_PAD
     } else if d >= -12.0 {
-        // 0 â€¦ âˆ’12 dB, uniform 3 dB/grid (zoomed EQ band).
+        // 0 … −12 dB, uniform 3 dB/grid (zoomed EQ band).
         let u = (0.0 - d) / 12.0;
         PRO_Q_T_TOP_PAD + u * (PRO_Q_T_MINUS12 - PRO_Q_T_TOP_PAD)
-    } else if d >= -90.0 {
-        // âˆ’12 â€¦ âˆ’90 dB, compressed (all the low-level detail lives here).
-        let u = (-12.0 - d) / 78.0;
-        PRO_Q_T_MINUS12 + u * (PRO_Q_T_MINUS90 - PRO_Q_T_MINUS12)
+    } else if d >= PRO_Q_ANALYZER_DB_BOT {
+        // −12 dB … bottom, compressed (all the low-level detail lives here).
+        let span = -12.0 - PRO_Q_ANALYZER_DB_BOT; // positive dB span (e.g. 66 for −78)
+        let u = (-12.0 - d) / span;
+        PRO_Q_T_MINUS12 + u * (PRO_Q_T_BOT - PRO_Q_T_MINUS12)
     } else {
-        // Below âˆ’90 dB: linear into the bottom padding band, saturating at âˆ’120 dB.
-        let u = ((-90.0 - d) / 30.0).clamp(0.0, 1.0);
-        PRO_Q_T_MINUS90 + u * (1.0 - PRO_Q_T_MINUS90)
+        // Below the bottom tick: linear into the bottom padding band, saturating 30 dB lower.
+        let u = ((PRO_Q_ANALYZER_DB_BOT - d) / 30.0).clamp(0.0, 1.0);
+        PRO_Q_T_BOT + u * (1.0 - PRO_Q_T_BOT)
     }
 }
 
-/// Log-frequency plot limits. Extended down to 8 Hz so the 10 Hz ruler tick is clearly inset â€”
+/// Log-frequency plot limits. Extended down to 8 Hz so the 10 Hz ruler tick is clearly inset —
 /// bin 1 at 48 kHz / 8192 samples sits at 5.86 Hz, so everything above 8 Hz is real FFT data.
 const F_DISPLAY_MIN_HZ: f32 = 8.0;
 const F_DISPLAY_MAX_CAP_HZ: f32 = 29_000.0;
 
-// Pro-Q 3â€“inspired panel (dark graphite, soft grid, cool fill).
+// Pro-Q 3–inspired panel (dark graphite, soft grid, cool fill).
 const BG_COL: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2f);
 const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(0x62, 0x62, 0x68, 0x28);
 const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0x4a, 0x50, 0x1c);
@@ -69,7 +76,7 @@ const FILL_BOT: Color32 = Color32::from_rgba_premultiplied(0x30, 0x32, 0x38, 0x0
 const LINE_COL: Color32 = Color32::from_rgba_premultiplied(0xe4, 0xe4, 0xea, 0xb8);
 const HOLD_COL: Color32 = Color32::from_rgba_premultiplied(0xb0, 0xb0, 0xb8, 0x62);
 
-/// Mid-band Ïƒ reference in ln(Hz); [`gauss_sigma_ln_for_freq`] widens toward bass, narrows toward treble.
+/// Mid-band σ reference in ln(Hz); [`gauss_sigma_ln_for_freq`] widens toward bass, narrows toward treble.
 const GAUSS_SIGMA_LN_REF: f32 = 0.025;
 
 pub const MIN_WIDTH: f32 = 360.0;
@@ -84,7 +91,7 @@ pub fn show_spectrum(
     // `analyzer` is ticked in `AudioMeterApp::ui` so the spectrum decays when audio stops even
     // if the History tab is visible.
 
-    // Claim exactly what the container gives us â€” the outer window
+    // Claim exactly what the container gives us — the outer window
     // already enforces a sensible minimum size (see
     // `WINDOW_W_MIN_WITH_GRAPH`), so if the user has somehow shrunk
     // beyond the recommended width we still render inside our bounds
@@ -107,7 +114,7 @@ pub fn show_spectrum(
 
     // Plot the full labelled span even if the sample-rate Nyquist (e.g. 24 kHz @ 48 kHz) is below
     // `F_DISPLAY_MAX_CAP_HZ`: frequencies above Nyquist have no FFT data so the trace naturally
-    // tapers into the spectrum floor, producing Pro-Qâ€™s visible right-side padding past 20 kHz.
+    // tapers into the spectrum floor, producing Pro-Q’s visible right-side padding past 20 kHz.
     let _nyquist = (analyzer.sample_rate * 0.5).max(1000.0);
     let f_min = F_DISPLAY_MIN_HZ;
     let f_max = F_DISPLAY_MAX_CAP_HZ;
@@ -169,7 +176,7 @@ pub fn show_spectrum(
             LABEL_COL,
         );
     }
-    // dB grid â€” Pro-Q 3 ruler: zoomed Â±12 dB EQ band at 3 dB/grid, then compressed below.
+    // dB grid — Pro-Q 3 ruler: zoomed ±12 dB EQ band at 3 dB/grid, then compressed below.
     // Negative values are drawn without an explicit sign; positive values keep the leading '+'.
     let db_ticks: &[(f32, &str)] = &[
         (0.0, "0"),
@@ -177,11 +184,11 @@ pub fn show_spectrum(
         (-6.0, "-6"),
         (-9.0, "-9"),
         (-12.0, "-12"),
-        (-30.0, "-30"),
-        (-40.0, "-40"),
-        (-50.0, "-50"),
+        (-24.0, "-24"),
+        (-36.0, "-36"),
+        (-48.0, "-48"),
         (-60.0, "-60"),
-        (-90.0, "-90"),
+        (-72.0, "-72"),
     ];
     for &(db, label) in db_ticks {
         let y = y_from_db(db);
@@ -216,14 +223,47 @@ pub fn show_spectrum(
             let mut mags: Vec<f32> = Vec::with_capacity(pixel_count + 1);
             let mut holds: Vec<f32> = Vec::with_capacity(pixel_count + 1);
 
+            // Nyquist taper: for the last slice of the display before/at Nyquist, fade the signal
+            // down to the spectrum floor. Past Nyquist there are no FFT bins, so without this the
+            // trace would sit on a flat plateau at the floor between Nyquist and the display cap,
+            // producing a visible "wall" right of 20 kHz.
+            let nyquist_hz = (analyzer.sample_rate * 0.5).max(1000.0);
+            let nyquist_fade_lo = nyquist_hz * 0.96;
+
+            // Downward expander (post-tilt): pulls quiet signals *further* below the visible
+            // floor while leaving loud signals at their exact dB level. This is the literal
+            // answer to "move the waveform down until the slope is hidden, without changing the
+            // dB height of real music":
+            //
+            //   - Above `EXPANDER_KNEE_HI` (−45 dB) → full pass-through. A peak at −3 dB displays
+            //     at exactly −3 dB, same pixel height as before.
+            //   - Below `EXPANDER_KNEE_LO` (−55 dB) → hard expansion with `EXPANDER_RATIO`. Every
+            //     dB below the threshold becomes RATIO dB below the threshold. At ratio 3, a −70
+            //     dB noise slope gets pulled to −110 dB; a −85 dB line goes to −155 dB. Well
+            //     below the spectrum floor in either case → invisible.
+            //   - Between the two knee edges → quadratic soft blend so there is no visible cliff.
+            //
+            // The pink tilt adds up to +14 dB at 20 kHz, which is what turned the ADC/DAC self
+            // noise into a visible rising slope. The expander reverses that amplification only
+            // where the signal is quiet enough to actually be noise — real high-frequency
+            // content (cymbals, hi-hats, air) sits well above −45 dB after the tilt and rides
+            // through untouched.
+            //
+            // Purely cosmetic: no effect on the EMA, Gaussian kernel, peak-hold ballistics, or
+            // the raw FFT data.
+            const EXPANDER_KNEE_HI: f32 = -45.0;
+            const EXPANDER_KNEE_LO: f32 = -55.0;
+            const EXPANDER_THRESHOLD_DB: f32 = -50.0;
+            const EXPANDER_RATIO: f32 = 3.0;
+
             for px in 0..=pixel_count {
                 let t = px as f32 / pixel_count as f32;
                 let f = 10.0_f32.powf(log_fmin + t * log_range);
-                // Adaptive minimum Ïƒ (in ln-Hz) that guarantees the Gaussian's Â±2Ïƒ main lobe always
-                // spans â‰¥ ~1.5 bins in Hz terms. Below ~40 Hz the FFT has too few bins per octave
-                // for the static bass Ïƒ to produce a smooth curve â€” without this floor you get
+                // Adaptive minimum σ (in ln-Hz) that guarantees the Gaussian's ±2σ main lobe always
+                // spans ≥ ~1.5 bins in Hz terms. Below ~40 Hz the FFT has too few bins per octave
+                // for the static bass σ to produce a smooth curve — without this floor you get
                 // stair-steps where each pixel reads mostly one bin. Mids/highs are unaffected
-                // because `gauss_sigma_ln_for_freq` already returns Ïƒ wider than this minimum.
+                // because `gauss_sigma_ln_for_freq` already returns σ wider than this minimum.
                 let min_sigma_ln = (0.75 * bin_hz / f.max(bin_hz)).min(0.9);
                 let sigma_ln = gauss_sigma_ln_for_freq(f).max(min_sigma_ln);
                 let (m, h) = gaussian_constant_q_db(
@@ -237,8 +277,37 @@ pub fn show_spectrum(
                 );
 
                 let comp = spectrum_pro_q_display_db(f);
-                mags.push((m + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
-                holds.push((h + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
+                let mv = m + comp;
+                let hv = h + comp;
+
+                // Downward expander with soft knee. See constants above for the design.
+                let expand = |d: f32| -> f32 {
+                    if d >= EXPANDER_KNEE_HI {
+                        d
+                    } else if d <= EXPANDER_KNEE_LO {
+                        EXPANDER_THRESHOLD_DB
+                            + (d - EXPANDER_THRESHOLD_DB) * EXPANDER_RATIO
+                    } else {
+                        // Quadratic blend across the 10 dB knee (−55 … −45 dB).
+                        let t = (d - EXPANDER_KNEE_LO)
+                            / (EXPANDER_KNEE_HI - EXPANDER_KNEE_LO);
+                        let hard = EXPANDER_THRESHOLD_DB
+                            + (d - EXPANDER_THRESHOLD_DB) * EXPANDER_RATIO;
+                        hard + (d - hard) * (t * t)
+                    }
+                };
+
+                // Nyquist-taper weight (1 at/below 0.96·Nyquist, 0 at/above Nyquist).
+                let nyq_w = ((nyquist_hz - f) / (nyquist_hz - nyquist_fade_lo)).clamp(0.0, 1.0);
+                let nyq_s = nyq_w * nyq_w * (3.0 - 2.0 * nyq_w);
+
+                let mv_e = expand(mv);
+                let hv_e = expand(hv);
+                let mv_f = SPECTRUM_FLOOR_DB + (mv_e - SPECTRUM_FLOOR_DB) * nyq_s;
+                let hv_f = SPECTRUM_FLOOR_DB + (hv_e - SPECTRUM_FLOOR_DB) * nyq_s;
+
+                mags.push(mv_f.clamp(SPECTRUM_FLOOR_DB, 12.0));
+                holds.push(hv_f.clamp(SPECTRUM_FLOOR_DB, 12.0));
             }
 
             let raw_mags = mags.clone();
@@ -249,7 +318,7 @@ pub fn show_spectrum(
             blend_detail_hz(&mut holds, &raw_holds, log_fmin, log_fmax);
 
             // Inset the path slightly from the plot left/right so 1px strokes are not half-clipped
-            // at the edges (which looked like a detached â€œghostâ€ line past 20k, especially with a
+            // at the edges (which looked like a detached “ghost” line past 20k, especially with a
             // wide halo stroke).
             let x_inset = 1.0_f32;
             let inner_w = (width - 2.0 * x_inset).max(1.0);
@@ -306,12 +375,6 @@ pub fn show_spectrum(
                     painter.line_segment([w[0], w[1]], line_stroke);
                 }
 
-                // Peak-hold trail â€” thinner, dimmer.
-                let hold_stroke = Stroke::new(0.75, HOLD_COL);
-                for w in pts_hold.windows(2) {
-                    painter.line_segment([w[0], w[1]], hold_stroke);
-                }
-
             }
         }
     }
@@ -328,9 +391,9 @@ pub fn show_spectrum(
     response
 }
 
-/// Wider kernel (smooth lows) â†’ narrower kernel (defined highs), uniform in log-frequency.
-/// Curve is super-linear in `u` so Ïƒ drops fast through the low-mids (200 Hz â€“ 1 kHz),
-/// matching Pro-Qâ€™s behaviour where individual partials start resolving well before 1 kHz.
+/// Wider kernel (smooth lows) → narrower kernel (defined highs), uniform in log-frequency.
+/// Curve is super-linear in `u` so σ drops fast through the low-mids (200 Hz – 1 kHz),
+/// matching Pro-Q’s behaviour where individual partials start resolving well before 1 kHz.
 #[inline]
 fn gauss_sigma_ln_for_freq(f_hz: f32) -> f32 {
     const F_LO: f32 = 8.0;
@@ -339,17 +402,17 @@ fn gauss_sigma_ln_for_freq(f_hz: f32) -> f32 {
     let u = (f / F_LO).log10() / (F_HI / F_LO).log10();
     let u = u.clamp(0.0, 1.0);
     // `u.powf(0.35)` rises VERY fast early so the kernel tightens sharply through the low-mids.
-    // Bass scale (5.5Ã—) keeps the sub-bass hump smooth by blurring across the FFT's coarse low bins
-    // (~11.7 Hz @ 48 kHz / 4096). The Ïƒ floor is tight (0.004) so the 8â€“20 kHz band shows very
-    // defined individual partials â€” matching Pro-Qâ€™s crisp treble spikes.
+    // Bass scale (5.5×) keeps the sub-bass hump smooth by blurring across the FFT's coarse low bins
+    // (~11.7 Hz @ 48 kHz / 4096). The σ floor is tight (0.004) so the 8–20 kHz band shows very
+    // defined individual partials — matching Pro-Q’s crisp treble spikes.
     let t = u.powf(0.35);
     let scale = 5.5 - 5.3 * t;
     (GAUSS_SIGMA_LN_REF * scale).clamp(0.004, 0.22)
 }
 
 /// 0 = fully smoothed (deep sub), 1 = mostly raw columns. Ramps in across the **low-mids**
-/// (~70 Hz â†’ 2.5 kHz) so partials start resolving around 200-300 Hz and mids/highs are
-/// fully detailed â€” matching Pro-Qâ€™s RTA where lows are a smooth hump but 500 Hz already
+/// (~70 Hz → 2.5 kHz) so partials start resolving around 200-300 Hz and mids/highs are
+/// fully detailed — matching Pro-Q’s RTA where lows are a smooth hump but 500 Hz already
 /// shows individual peaks.
 #[inline]
 fn detail_blend_for_freq(f_hz: f32) -> f32 {
@@ -395,14 +458,14 @@ fn gaussian_constant_q_db(
 ) -> (f32, f32) {
     // Clamp the kernel center to just above DC so the sub-20 Hz display pixels follow their own
     // log-frequency position instead of collapsing onto a fixed 22 Hz center (which used to
-    // produce a flat plateau between 8 Hz and the FFTâ€™s first usable bin).
+    // produce a flat plateau between 8 Hz and the FFT’s first usable bin).
     let ln_fc = f_center.max(bin_hz.max(1.0)).ln();
     let f_lo = (ln_fc - 4.2 * sigma_ln).exp();
     let f_hi = (ln_fc + 4.2 * sigma_ln).exp();
     let i0 = (f_lo / bin_hz).floor() as isize;
     let i1 = (f_hi / bin_hz).ceil() as isize;
-    // Bin 0 is DC and is force-floored inside the analyzer; start at bin 1 (â‰ˆ 5.86 Hz at 48 kHz /
-    // 8192). Do NOT add a Hz-based lower cutoff â€” we want real FFT content from 6 Hz up so that
+    // Bin 0 is DC and is force-floored inside the analyzer; start at bin 1 (≈ 5.86 Hz at 48 kHz /
+    // 8192). Do NOT add a Hz-based lower cutoff — we want real FFT content from 6 Hz up so that
     // sub-20 Hz transients (kick tails, room rumble) roll smoothly into the 20 Hz region.
     let i0 = i0.max(1) as usize;
     let i1 = (i1 as usize).min(bins.saturating_sub(1));

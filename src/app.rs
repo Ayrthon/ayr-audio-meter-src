@@ -55,7 +55,6 @@ pub struct AudioMeterApp {
     devices: Vec<DeviceInfo>,
     selected_device: Option<usize>,
     mode: MeterMode,
-    follow_default: bool,
     panel: GraphView,
     last_panel: GraphView,
     // Width we last auto-snapped the window to.  If the current width
@@ -97,7 +96,6 @@ pub struct AudioMeterApp {
     engine: Option<AudioEngine>,
     channels: usize,
     status: String,
-    last_default_check: f64,
 }
 
 /// Target window widths for the two UI modes.  The app snaps to one
@@ -163,7 +161,6 @@ impl AudioMeterApp {
             devices,
             selected_device,
             mode: MeterMode::SamplePeak,
-            follow_default: true,
             panel: GraphView::History,
             last_panel: GraphView::History,
             // Seed with the History snap width (matches initial
@@ -191,7 +188,6 @@ impl AudioMeterApp {
             engine: None,
             channels: 2,
             status: "Idle".into(),
-            last_default_check: 0.0,
         }
     }
 
@@ -478,46 +474,12 @@ impl AudioMeterApp {
         let _ = now;
     }
 
-    fn maybe_follow_default(&mut self, now: f64) {
-        if !self.follow_default {
-            return;
-        }
-        if now - self.last_default_check < 1.0 {
-            return;
-        }
-        self.last_default_check = now;
-        let kind = self.active_kind();
-        let default_name = match kind {
-            SourceKind::Input => default_input_name(),
-            SourceKind::Loopback => default_output_name(),
-        };
-        let Some(default_name) = default_name else {
-            return;
-        };
-        let target_idx = self
-            .devices
-            .iter()
-            .position(|d| d.kind == kind && d.name == default_name);
-        let Some(idx) = target_idx else {
-            self.refresh_devices();
-            return;
-        };
-        if Some(idx) == self.selected_device && self.engine.is_some() {
-            return;
-        }
-        self.selected_device = Some(idx);
-        if self.engine.is_some() {
-            self.stop_stream();
-            let _ = self.start_stream();
-        }
-    }
 }
 
 impl eframe::App for AudioMeterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
-        self.maybe_follow_default(now);
         self.tick_meters(now);
         // Spectrum: run the analyzer while the tab is open, and keep decaying after Stop even if
         // another panel is selected (otherwise FFT state never reaches the noise floor).
@@ -677,16 +639,6 @@ impl AudioMeterApp {
                     {
                         self.refresh_devices();
                     }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(5.0);
-
-                    // ── OPTIONS ────────────────────────────────────────────
-                    section_header(ui, "OPTIONS");
-                    ui.add_space(3.0);
-                    ui.checkbox(&mut self.follow_default, "Follow system default device")
-                        .on_hover_text("When on, the meter follows Windows default input/output changes.");
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -927,10 +879,16 @@ impl AudioMeterApp {
             })
             .unwrap_or_else(|| "<no devices>".into());
 
-        egui::ComboBox::from_id_salt(id)
-            .width(width)
-            .selected_text(truncate(&current_label, 36))
-            .show_ui(ui, |ui| {
+        // Lock the picker while capture is live so the user can't swap devices mid-stream
+        // (which would otherwise drop the current engine, allocate a new one, and reset the
+        // spectrum/meter state without an explicit intent). Stop metering first to change
+        // devices.
+        let metering_active = self.engine.is_some();
+        let combo_resp = ui.add_enabled_ui(!metering_active, |ui| {
+            egui::ComboBox::from_id_salt(id)
+                .width(width)
+                .selected_text(truncate(&current_label, 36))
+                .show_ui(ui, |ui| {
                 let has_inputs = self.devices.iter().any(|d| d.kind == SourceKind::Input);
                 let has_outputs = self
                     .devices
@@ -982,7 +940,12 @@ impl AudioMeterApp {
                         RichText::new("no devices found").color(Color32::from_gray(130)),
                     );
                 }
-            });
+                })
+        }).response;
+
+        if metering_active {
+            combo_resp.on_hover_text("Stop metering to change the audio source.");
+        }
     }
 
     fn start_or_restart(&mut self) {
