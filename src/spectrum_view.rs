@@ -215,12 +215,14 @@ pub fn show_spectrum(
                 let t = px as f32 / pixel_count as f32;
                 let f = 10.0_f32.powf(log_fmin + t * log_range);
 
-                // Linear interpolation in log-frequency across the 251 analyzer buckets.
-                // Each bucket already represents a mean-square-averaged power-to-dB value
-                // (ZL's `kAnalyzerPointNum` aggregation), so no per-pixel smoothing kernel is
-                // needed — the lerp is enough to render a clean curve on a log x-axis.
-                let m = bucket_lerp_db(f, &analyzer.bucket_freqs, &analyzer.bucket_dbs);
-                let h = bucket_lerp_db(f, &analyzer.bucket_freqs, &analyzer.peak_hold_db);
+                // Catmull-Rom cubic interpolation in log-frequency across the 251 analyzer
+                // buckets. Each bucket is a mean-square-averaged power-to-dB value
+                // (ZL's `kAnalyzerPointNum` aggregation). A cubic between the four surrounding
+                // bucket samples rounds the corners at bucket centers so transient peaks look
+                // like Pro-Q's smoothly-shouldered spikes instead of piecewise-linear tents.
+                // Conceptually equivalent to the Akima spline ZL draws its 251 points with.
+                let m = bucket_catmull_db(f, &analyzer.bucket_freqs, &analyzer.bucket_dbs);
+                let h = bucket_catmull_db(f, &analyzer.bucket_freqs, &analyzer.peak_hold_db);
 
                 let comp = spectrum_pro_q_display_db(f) + DISPLAY_OFFSET_DB;
                 mags.push((m + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
@@ -306,21 +308,32 @@ pub fn show_spectrum(
     response
 }
 
-/// Piecewise-linear interpolation of `bucket_vals` in log-frequency at `f_hz`. Clamps to the
-/// first/last bucket value outside the bucket range.
-fn bucket_lerp_db(f_hz: f32, bucket_freqs: &[f32], bucket_vals: &[f32]) -> f32 {
+/// Uniform Catmull-Rom cubic interpolation of `bucket_vals` in log-frequency at `f_hz`.
+///
+/// Treats the four surrounding bucket samples as control points and evaluates the standard
+/// Catmull-Rom spline (tension 0.5) on the local log-frequency parameter `t ∈ [0, 1]` between
+/// the two central samples. Buckets are geometrically spaced so `t` in log-frequency is very
+/// close to uniform; this is the same family of C¹-continuous cubics that ZLEqualizer's Akima
+/// path produces, without the monotonicity guard (spectrum traces already average in power so
+/// overshoot is visually negligible here).
+///
+/// Outside the bucket range the function clamps to the first/last sample.
+fn bucket_catmull_db(f_hz: f32, bucket_freqs: &[f32], bucket_vals: &[f32]) -> f32 {
     let n = bucket_freqs.len().min(bucket_vals.len());
     if n == 0 {
         return SPECTRUM_FLOOR_DB;
     }
-    if f_hz <= bucket_freqs[0] {
+    if n == 1 {
         return bucket_vals[0];
     }
     let last = n - 1;
+    if f_hz <= bucket_freqs[0] {
+        return bucket_vals[0];
+    }
     if f_hz >= bucket_freqs[last] {
         return bucket_vals[last];
     }
-    // Binary search for the bracketing indices. Buckets are monotonically increasing.
+    // Binary search for `i` with bucket_freqs[i] <= f_hz < bucket_freqs[i+1].
     let mut lo = 0usize;
     let mut hi = last;
     while hi - lo > 1 {
@@ -331,13 +344,28 @@ fn bucket_lerp_db(f_hz: f32, bucket_freqs: &[f32], bucket_vals: &[f32]) -> f32 {
             hi = mid;
         }
     }
-    let f0 = bucket_freqs[lo];
-    let f1 = bucket_freqs[hi];
-    let ln0 = f0.max(1e-6).ln();
-    let ln1 = f1.max(1e-6).ln();
-    let denom = (ln1 - ln0).abs().max(1e-9);
-    let t = ((f_hz.max(1e-6).ln() - ln0) / denom).clamp(0.0, 1.0);
-    bucket_vals[lo] * (1.0 - t) + bucket_vals[hi] * t
+    let i = lo;
+
+    let ln1 = bucket_freqs[i].max(1e-6).ln();
+    let ln2 = bucket_freqs[i + 1].max(1e-6).ln();
+    let denom = (ln2 - ln1).abs().max(1e-9);
+    let t = ((f_hz.max(1e-6).ln() - ln1) / denom).clamp(0.0, 1.0);
+
+    let p1 = bucket_vals[i];
+    let p2 = bucket_vals[i + 1];
+    let p0 = if i > 0 { bucket_vals[i - 1] } else { p1 };
+    let p3 = if i + 2 <= last {
+        bucket_vals[i + 2]
+    } else {
+        p2
+    };
+
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * ((2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
 fn smooth_triple_1d(v: &mut [f32]) {
