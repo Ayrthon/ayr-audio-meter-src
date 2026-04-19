@@ -9,8 +9,8 @@
 
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
-    Align2, Checkbox, Color32, FontId, Pos2, Rect, Response, RichText, Sense, Shape, Stroke,
-    Ui, pos2, vec2,
+    Align2, Button, Color32, CursorIcon, Direction, FontId, Layout, Painter, Pos2, Rect,
+    Response, RichText, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 
 use crate::spectrum::{
@@ -87,6 +87,27 @@ const PRETTY_FILL_ALPHA: u8 = 0x22;
 /// Alpha for the stroke in pretty mode (matches `LINE_COL.a`).
 const PRETTY_LINE_ALPHA: u8 = 0x72;
 
+// ---- Interaction overlay (hover cursor line + user-pinned anchor lines) ----
+// Hover line follows the mouse while the cursor is in the plot body. Anchor
+// lines are "pins" the user clicked on - each gets a small × to remove it.
+// Colour palette is deliberately warm/amber so anchors read as *user data*
+// rather than background grid.
+const HOVER_LINE_COL: Color32 = Color32::from_rgba_premultiplied(0xcc, 0xcc, 0xd4, 0x78);
+const HOVER_PILL_BG: Color32 = Color32::from_rgba_premultiplied(0x18, 0x18, 0x1e, 0xd8);
+const HOVER_PILL_FG: Color32 = Color32::from_rgb(0xea, 0xea, 0xf0);
+
+const ANCHOR_LINE_COL: Color32 = Color32::from_rgba_premultiplied(0xff, 0xc8, 0x5a, 0xa8);
+const ANCHOR_PILL_BG: Color32 = Color32::from_rgba_premultiplied(0x18, 0x12, 0x0a, 0xe0);
+const ANCHOR_PILL_FG: Color32 = Color32::from_rgb(0xff, 0xd8, 0x80);
+const ANCHOR_X_FG: Color32 = Color32::from_rgb(0xc8, 0x9a, 0x58);
+const ANCHOR_X_HOVER_FG: Color32 = Color32::from_rgb(0xff, 0x82, 0x64);
+
+/// Duplicate-click tolerance in log10(Hz) units. ~0.01 means two anchors within
+/// about 2.3 % of each other are treated as the same pin - wide enough that a
+/// small wobble on click doesn't stack two lines, narrow enough that users can
+/// still place adjacent references (e.g. 440 Hz and 466 Hz) intentionally.
+const ANCHOR_DEDUPE_LOG_HZ: f32 = 0.01;
+
 // Purely cosmetic: shift the whole displayed trace down by this many dB. Used to push the
 // DAC/ADC idle-noise slope (which sits around -80 to -85 dB after the pink tilt, since the
 // tilt adds +14 dB at 20 kHz) below the -100 dB axis bottom so it falls off-screen. Does NOT
@@ -106,6 +127,7 @@ pub fn show_spectrum(
     _shared: &SharedSpectrum,
     _now: f64,
     pretty_mode: &mut bool,
+    anchors: &mut Vec<f32>,
 ) -> Response {
     // `analyzer` is ticked in `AudioMeterApp::ui` so the spectrum decays when audio stops even
     // if the History tab is visible.
@@ -115,7 +137,12 @@ pub fn show_spectrum(
     const RIGHT_MARGIN: f32 = 16.0;
     let mut desired = ui.available_size();
     desired.x = (desired.x - RIGHT_MARGIN).max(MIN_WIDTH);
-    let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
+    // `Sense::click()` so we get both hover-position reporting AND click events.
+    // The hover cursor line, anchor pins, and delete-× hit-testing all ride on
+    // this single response; egui resolves overlaps with the Pretty-mode checkbox
+    // (registered later via `ui.put`) automatically because later-registered
+    // widgets win clicks in their sub-rect.
+    let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
     let painter = ui.painter_at(rect);
 
     // Vertical gradient background: BG_TOP at the top fading to BG_BOTTOM at the bottom.
@@ -410,6 +437,188 @@ pub fn show_spectrum(
         }
     }
 
+    // Pre-compute the control stack: **Pretty** top-left, **Clear all** top-right.
+    // Anchor pills sit in the upper band (see `pill_top` below) — above the
+    // densest part of many traces but below the button row.
+    //
+    // Both rects are calculated up front so the hover-line / anchor-click
+    // code below can use their union as a "don't paint / don't click here"
+    // guard without caring which button is which. The hover vertical line
+    // will still pass through the columns the buttons occupy - the buttons
+    // paint after the line so they cover that slice naturally.
+    const BTN_W: f32 = 78.0;
+    const BTN_H: f32 = 18.0;
+    // Single inset from the plot's inner top-left corner so horizontal and
+    // vertical spacing to the graph border match.
+    const BTN_INSET: f32 = 4.0;
+    let pretty_rect = Rect::from_min_size(
+        pos2(plot.left() + BTN_INSET, plot.top() + BTN_INSET),
+        vec2(BTN_W, BTN_H),
+    );
+    let clear_rect = Rect::from_min_size(
+        pos2(plot.right() - BTN_W - BTN_INSET, plot.top() + BTN_INSET),
+        vec2(BTN_W, BTN_H),
+    );
+    // Everything the hover/click logic must stay out of.
+    let overlay_rect = pretty_rect.union(clear_rect);
+
+    // ----- anchor pins + hover cursor line ------------------------
+    // Inverse of `x_from_freq`: pixel → Hz along the log axis. Used to resolve
+    // both the hover label and the frequency stored on click.
+    let freq_from_x = |x: f32| -> f32 {
+        let t = ((x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+        10.0_f32.powf(log_fmin + t * (log_fmax - log_fmin))
+    };
+
+    // Shift = "fine-control" modifier, same convention as knob-dragging in
+    // most DAWs. When Shift goes from up → down while the cursor is inside
+    // the plot we latch the current pointer x as an anchor; while it stays
+    // down the *effective* hover x is computed as
+    //     effective_x = anchor_x + (pointer_x - anchor_x) * FINE_SCALE
+    // so every physical pixel of mouse motion only moves the hover line
+    // `FINE_SCALE` pixels on the log axis. At FINE_SCALE=0.1 that's 10×
+    // finer, which at 1 kHz on this plot works out to roughly 1 Hz per
+    // physical pixel - enough to land on whole-Hz references (440, 523, ...)
+    // without wrestling a sub-pixel hit target.
+    //
+    // Visually the OS cursor "detaches" from the hover line while Shift is
+    // held (same as a DAW knob does). The line + pill are the virtual
+    // cursor; the OS cursor stays where your hand is. Releasing Shift
+    // immediately drops the anchor and the line snaps back to the pointer.
+    //
+    // State lives in egui's per-context temp data so we don't need to
+    // thread it through the `AudioMeterApp` struct for what is a purely
+    // view-internal interaction mode.
+    const FINE_SCALE: f32 = 0.1;
+    let fine_anchor_id = ui.id().with("spectrum_shift_fine_anchor");
+    let shift_held = ui.input(|i| i.modifiers.shift);
+    let mut fine_anchor_x: Option<f32> = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(fine_anchor_id));
+    if shift_held {
+        if fine_anchor_x.is_none() {
+            if let Some(p) = response.hover_pos() {
+                if plot.contains(p) && !overlay_rect.contains(p) {
+                    fine_anchor_x = Some(p.x);
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(fine_anchor_id, p.x));
+                }
+            }
+        }
+    } else if fine_anchor_x.is_some() {
+        ui.ctx()
+            .data_mut(|d| d.remove::<f32>(fine_anchor_id));
+        fine_anchor_x = None;
+    }
+    let effective_x = |raw_x: f32| -> f32 {
+        match (shift_held, fine_anchor_x) {
+            (true, Some(ax)) => (ax + (raw_x - ax) * FINE_SCALE).clamp(plot.left(), plot.right()),
+            _ => raw_x,
+        }
+    };
+
+    // Lay out the anchor pills first. Each pin owns:
+    //   - a full-height vertical line at `x_from_freq(f)`
+    //   - a pill ~1/5 down from the plot top (higher than the old 1/3 band)
+    //   - a small × hit-rect immediately right of the pill
+    // Higher placement keeps titles further from loud low-mid energy and leaves
+    // breathing room under the top buttons. The full-height anchor line still
+    // spans the plot. Pins in adjacent columns render side-by-side so × rects
+    // stay unique per anchor.
+    let pill_top = plot.top() + plot.height() * (1.0 / 5.0);
+    let anchor_layouts: Vec<AnchorLayout> = anchors
+        .iter()
+        .copied()
+        .map(|f| {
+            let x = x_from_freq(f);
+            let label = fmt_freq(f);
+            let (pill_rect, x_rect) = measure_anchor_pill(&painter, x, pill_top, &label, true);
+            AnchorLayout {
+                freq_hz: f,
+                line_x: x,
+                pill_rect,
+                x_rect,
+            }
+        })
+        .collect();
+
+    // Hit-test: is the pointer over one of the × buttons right now?
+    let hover_pos = response.hover_pos();
+    let hovered_delete: Option<usize> = hover_pos.and_then(|p| {
+        anchor_layouts
+            .iter()
+            .position(|a| a.x_rect.contains(p))
+    });
+
+    // Click handling: delete takes precedence over "add new anchor".
+    // The overlay_rect check is belt-and-braces - `ui.put` / `scope_builder`
+    // below normally claim clicks in the Pretty / Clear-all button rects,
+    // but we still guard it in case widget stacking order ever changes.
+    if response.clicked() {
+        if let Some(click_pos) = response.interact_pointer_pos() {
+            let delete_idx = anchor_layouts
+                .iter()
+                .position(|a| a.x_rect.contains(click_pos));
+            if let Some(idx) = delete_idx {
+                anchors.remove(idx);
+            } else if plot.contains(click_pos) && !overlay_rect.contains(click_pos) {
+                // `effective_x` folds in the Shift fine-control offset, so a
+                // click while holding Shift commits exactly what the hover
+                // line was indicating (not the raw OS cursor position).
+                let new_f = freq_from_x(effective_x(click_pos.x)).clamp(f_min, f_max);
+                let new_log = new_f.log10();
+                let duplicate = anchors
+                    .iter()
+                    .any(|a| (a.log10() - new_log).abs() < ANCHOR_DEDUPE_LOG_HZ);
+                if !duplicate {
+                    anchors.push(new_f);
+                    anchors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
+        }
+    }
+
+    // Cursor feedback: pointing-hand over a delete target, crosshair anywhere
+    // else inside the plot body. Outside the plot we leave the cursor alone
+    // so neighbouring widgets (scroll area, window edge) behave normally.
+    if let Some(p) = hover_pos {
+        if hovered_delete.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        } else if plot.contains(p) && !overlay_rect.contains(p) {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        }
+    }
+
+    // Draw anchor lines + pills. Pills go on top of the line so the label
+    // stays readable even when the line crosses the trace peak behind it.
+    for (i, a) in anchor_layouts.iter().enumerate() {
+        painter.line_segment(
+            [pos2(a.line_x, plot.top()), pos2(a.line_x, plot.bottom())],
+            Stroke::new(1.0, ANCHOR_LINE_COL),
+        );
+        let label = fmt_freq(a.freq_hz);
+        draw_anchor_pill(&painter, a, &label, hovered_delete == Some(i));
+    }
+
+    // Draw the hover cursor line. Keep it out of the checkbox footprint and
+    // hide it while the cursor is over a delete button (the anchor's own pill
+    // already reports the same frequency, drawing a second one on top of it
+    // just adds visual noise during the split second before deletion).
+    //
+    // `effective_x` applies the Shift fine-control scaling so the line reads
+    // as a slow-moving virtual cursor while Shift is held.
+    if let Some(p) = hover_pos {
+        if plot.contains(p) && !overlay_rect.contains(p) && hovered_delete.is_none() {
+            let line_x = effective_x(p.x);
+            painter.line_segment(
+                [pos2(line_x, plot.top()), pos2(line_x, plot.bottom())],
+                Stroke::new(1.0, HOVER_LINE_COL),
+            );
+            let label = fmt_freq(freq_from_x(line_x).clamp(f_min, f_max));
+            draw_hover_pill(&painter, line_x, pill_top, &label);
+        }
+    }
+
     // Soft outer border tying it in with the rest of the UI.
     painter.rect_stroke(
         rect,
@@ -418,28 +627,235 @@ pub fn show_spectrum(
         egui::StrokeKind::Inside,
     );
 
-    // Top-right "Pretty" toggle. Placed via `ui.put` so it paints on top of the trace and
-    // stays clickable even though the plot itself claimed its rect with `Sense::hover()`.
-    {
-        const CB_W: f32 = 78.0;
-        const CB_H: f32 = 18.0;
-        const CB_MARGIN_R: f32 = 10.0;
-        const CB_MARGIN_T: f32 = 6.0;
-        let cb_rect = Rect::from_min_size(
-            pos2(rect.right() - CB_W - CB_MARGIN_R, rect.top() + CB_MARGIN_T),
-            vec2(CB_W, CB_H),
-        );
-        ui.put(
-            cb_rect,
-            Checkbox::new(
-                pretty_mode,
-                RichText::new("Pretty").size(11.0).color(LABEL_COL),
-            ),
-        );
+    // Top-right button stack: "Pretty" (toggle) above "Clear all" (action).
+    // Both are plain `Button`s laid out via `scope_builder` so they share
+    // visual treatment (small, same frame, same hit behaviour) - the
+    // previous Checkbox widget was the odd one out visually.
+    //
+    // The Pretty button's label is a `LayoutJob` whose characters are
+    // coloured from the pretty-mode waveform palette when the mode is
+    // active, giving the button itself a miniature warm→cool gradient
+    // that directly echoes the trace it controls. In its off state the
+    // label is just the regular `LABEL_COL` so it reads identically to
+    // Clear-all until you click it on.
+    let pretty_label = if *pretty_mode {
+        gradient_pretty_label(11.0)
+    } else {
+        RichText::new("Pretty").size(11.0).color(LABEL_COL).into()
+    };
+    let pretty_resp = ui
+        .scope_builder(
+            UiBuilder::new()
+                .max_rect(pretty_rect)
+                .layout(Layout::centered_and_justified(Direction::TopDown)),
+            |ui| ui.add(Button::new(pretty_label).small()),
+        )
+        .inner;
+    if pretty_resp.clicked() {
+        *pretty_mode = !*pretty_mode;
+    }
+
+    // "Clear all" sits below Pretty. Always present so users learn the
+    // affordance exists, but disabled + greyed by egui when the anchor list
+    // is empty. `add_enabled(false, ..)` gives the built-in disabled tint +
+    // no-click behaviour without hand-rolling dimmed colours.
+    let clear_enabled = !anchors.is_empty();
+    let clear_resp = ui
+        .scope_builder(
+            UiBuilder::new()
+                .max_rect(clear_rect)
+                .layout(Layout::centered_and_justified(Direction::TopDown)),
+            |ui| {
+                ui.add_enabled(
+                    clear_enabled,
+                    Button::new(RichText::new("Clear all").size(11.0).color(LABEL_COL))
+                        .small(),
+                )
+            },
+        )
+        .inner;
+    if clear_resp.clicked() {
+        anchors.clear();
     }
 
     let _ = vec2(0.0, 0.0); // keep `vec2` used.
     response
+}
+
+/// Build a `WidgetText` with per-character colouring sampled from the warm→cool
+/// pretty-mode palette. Used for the "Pretty" toggle button's active-state
+/// label so the control visually echoes the waveform it enables. Characters
+/// are distributed linearly across the full palette range so the first
+/// character always reads as the low-band red and the last as the high-band
+/// violet, regardless of text length.
+fn gradient_pretty_label(size: f32) -> egui::WidgetText {
+    use egui::text::{LayoutJob, TextFormat};
+    const TEXT: &str = "Pretty";
+    let mut job = LayoutJob::default();
+    let chars: Vec<char> = TEXT.chars().collect();
+    let n = chars.len();
+    let font = FontId::proportional(size);
+    for (i, c) in chars.iter().enumerate() {
+        let t = if n <= 1 {
+            0.0
+        } else {
+            i as f32 / (n - 1) as f32
+        };
+        let (r, g, b) = pretty_rgb_at_t(t);
+        job.append(
+            &c.to_string(),
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: Color32::from_rgb(r, g, b),
+                ..Default::default()
+            },
+        );
+    }
+    job.into()
+}
+
+/// Sample the pretty palette at a parameterised position `t ∈ [0, 1]` with
+/// piecewise-linear interpolation between the five `PRETTY_ANCHORS_RGB`
+/// entries. Separate from `pretty_rgb_at_hz` because the button layout uses
+/// character index, not frequency, as its x-coordinate - we want the gradient
+/// evenly spread across the word rather than compressed to wherever 30 Hz /
+/// 15 kHz fall on the log axis.
+fn pretty_rgb_at_t(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let segs = PRETTY_ANCHORS_RGB.len() - 1;
+    let scaled = t * segs as f32;
+    let i = (scaled as usize).min(segs - 1);
+    let lt = scaled - i as f32;
+    let a = PRETTY_ANCHORS_RGB[i];
+    let b = PRETTY_ANCHORS_RGB[i + 1];
+    let lerp = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * lt)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+}
+
+/// Format a frequency for label display. Matches the visual conventions on the
+/// bottom ruler (sub-1 kHz in Hz, >= 1 kHz in kHz) but with a little more
+/// precision - users pin anchors at musically meaningful values like 440 Hz or
+/// 2.50 kHz and want those read back exactly, not rounded to "2k".
+fn fmt_freq(hz: f32) -> String {
+    if hz >= 10_000.0 {
+        format!("{:.1} kHz", hz / 1000.0)
+    } else if hz >= 1_000.0 {
+        format!("{:.2} kHz", hz / 1000.0)
+    } else if hz >= 100.0 {
+        format!("{:.0} Hz", hz)
+    } else {
+        format!("{:.1} Hz", hz)
+    }
+}
+
+const PILL_PAD_X: f32 = 4.0;
+const PILL_PAD_Y: f32 = 2.0;
+const PILL_FONT_PX: f32 = 10.0;
+const X_BUTTON_SIZE: f32 = 11.0;
+const X_BUTTON_GAP: f32 = 3.0;
+
+/// Measure the pill + optional × rects for a frequency label so the caller can
+/// hit-test them *before* deciding whether to repaint. Returns rects in screen
+/// space, centered horizontally on `anchor_x`, sitting at `top` y. The × rect
+/// is `Rect::NOTHING` when `with_x = false`.
+fn measure_anchor_pill(
+    painter: &Painter,
+    anchor_x: f32,
+    top: f32,
+    label: &str,
+    with_x: bool,
+) -> (Rect, Rect) {
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::proportional(PILL_FONT_PX),
+        ANCHOR_PILL_FG,
+    );
+    let text_size = galley.size();
+    let x_w = if with_x { X_BUTTON_GAP + X_BUTTON_SIZE } else { 0.0 };
+    let total_w = text_size.x + PILL_PAD_X * 2.0 + x_w;
+    let total_h = text_size.y + PILL_PAD_Y * 2.0;
+    let pill = Rect::from_min_size(
+        pos2(anchor_x - total_w * 0.5, top),
+        vec2(total_w, total_h),
+    );
+    let x_rect = if with_x {
+        let x_center_x = pill.right() - PILL_PAD_X - X_BUTTON_SIZE * 0.5;
+        let x_center_y = pill.center().y;
+        Rect::from_center_size(
+            pos2(x_center_x, x_center_y),
+            vec2(X_BUTTON_SIZE, X_BUTTON_SIZE),
+        )
+    } else {
+        Rect::NOTHING
+    };
+    (pill, x_rect)
+}
+
+fn draw_anchor_pill(painter: &Painter, anchor: &AnchorLayout, label: &str, x_hovered: bool) {
+    painter.rect_filled(anchor.pill_rect, 3.0, ANCHOR_PILL_BG);
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::proportional(PILL_FONT_PX),
+        ANCHOR_PILL_FG,
+    );
+    painter.galley(
+        pos2(
+            anchor.pill_rect.left() + PILL_PAD_X,
+            anchor.pill_rect.top() + PILL_PAD_Y,
+        ),
+        galley,
+        ANCHOR_PILL_FG,
+    );
+
+    // × glyph drawn as two stroke segments. Scales down a hair (`0.3`) from the
+    // hit-rect so there's visible padding between the cross arms and the pill
+    // edge; hover state just brightens + warms the stroke colour without
+    // changing geometry so the layout doesn't shift when the user approaches.
+    let c = anchor.x_rect.center();
+    let arm = X_BUTTON_SIZE * 0.3;
+    let col = if x_hovered { ANCHOR_X_HOVER_FG } else { ANCHOR_X_FG };
+    let sw = if x_hovered { 1.4 } else { 1.2 };
+    painter.line_segment(
+        [pos2(c.x - arm, c.y - arm), pos2(c.x + arm, c.y + arm)],
+        Stroke::new(sw, col),
+    );
+    painter.line_segment(
+        [pos2(c.x + arm, c.y - arm), pos2(c.x - arm, c.y + arm)],
+        Stroke::new(sw, col),
+    );
+}
+
+fn draw_hover_pill(painter: &Painter, anchor_x: f32, top: f32, label: &str) {
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::proportional(PILL_FONT_PX),
+        HOVER_PILL_FG,
+    );
+    let text_size = galley.size();
+    let total_w = text_size.x + PILL_PAD_X * 2.0;
+    let total_h = text_size.y + PILL_PAD_Y * 2.0;
+    let pill = Rect::from_min_size(
+        pos2(anchor_x - total_w * 0.5, top),
+        vec2(total_w, total_h),
+    );
+    painter.rect_filled(pill, 3.0, HOVER_PILL_BG);
+    painter.galley(
+        pos2(pill.left() + PILL_PAD_X, pill.top() + PILL_PAD_Y),
+        galley,
+        HOVER_PILL_FG,
+    );
+}
+
+struct AnchorLayout {
+    freq_hz: f32,
+    line_x: f32,
+    pill_rect: Rect,
+    x_rect: Rect,
 }
 
 /// Sample the warm→cool pretty-mode palette at `f_hz`. Interpolates linearly in log-frequency

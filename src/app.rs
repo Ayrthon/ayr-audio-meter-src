@@ -96,6 +96,13 @@ pub struct AudioMeterApp {
     /// of the default monochrome translucent look. Toggled via the checkbox in
     /// the top-right corner of the spectrum view.
     spectrum_pretty_mode: bool,
+    /// User-pinned frequency reference lines, as Hz. Kept sorted ascending so the
+    /// draw order and duplicate-click heuristics are deterministic. Lives in
+    /// memory for the duration of the app session; there's no config file yet,
+    /// adding one here would be a cross-cutting change for a list most users
+    /// rebuild per listening session anyway. Managed entirely inside
+    /// `spectrum_view::show_spectrum` - `app` only owns the storage.
+    spectrum_anchors: Vec<f32>,
     meter_states: Vec<MeterState>,
     history: SharedHistory,
     engine: Option<AudioEngine>,
@@ -190,6 +197,7 @@ impl AudioMeterApp {
             spectrum: make_shared_spectrum(),
             analyzer: SpectrumAnalyzer::new(),
             spectrum_pretty_mode: false,
+            spectrum_anchors: Vec::new(),
             meter_states,
             history,
             engine: None,
@@ -799,6 +807,7 @@ impl AudioMeterApp {
                     let cfg = config_for(self.mode);
                     let (mid_name, high_name) = match cfg.palette {
                         crate::meter::ColorPalette::ProTools => ("Green", "Orange"),
+                        crate::meter::ColorPalette::Obs => ("Green", "Yellow"),
                         crate::meter::ColorPalette::Standard => ("Green", "Yellow"),
                     };
                     let mode_zone_hint = format!(
@@ -1088,6 +1097,7 @@ impl AudioMeterApp {
                                 &self.spectrum,
                                 now,
                                 &mut self.spectrum_pretty_mode,
+                                &mut self.spectrum_anchors,
                             );
                         });
                 }

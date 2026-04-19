@@ -17,6 +17,8 @@ pub const COL_TICK: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x78);
 pub const COL_TICK_MAJOR: Color32 = Color32::from_rgb(0xa4, 0xa4, 0xb0);
 pub const COL_TEXT: Color32 = Color32::from_rgb(0xe6, 0xe6, 0xee);
 pub const COL_TEXT_DIM: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x94);
+/// OBS Yami theme: `qproperty-majorTickColor: var(--white5)` (#969696).
+pub const COL_OBS_TICK_MAJOR: Color32 = Color32::from_rgb(0x96, 0x96, 0x96);
 // RMS / "pressure" line — drawn inside the filled bar to show the
 // averaged energy level below the peak.  Near-black with high alpha
 // so it reads clearly against bright green / orange / olive fills.
@@ -26,6 +28,9 @@ pub const COL_HOLD: Color32 = Color32::WHITE;
 pub const COL_CLIP_OFF: Color32 = Color32::from_rgb(0x33, 0x14, 0x1a);
 pub const COL_CLIP_ON: Color32 = Color32::from_rgb(0xff, 0x3b, 0x2e);
 pub const COL_REFERENCE: Color32 = Color32::from_rgb(0xff, 0xcc, 0x33);
+/// OBS Yami theme: dashed alignment line at -20 dBFS should read as a warm
+/// mustard dash (not the generic Pro Tools amber used by `COL_REFERENCE`).
+pub const COL_OBS_REFERENCE: Color32 = Color32::from_rgb(0xe5, 0xaf, 0x24);
 pub const COL_READOUT_BG: Color32 = Color32::from_rgb(0x0c, 0x0c, 0x0f);
 pub const COL_READOUT_BORDER: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x33);
 pub const COL_READOUT_TEXT: Color32 = Color32::from_rgb(0xd6, 0xd6, 0xdf);
@@ -54,6 +59,25 @@ pub const PT_ORANGE_BG: Color32 = Color32::from_rgb(0x2e, 0x1c, 0x08);
 pub const STD_DIM_GREEN:    Color32 = Color32::from_rgb(0x1b, 0x97, 0x3c);
 pub const STD_DIM_GREEN_BG: Color32 = Color32::from_rgb(0x07, 0x1e, 0x0e);
 
+// OBS **Yami** theme (default dark skin) — `frontend/data/themes/Yami.obt`
+// VolumeMeter block maps qproperty colours to:
+//   foregroundNominalColor  = var(--green2)  #37D247
+//   foregroundWarningColor  = var(--yellow2) #E5AF24
+//   foregroundErrorColor    = var(--red2)    #E33B57
+//   backgroundNominalColor  = var(--green5) #17641E
+//   backgroundWarningColor  = var(--yellow5)#6E520D
+//   backgroundErrorColor    = var(--red5)    #7D1224
+//
+// OBS still ships classic themes (e.g. `Yami_Classic.ovt`) with the older
+// neon RGB literals from `VolumeMeter.cpp`, but the screenshot you sent
+// matches the modern Yami palette above — that's what we mirror here.
+pub const OBS_GREEN_BG:   Color32 = Color32::from_rgb(0x17, 0x64, 0x1e);
+pub const OBS_YELLOW_BG:  Color32 = Color32::from_rgb(0x6e, 0x52, 0x0d);
+pub const OBS_RED_BG:     Color32 = Color32::from_rgb(0x7d, 0x12, 0x24);
+pub const OBS_GREEN:      Color32 = Color32::from_rgb(0x37, 0xd2, 0x47);
+pub const OBS_YELLOW:     Color32 = Color32::from_rgb(0xe5, 0xaf, 0x24);
+pub const OBS_RED:        Color32 = Color32::from_rgb(0xe3, 0x3b, 0x57);
+
 #[derive(Clone, Copy)]
 pub struct ZoneStyle {
     pub fill: Color32,
@@ -64,6 +88,17 @@ pub struct ZoneStyle {
 /// `low` → `mid` → `high` → `over`.
 pub fn zone_styles(palette: ColorPalette) -> [ZoneStyle; 4] {
     match palette {
+        ColorPalette::Obs => [
+            // `zone_low_top_db` is MIN_DB in OBS mode, so this first slot
+            // collapses to zero height; keep it defined anyway for consistency.
+            ZoneStyle { fill: OBS_GREEN,  bg: OBS_GREEN_BG },
+            // Bottom active band (-60 .. -20 dBFS): bright green.
+            ZoneStyle { fill: OBS_GREEN,  bg: OBS_GREEN_BG },
+            // Mid caution band (-20 .. -9 dBFS): yellow.
+            ZoneStyle { fill: OBS_YELLOW, bg: OBS_YELLOW_BG },
+            // Top hot band (-9 .. 0 dBFS): red.
+            ZoneStyle { fill: OBS_RED,    bg: OBS_RED_BG },
+        ],
         ColorPalette::ProTools => [
             ZoneStyle { fill: PT_LOW,      bg: PT_LOW_BG },
             ZoneStyle { fill: METER_GREEN, bg: METER_GREEN_BG },
@@ -88,12 +123,40 @@ pub fn zone_tops_db(cfg: &MeterConfig) -> [f32; 4] {
     [low, mid, high, MAX_DB]
 }
 
+/// Peak-hold segment colour for OBS-style meters. Mirrors the logic in
+/// `obs-studio/frontend/components/VolumeMeter.cpp` (`getPeakColor` /
+/// `paintEvent`): the short horizontal hold bar takes the **foreground**
+/// colour of whichever band its dB level currently sits in, not a flat white.
+#[inline]
+fn obs_peak_hold_color(hold_db: f32, tops_db: &[f32; 4], styles: &[ZoneStyle; 4]) -> Color32 {
+    const MIN_INPUT_DB: f32 = -50.0;
+    if hold_db < MIN_INPUT_DB {
+        return styles[1].bg;
+    }
+    if hold_db >= tops_db[2] {
+        styles[3].fill
+    } else if hold_db >= tops_db[1] {
+        styles[2].fill
+    } else {
+        styles[1].fill
+    }
+}
+
 pub const BAR_TOP_PAD: f32 = 26.0;
-pub const BAR_BOTTOM_PAD_WITH_LABEL: f32 = 46.0;
+/// Bottom padding when a channel label is shown. Must cover:
+///   live strip + gap + readout + gap + label.
+pub const BAR_BOTTOM_PAD_WITH_LABEL: f32 = 58.0;
+/// Bottom padding when no channel label (still need readout + strip).
+pub const BAR_BOTTOM_PAD_NO_LABEL: f32 = 40.0;
+/// Thin status strip beneath the bar (OBS-style input indicator concept).
+/// Its colour tracks the currently "active" band in real time.
+pub const BAR_INPUT_INDICATOR_H: f32 = 6.0;
+pub const BAR_INPUT_INDICATOR_GAP: f32 = 3.0;
 pub const CLIP_H: f32 = 9.0;
 pub const MODE_H: f32 = 14.0;
 pub const READOUT_H: f32 = 22.0;
 pub const LABEL_H: f32 = 18.0;
+pub const READOUT_GAP: f32 = 2.0;
 
 pub const METER_WIDTH: f32 = 92.0;
 pub const METER_MIN_HEIGHT: f32 = 300.0;
@@ -176,13 +239,22 @@ impl MeterState {
             self.peak_db = INF_FLOOR_DB;
         }
 
-        self.rms_db = approach(
-            self.rms_db,
-            self.target_rms,
-            dt,
-            cfg.rms_attack_tau,
-            cfg.rms_release_tau,
-        );
+        if let Some(tau) = cfg.rms_linear_blend_tau {
+            // OBS `VolumeMeter::calculateBallisticsForChannel` magnitude path:
+            // `attack = (current - display) * (dt / magnitudeIntegrationTime) * 0.99`
+            // then clamp to [-60, 0] dB on the widget side.
+            let step = (dt / tau) * 0.99;
+            self.rms_db += (self.target_rms - self.rms_db) * step;
+            self.rms_db = self.rms_db.clamp(MIN_DB, MAX_DB);
+        } else {
+            self.rms_db = approach(
+                self.rms_db,
+                self.target_rms,
+                dt,
+                cfg.rms_attack_tau,
+                cfg.rms_release_tau,
+            );
+        }
         if self.rms_db < INF_FLOOR_DB {
             self.rms_db = INF_FLOOR_DB;
         }
@@ -202,9 +274,14 @@ impl MeterState {
             self.hold_db = hold_source;
             self.hold_set_at = now;
         } else if (now - self.hold_set_at) as f32 > cfg.hold_time {
-            self.hold_db -= cfg.hold_release_db_per_sec * dt;
-            if self.hold_db < hold_source {
+            if cfg.hold_snap_after_timeout {
                 self.hold_db = hold_source;
+                self.hold_set_at = now;
+            } else {
+                self.hold_db -= cfg.hold_release_db_per_sec * dt;
+                if self.hold_db < hold_source {
+                    self.hold_db = hold_source;
+                }
             }
         }
         if self.hold_db < INF_FLOOR_DB {
@@ -248,9 +325,14 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     let bottom_pad = if has_label {
         BAR_BOTTOM_PAD_WITH_LABEL
     } else {
-        READOUT_H + 4.0
+        BAR_BOTTOM_PAD_NO_LABEL
     };
     let bar_top = rect.top() + BAR_TOP_PAD;
+    // `bar_bottom` is the **physical bottom edge of the meter bar** — the
+    // dB scale maps linearly between `bar_top` (0 dBFS) and `bar_bottom`
+    // (MIN_DB). The live indicator strip + readout live *below* this line in
+    // `bottom_pad` space; shrinking `bar_bottom` to make room for them was
+    // what broke tick alignment against the coloured bar.
     let bar_bottom = rect.bottom() - bottom_pad;
 
     // --- background ----------------------------------------------
@@ -311,10 +393,39 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
         );
     }
 
+    // --- bottom live indicator strip ----------------------------
+    // Small always-visible strip directly below the bar, coloured by the
+    // current meter level's active zone. Mirrors the "tiny always-on colour
+    // piece" users expect from OBS-like meters and gives us extra breathing
+    // room for the bottom ruler labels.
+    let indicator_col = if fill_db < -50.0 {
+        // Very quiet/silent -> show the zone background, not lit fill.
+        styles[1].bg
+    } else if fill_db >= tops[2] {
+        styles[3].fill
+    } else if fill_db >= tops[1] {
+        styles[2].fill
+    } else {
+        styles[1].fill
+    };
+    let indicator_rect = Rect::from_min_max(
+        pos2(bar_x, bar_bottom + BAR_INPUT_INDICATOR_GAP),
+        pos2(
+            bar_x + bar_w,
+            bar_bottom + BAR_INPUT_INDICATOR_GAP + BAR_INPUT_INDICATOR_H,
+        ),
+    );
+    painter.rect_filled(indicator_rect, 0.5, indicator_col);
+
     // --- reference dashed line ----------------------------------
     if cfg.reference_db > MIN_DB && cfg.reference_db <= 0.0 {
         let ref_y = scale.dbfs_to_y(cfg.reference_db, bar_top, bar_bottom);
-        draw_dashed_h(&painter, bar_x, bar_x + bar_w, ref_y, COL_REFERENCE, 4.0, 3.0, 1.1);
+        let ref_col = if cfg.palette == ColorPalette::Obs {
+            COL_OBS_REFERENCE
+        } else {
+            COL_REFERENCE
+        };
+        draw_dashed_h(&painter, bar_x, bar_x + bar_w, ref_y, ref_col, 4.0, 3.0, 1.1);
     }
 
     // --- RMS "pressure" line (inside the fill) -------------------
@@ -337,7 +448,12 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     // --- peak-hold --------------------------------------------
     if args.state.hold_db > INF_FLOOR_DB + 0.5 {
         let hold_y = scale.dbfs_to_y(args.state.hold_db, bar_top, bar_bottom);
-        painter.hline(bar_x..=bar_x + bar_w, hold_y, Stroke::new(1.5, COL_HOLD));
+        let hold_col = if cfg.palette == ColorPalette::Obs {
+            obs_peak_hold_color(args.state.hold_db, &tops, &styles)
+        } else {
+            COL_HOLD
+        };
+        painter.hline(bar_x..=bar_x + bar_w, hold_y, Stroke::new(1.5, hold_col));
     }
 
     // --- border ----------------------------------------------
@@ -349,6 +465,11 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     );
 
     // --- scale ticks + labels ---------------------------------
+    let tick_major_col = if cfg.palette == ColorPalette::Obs {
+        COL_OBS_TICK_MAJOR
+    } else {
+        COL_TICK_MAJOR
+    };
     for &disp in scale.tick_display_values() {
         if disp > scale.disp_max || disp < scale.disp_min {
             continue;
@@ -363,11 +484,11 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
         }
         painter.line_segment(
             [pos2(bar_x - 3.0, y), pos2(bar_x - 1.0, y)],
-            Stroke::new(1.0, COL_TICK_MAJOR),
+            Stroke::new(1.0, tick_major_col),
         );
         painter.line_segment(
             [pos2(bar_x + bar_w, y), pos2(bar_x + bar_w + 3.0, y)],
-            Stroke::new(1.0, COL_TICK_MAJOR),
+            Stroke::new(1.0, tick_major_col),
         );
         let label = scale.tick_label(disp);
         painter.text(
@@ -378,22 +499,15 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
             COL_TEXT_DIM,
         );
     }
-    if matches!(scale.kind, crate::meter::MeterScaleKind::Dbf) {
-        painter.text(
-            pos2(bar_x - 4.0, bar_bottom),
-            egui::Align2::RIGHT_CENTER,
-            "\u{221E}",
-            FontId::proportional(FONT_TICK),
-            COL_TEXT_DIM,
-        );
-    }
 
     // --- readout pill -----------------------------------------
     // The pill spans (almost) the full meter width rather than just the
     // bar area so the two values have enough room at the larger font.
+    // Keep the readout below the live strip; otherwise the panel covers it.
+    let readout_top = indicator_rect.bottom() + READOUT_GAP;
     let readout_rect = Rect::from_min_max(
-        pos2(rect.left() + 3.0, bar_bottom + 3.0),
-        pos2(rect.right() - 3.0, bar_bottom + 3.0 + READOUT_H),
+        pos2(rect.left() + 3.0, readout_top),
+        pos2(rect.right() - 3.0, readout_top + READOUT_H),
     );
     painter.rect_filled(readout_rect, 3.0, COL_READOUT_BG);
     painter.rect_stroke(
@@ -546,12 +660,17 @@ pub fn show_reference_label(ui: &mut Ui, mode: MeterMode) -> Response {
     let bar_bottom = rect.bottom() - BAR_BOTTOM_PAD_WITH_LABEL;
     if cfg.reference_db > MIN_DB && cfg.reference_db <= 0.0 {
         let y = scale.dbfs_to_y(cfg.reference_db, bar_top, bar_bottom);
+        let ref_col = if cfg.palette == ColorPalette::Obs {
+            COL_OBS_REFERENCE
+        } else {
+            COL_REFERENCE
+        };
         painter.text(
             pos2(rect.left() + 4.0, y),
             egui::Align2::LEFT_CENTER,
             scale.reference_label_text(),
             FontId::proportional(FONT_REF_LABEL),
-            COL_REFERENCE,
+            ref_col,
         );
     }
     response

@@ -6,6 +6,11 @@ pub const MIN_DB: f32 = -60.0;
 /// Digital full scale (top of the dBFS ruler).
 pub const MAX_DB: f32 = 0.0;
 
+/// OBS **Settings → Audio → Meter decay rate → Fast** (`VOLUME_METER_DECAY_FAST`
+/// in `OBSBasicSettings.hpp`, default in `OBSBasic.cpp`). Linear dB/s fall of the
+/// painted peak; ~40 dB / 1.7 s.
+pub const OBS_METER_DECAY_FAST_DB_PER_SEC: f32 = 23.53;
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MeterMode {
@@ -34,7 +39,7 @@ impl MeterMode {
     pub fn display_name(self) -> &'static str {
         match self {
             MeterMode::SamplePeak => "Sample Peak  (Pro Tools)",
-            MeterMode::Obs => "OBS  (Sample Peak, AL -20 / PML -9)",
+            MeterMode::Obs => "OBS  (Fast decay, Sample Peak, AL -20 / PML -9)",
             MeterMode::DigitalPpm => "Digital PPM  (ATEM, EBU/BBC)",
             MeterMode::TruePeak => "True Peak  (EBU R128, Loudness)",
             MeterMode::Vu => "VU  (Analog / SMPTE)",
@@ -94,6 +99,8 @@ pub enum FillSource {
 pub enum ColorPalette {
     /// Bright green → yellow → red.  Matches OBS, PPM, K-System, VU.
     Standard,
+    /// OBS-style face: green (safe) → mustard/amber (caution) → red (hot).
+    Obs,
     /// Dark olive → bright green → orange (+ red LED).  Matches Avid
     /// Pro Tools' Sample Peak / Pro Tools Classic meter.
     ProTools,
@@ -107,6 +114,13 @@ pub struct MeterConfig {
     pub rms_release_tau: f32,
     pub hold_time: f32,
     pub hold_release_db_per_sec: f32,
+    /// When true, after `hold_time` without a new maximum the hold **jumps** to
+    /// the current level (OBS `VolumeMeter` peak-hold). When false, the hold
+    /// decays at `hold_release_db_per_sec`.
+    pub hold_snap_after_timeout: bool,
+    /// When set, RMS / magnitude smoothing uses OBS's per-frame linear step in
+    /// dB (`Δ * (dt/τ) * 0.99`, clamped) instead of exponential `approach`.
+    pub rms_linear_blend_tau: Option<f32>,
     pub fill_source: FillSource,
     pub show_rms_line: bool,
     pub true_peak: bool,
@@ -141,6 +155,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             // Pro Tools default: Peak Hold = 3 seconds.
             hold_time: 3.0,
             hold_release_db_per_sec: 10.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
@@ -151,20 +167,30 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             palette: ColorPalette::ProTools,
         },
         MeterMode::Obs => MeterConfig {
-            peak_attack_tau: 0.010,
-            peak_release_db_per_sec: 35.0,
+            // Peak attack/decay/hold/RMS: `VolumeMeter.cpp`. Decay rate is taken
+            // from the user's `MeterDecayRate` setting; we lock to OBS default
+            // **Fast** — `OBS_METER_DECAY_FAST_DB_PER_SEC` (23.53 dB/s).
+            peak_attack_tau: 0.0,
+            peak_release_db_per_sec: OBS_METER_DECAY_FAST_DB_PER_SEC,
             rms_attack_tau: 0.300,
             rms_release_tau: 0.300,
-            hold_time: 2.2,
+            hold_time: 20.0,
             hold_release_db_per_sec: 10.0,
+            hold_snap_after_timeout: true,
+            rms_linear_blend_tau: Some(0.3),
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
+            // OBS sample-peak meter definitions from upstream:
+            //   Alignment Level (AL)       = -20 dBFS
+            //   Permitted Maximum Level    =  -9 dBFS
+            // with ruler labels every 6 dB. This places transitions visually
+            // between -24/-18 and -12/-6 ticks, matching OBS.
             reference_db: -20.0,
             zone_low_top_db: MIN_DB,
             zone_mid_top_db: -20.0,
             zone_high_top_db: -9.0,
-            palette: ColorPalette::Standard,
+            palette: ColorPalette::Obs,
         },
         MeterMode::DigitalPpm => MeterConfig {
             peak_attack_tau: 0.010,
@@ -173,6 +199,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             rms_release_tau: 1.700,
             hold_time: 2.2,
             hold_release_db_per_sec: 6.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
@@ -189,6 +217,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             rms_release_tau: 0.700,
             hold_time: 2.2,
             hold_release_db_per_sec: 10.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: true,
@@ -205,6 +235,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             rms_release_tau: 0.300,
             hold_time: 2.2,
             hold_release_db_per_sec: 10.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
@@ -221,6 +253,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             rms_release_tau: 0.300,
             hold_time: 2.2,
             hold_release_db_per_sec: 6.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
@@ -237,6 +271,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             rms_release_tau: 0.300,
             hold_time: 2.2,
             hold_release_db_per_sec: 6.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
@@ -253,6 +289,8 @@ pub fn config_for(mode: MeterMode) -> MeterConfig {
             rms_release_tau: 0.300,
             hold_time: 2.2,
             hold_release_db_per_sec: 6.0,
+            hold_snap_after_timeout: false,
+            rms_linear_blend_tau: None,
             fill_source: FillSource::Peak,
             show_rms_line: true,
             true_peak: false,
@@ -296,6 +334,10 @@ pub struct MeterScale {
 pub const TICK_DBF: [f32; 11] = [
     0.0, -5.0, -10.0, -15.0, -20.0, -25.0, -30.0, -35.0, -40.0, -50.0, -60.0,
 ];
+/// OBS-style dBFS ruler: 6 dB steps from 0 to -60.
+pub const TICK_OBS: [f32; 11] = [
+    0.0, -6.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0,
+];
 pub const TICK_VU: [f32; 12] = [
     -20.0, -15.0, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0,
 ];
@@ -337,6 +379,13 @@ impl MeterScale {
                 disp_min: -32.0,
                 disp_max: 12.0,
                 ticks: &TICK_K12,
+            },
+            MeterMode::Obs => Self {
+                kind: MeterScaleKind::Dbf,
+                reference_dbfs: 0.0,
+                disp_min: MIN_DB,
+                disp_max: MAX_DB,
+                ticks: &TICK_OBS,
             },
             _ => Self {
                 kind: MeterScaleKind::Dbf,

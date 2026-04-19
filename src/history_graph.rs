@@ -205,15 +205,6 @@ pub fn show_history_graph(
             COL_TEXT_DIM,
         );
     }
-    if matches!(scale.kind, MeterScaleKind::Dbf) {
-        painter.text(
-            pos2(left - 4.0, bottom),
-            egui::Align2::RIGHT_CENTER,
-            "\u{221E}",
-            FontId::proportional(10.5),
-            COL_TEXT_DIM,
-        );
-    }
 
     // Time grid
     for s in (0..=(WINDOW_SECS as i32)).step_by(5) {
