@@ -1,9 +1,9 @@
-; Inno Setup 6 — https://jrsoftware.org/isinfo.php
+﻿; Inno Setup 6 — https://jrsoftware.org/isinfo.php
 ; Build: install Inno Setup 6, run ..\installer\build-installer.ps1 from repo root (or ISCC this file after `cargo build --release`).
 ; Bump MyAppVersion when you bump version in Cargo.toml.
 
 #define MyAppName      "Audio Meter"
-#define MyAppVersion   "0.1.0"
+#define MyAppVersion   "1.3.6"
 #define MyAppPublisher "Ayrthon"
 #define MyAppURL       "https://ayrthon.com"
 #define MyAppExeName   "Audio Meter.exe"
@@ -34,7 +34,11 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppIconFile}
-CloseApplications=no
+; If a previous version is running, the installer can't overwrite the .exe (Windows locks it).
+; `CloseApplications=yes` uses the Restart Manager API to prompt the user to close the running
+; copy automatically, then relaunches it after the install via `RestartApplications=yes`.
+CloseApplications=yes
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
