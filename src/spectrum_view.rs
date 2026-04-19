@@ -223,7 +223,14 @@ pub fn show_spectrum(
     // ----- spectrum path ------------------------------------------
     let nb = analyzer.bucket_dbs.len();
     if nb > 2 {
-        let pixel_step = 1.0_f32;
+        // Sample the Catmull-Rom curve at **physical-pixel** density so the trace stays
+        // crisp at any Windows / egui DPI scale. At 1.0× we get one sample per logical
+        // pixel (unchanged); at 1.5× (common on 1440p/4K) we get 1.5× as many samples so
+        // each physical pixel has a dedicated curve sample instead of being stretched
+        // across 1.5 px of interpolation. Clamped to [1.0, 4.0] to avoid runaway vertex
+        // counts on exotic DPI settings.
+        let ppp = ui.ctx().pixels_per_point().clamp(1.0, 4.0);
+        let pixel_step = 1.0_f32 / ppp;
         let pixel_count = (plot.width() / pixel_step).ceil() as usize;
         if pixel_count > 4 {
             let width = plot.width();
@@ -336,7 +343,19 @@ pub fn show_spectrum(
                 // Single thin stroke (dual wide+halo layers caused a doubled edge on the right).
                 // Colour per segment is the palette sample at the segment midpoint so the
                 // stroke gradient lines up visually with the mesh fill.
+                //
+                // Skip segments where both endpoints sit at the plot floor: the Catmull-Rom
+                // curve naturally clamps to `plot.bottom()` whenever the display dB falls
+                // below -120, and drawing a 1.05 px stroke there produced visible horizontal
+                // "white lines" in bands with nothing but ADC / idle noise (most common in
+                // the sub-bass and ~2 kHz regions where faint system audio / mains leakage
+                // lives on some machines). A half-pixel tolerance is enough to catch the
+                // clamp plateau without cutting off real troughs that only graze the floor.
+                let floor_y = plot.bottom();
                 for (i, w) in pts.windows(2).enumerate() {
+                    if (w[0].y >= floor_y - 0.5) && (w[1].y >= floor_y - 0.5) {
+                        continue;
+                    }
                     let stroke_col = if pretty {
                         let mid = (i as f32 + 0.5) / pixel_count as f32;
                         let f = 10.0_f32.powf(log_fmin + mid * log_range);
