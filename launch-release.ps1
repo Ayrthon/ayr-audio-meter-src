@@ -1,6 +1,13 @@
 # Build and run the release binary in THIS repo's target\release\ (same path the installer uses).
 # Use this when launching from Cursor so builds are not redirected to a sandbox target dir.
 #
+# Staging step: after build, the .exe is copied to %LOCALAPPDATA%\AudioMeter\ and launched from
+# there. Running the binary directly from \\wsl.localhost\... places it in the Internet security
+# zone, which makes Windows show the "We can't verify who created this file" Open File - Security
+# Warning every single launch. Local-drive execution is trusted by SmartScreen, so the warning
+# goes away for dev builds. The original path under target\release\audio-meter-rs.exe is left
+# untouched so installer\build-installer.ps1 can still package it.
+#
 # Usage:  powershell -ExecutionPolicy Bypass -File .\launch-release.ps1
 
 $ErrorActionPreference = "Stop"
@@ -17,5 +24,14 @@ if (-not (Test-Path $Exe)) {
     Write-Error "Missing $Exe - build failed."
 }
 
-Write-Host ('==> Starting ' + $Exe) -ForegroundColor Cyan
-Start-Process -FilePath $Exe -WorkingDirectory $Root -WindowStyle Normal
+$Cache = Join-Path $env:LOCALAPPDATA "AudioMeter"
+if (-not (Test-Path $Cache)) {
+    New-Item -ItemType Directory -Path $Cache | Out-Null
+}
+$LocalExe = Join-Path $Cache "audio-meter-rs.exe"
+Copy-Item -Path $Exe -Destination $LocalExe -Force
+# Strip any Mark-of-the-Web ADS that may have been attached (no-op when absent).
+try { Unblock-File -Path $LocalExe -ErrorAction Stop } catch {}
+
+Write-Host ('==> Starting ' + $LocalExe) -ForegroundColor Cyan
+Start-Process -FilePath $LocalExe -WorkingDirectory $Cache -WindowStyle Normal

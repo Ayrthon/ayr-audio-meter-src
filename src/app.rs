@@ -134,6 +134,7 @@ fn window_w_without_graph(channels: usize) -> f32 {
 impl AudioMeterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
+        log_gl_caps(cc);
         let devices = list_devices().unwrap_or_default();
 
         // Prefer the system default output (loopback) so the user sees
@@ -1095,6 +1096,35 @@ impl AudioMeterApp {
     }
 }
 
+/// One-shot GL capability probe. We ask for 8× MSAA in `main.rs`, but the driver is
+/// free to give us fewer samples (or none) - NVIDIA Optimus and some Intel Arc
+/// profiles force "application-controlled MSAA" off regardless of what the app
+/// requests. Logging the actual `GL_SAMPLES` count makes the difference between
+/// "the trace is stair-stepped because the anti-aliasing plan is wrong" and "the
+/// trace is stair-stepped because MSAA silently isn't running" trivially debuggable.
+fn log_gl_caps(cc: &eframe::CreationContext<'_>) {
+    let Some(gl) = cc.gl.as_ref() else {
+        log::warn!("No glow context available at startup (wgpu renderer?)");
+        return;
+    };
+    use eframe::glow::HasContext;
+    unsafe {
+        let samples = gl.get_parameter_i32(eframe::glow::SAMPLES);
+        let sample_buffers = gl.get_parameter_i32(eframe::glow::SAMPLE_BUFFERS);
+        let renderer = gl.get_parameter_string(eframe::glow::RENDERER);
+        let version = gl.get_parameter_string(eframe::glow::VERSION);
+        log::info!(
+            "GL renderer='{renderer}' version='{version}' MSAA samples={samples} sample_buffers={sample_buffers}"
+        );
+        if samples < 2 {
+            log::warn!(
+                "MSAA not active (GL_SAMPLES={samples}). Requested 8× in main.rs but the driver declined. \
+                 Check NVIDIA/Intel control-panel 'Antialiasing - Mode' and set it to 'Application-controlled'."
+            );
+        }
+    }
+}
+
 fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
@@ -1108,6 +1138,19 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, DIVIDER);
     visuals.override_text_color = Some(Color32::from_rgb(0xd8, 0xd8, 0xe0));
     ctx.set_visuals(visuals);
+    // Widen egui's stroke feathering from the default 1.0 px to 1.5 px. egui's
+    // tessellator adds a fade-to-transparent skirt that wide on each side of every
+    // stroke; it's what keeps thin `Shape::line` calls smooth. On 1.5× DPI Windows
+    // scaling the default 1.0 px feather is only 1.5 physical px wide, which on
+    // shallow diagonals in the spectrum trace still shows faint stair-stepping even
+    // with 8× MSAA on top. Bumping to 1.5 logical px = 2.25 physical px on the same
+    // display gives the gradient a meaningful foothold across two full pixel rows,
+    // which is what actually kills the residual aliasing. Tiny softness penalty on
+    // text/vector widgets, imperceptible at normal viewing distances.
+    ctx.tessellation_options_mut(|opts| {
+        opts.feathering = true;
+        opts.feathering_size_in_pixels = 1.5;
+    });
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(6.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);

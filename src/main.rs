@@ -66,6 +66,17 @@ fn main() -> eframe::Result {
         // Keep vsync off so the renderer doesn't freeze on a monitor
         // transition where the refresh rate changes.
         vsync: false,
+        // 8× MSAA on the GL backbuffer. The spectrum trace is full of shallow
+        // diagonals in log-frequency space; 4 samples was already noticeably
+        // smoother than no MSAA but the crests of steep peaks still showed
+        // faint stair-stepping on 1.5× DPI Windows scaling. 8× gets us close
+        // to CAD-quality edges, at roughly twice the fill-rate cost of 4× -
+        // comfortably absorbed by anything from Intel Iris onward at our
+        // resolution. `apply_theme` also widens egui's own stroke feathering
+        // to 1.5 px on top of this, and `log_gl_caps` reports the actual
+        // sample count the driver handed us (some control-panel profiles
+        // force application-requested MSAA off silently).
+        multisampling: 8,
         ..Default::default()
     };
 

@@ -66,7 +66,7 @@ const LABEL_COL: Color32 = Color32::from_rgb(0xb4, 0xb4, 0xbc);
 
 const FILL_TOP: Color32 = Color32::from_rgba_premultiplied(0x25, 0x27, 0x2c, 0x22);
 const FILL_BOT: Color32 = Color32::from_rgba_premultiplied(0x30, 0x32, 0x38, 0x00);
-const LINE_COL: Color32 = Color32::from_rgba_premultiplied(0x72, 0x72, 0x75, 0x5c);
+const LINE_COL: Color32 = Color32::from_rgba_premultiplied(0x82, 0x82, 0x86, 0x72);
 
 /// "Pretty mode" palette — warm red at the low end through to cool violet at
 /// the top. Anchors are chosen at roughly the centre of each of the five
@@ -85,7 +85,7 @@ const PRETTY_ANCHORS_RGB: [(u8, u8, u8); 5] = [
 /// Alpha for the mesh-fill top vertex in pretty mode (matches `FILL_TOP.a`).
 const PRETTY_FILL_ALPHA: u8 = 0x22;
 /// Alpha for the stroke in pretty mode (matches `LINE_COL.a`).
-const PRETTY_LINE_ALPHA: u8 = 0x5c;
+const PRETTY_LINE_ALPHA: u8 = 0x72;
 
 // Purely cosmetic: shift the whole displayed trace down by this many dB. Used to push the
 // DAC/ADC idle-noise slope (which sits around -80 to -85 dB after the pink tilt, since the
@@ -340,30 +340,71 @@ pub fn show_spectrum(
                 }
                 painter.add(Shape::mesh(mesh));
 
-                // Single thin stroke (dual wide+halo layers caused a doubled edge on the right).
-                // Colour per segment is the palette sample at the segment midpoint so the
-                // stroke gradient lines up visually with the mesh fill.
+                // Stroke pass: one `Shape::line` per contiguous "visible run" (stretches
+                // of the curve that don't sit on the plot floor). egui's own tessellator
+                // feathers the stroke with 1 logical pixel of AA on each side, which is
+                // what actually keeps thin lines smooth - my earlier experiments with
+                // hand-rolled ribbon meshes bypassed that feathering and ended up worse
+                // than the library default. Lesson learnt: let egui do stroke AA.
                 //
-                // Skip segments where both endpoints sit at the plot floor: the Catmull-Rom
-                // curve naturally clamps to `plot.bottom()` whenever the display dB falls
-                // below -120, and drawing a 1.05 px stroke there produced visible horizontal
-                // "white lines" in bands with nothing but ADC / idle noise (most common in
-                // the sub-bass and ~2 kHz regions where faint system audio / mains leakage
-                // lives on some machines). A half-pixel tolerance is enough to catch the
-                // clamp plateau without cutting off real troughs that only graze the floor.
+                // Floor plateaus are still elided: the Catmull-Rom curve clamps to
+                // `plot.bottom()` wherever display dB falls below -120, and drawing any
+                // stroke there produced a horizontal "ghost line" in silent bands (common
+                // in the sub-bass / ~2 kHz regions on machines with mains / ADC leakage).
+                // A half-pixel tolerance catches the clamp plateau without clipping real
+                // troughs that only graze the floor.
+                //
+                // Pretty-mode colouring is per-frequency, but `Shape::line` takes a single
+                // stroke colour. To keep the warm→cool gradient visible we split each run
+                // into fixed-length colour bands (`PRETTY_STROKE_BAND_PX` segments each)
+                // and emit one shape per band, sampled at the band's midpoint. Bands share
+                // their boundary vertex so the miter normals still line up across the seam
+                // and the 1-px feather covers the single-pixel colour step invisibly.
+                const STROKE_W: f32 = 0.8;
+                const PRETTY_STROKE_BAND_PX: usize = 24;
                 let floor_y = plot.bottom();
-                for (i, w) in pts.windows(2).enumerate() {
-                    if (w[0].y >= floor_y - 0.5) && (w[1].y >= floor_y - 0.5) {
-                        continue;
+                let is_floor = |y: f32| y >= floor_y - 0.5;
+
+                let emit_run = |run: &[Pos2], run_start_px: usize| {
+                    if run.len() < 2 {
+                        return;
                     }
-                    let stroke_col = if pretty {
-                        let mid = (i as f32 + 0.5) / pixel_count as f32;
-                        let f = 10.0_f32.powf(log_fmin + mid * log_range);
-                        premul_alpha(pretty_rgb_at_hz(f), PRETTY_LINE_ALPHA)
+                    if pretty {
+                        let mut i = 0;
+                        while i + 1 < run.len() {
+                            let j = (i + PRETTY_STROKE_BAND_PX).min(run.len() - 1);
+                            let mid_px = run_start_px + (i + j) / 2;
+                            let t = mid_px as f32 / pixel_count as f32;
+                            let f = 10.0_f32.powf(log_fmin + t * log_range);
+                            let col = premul_alpha(pretty_rgb_at_hz(f), PRETTY_LINE_ALPHA);
+                            painter.add(Shape::line(
+                                run[i..=j].to_vec(),
+                                Stroke::new(STROKE_W, col),
+                            ));
+                            i = j;
+                        }
                     } else {
-                        LINE_COL
-                    };
-                    painter.line_segment([w[0], w[1]], Stroke::new(1.05, stroke_col));
+                        painter.add(Shape::line(run.to_vec(), Stroke::new(STROKE_W, LINE_COL)));
+                    }
+                };
+
+                let mut run: Vec<Pos2> = Vec::with_capacity(pts.len());
+                let mut run_start_px: usize = 0;
+                for (i, p) in pts.iter().enumerate() {
+                    if is_floor(p.y) {
+                        if !run.is_empty() {
+                            emit_run(&run, run_start_px);
+                            run.clear();
+                        }
+                    } else {
+                        if run.is_empty() {
+                            run_start_px = i;
+                        }
+                        run.push(*p);
+                    }
+                }
+                if !run.is_empty() {
+                    emit_run(&run, run_start_px);
                 }
             }
         }
@@ -511,3 +552,4 @@ fn smooth_triple_1d(v: &mut [f32]) {
         v[i] = 0.2 * src[i - 1] + 0.6 * src[i] + 0.2 * src[i + 1];
     }
 }
+
