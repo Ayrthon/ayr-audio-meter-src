@@ -91,6 +91,11 @@ pub struct AudioMeterApp {
     loudness: SharedLoudness,
     spectrum: SharedSpectrum,
     analyzer: SpectrumAnalyzer,
+    /// "Pretty mode" paints the spectrum trace with a warm→cool palette across
+    /// the five frequency bands (low / low-mid / mid / high-mid / high) instead
+    /// of the default monochrome translucent look. Toggled via the checkbox in
+    /// the top-right corner of the spectrum view.
+    spectrum_pretty_mode: bool,
     meter_states: Vec<MeterState>,
     history: SharedHistory,
     engine: Option<AudioEngine>,
@@ -183,6 +188,7 @@ impl AudioMeterApp {
             loudness: make_shared_loudness(),
             spectrum: make_shared_spectrum(),
             analyzer: SpectrumAnalyzer::new(),
+            spectrum_pretty_mode: false,
             meter_states,
             history,
             engine: None,
@@ -1075,7 +1081,13 @@ impl AudioMeterApp {
                     ScrollArea::horizontal()
                         .id_salt("spectrum_scroll")
                         .show(ui, |ui| {
-                            show_spectrum(ui, &mut self.analyzer, &self.spectrum, now);
+                            show_spectrum(
+                                ui,
+                                &mut self.analyzer,
+                                &self.spectrum,
+                                now,
+                                &mut self.spectrum_pretty_mode,
+                            );
                         });
                 }
             }

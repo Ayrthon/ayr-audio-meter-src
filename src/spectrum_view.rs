@@ -9,7 +9,8 @@
 
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
-    Align2, Color32, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2,
+    Align2, Checkbox, Color32, FontId, Pos2, Rect, Response, RichText, Sense, Shape, Stroke,
+    Ui, pos2, vec2,
 };
 
 use crate::spectrum::{
@@ -67,6 +68,25 @@ const FILL_TOP: Color32 = Color32::from_rgba_premultiplied(0x25, 0x27, 0x2c, 0x2
 const FILL_BOT: Color32 = Color32::from_rgba_premultiplied(0x30, 0x32, 0x38, 0x00);
 const LINE_COL: Color32 = Color32::from_rgba_premultiplied(0x72, 0x72, 0x75, 0x5c);
 
+/// "Pretty mode" palette — warm red at the low end through to cool violet at
+/// the top. Anchors are chosen at roughly the centre of each of the five
+/// classical spectrum bands (low / low-mid / mid / high-mid / high) so the
+/// gradient transitions naturally where band perception transitions. Colours
+/// are unpremultiplied RGB; the painter converts them with `premul_alpha` to
+/// match the current fill / stroke translucency exactly.
+const PRETTY_ANCHORS_HZ: [f32; 5] = [30.0, 180.0, 900.0, 4_000.0, 15_000.0];
+const PRETTY_ANCHORS_RGB: [(u8, u8, u8); 5] = [
+    (0xff, 0x4a, 0x3c), // low:       warm red
+    (0xff, 0x8c, 0x2a), // low-mid:   orange
+    (0xff, 0xd4, 0x3a), // mid:       gold / yellow
+    (0x46, 0xc8, 0xff), // high-mid:  cyan-blue
+    (0xb4, 0x50, 0xff), // high:      violet
+];
+/// Alpha for the mesh-fill top vertex in pretty mode (matches `FILL_TOP.a`).
+const PRETTY_FILL_ALPHA: u8 = 0x22;
+/// Alpha for the stroke in pretty mode (matches `LINE_COL.a`).
+const PRETTY_LINE_ALPHA: u8 = 0x5c;
+
 // Purely cosmetic: shift the whole displayed trace down by this many dB. Used to push the
 // DAC/ADC idle-noise slope (which sits around -80 to -85 dB after the pink tilt, since the
 // tilt adds +14 dB at 20 kHz) below the -100 dB axis bottom so it falls off-screen. Does NOT
@@ -85,6 +105,7 @@ pub fn show_spectrum(
     analyzer: &mut SpectrumAnalyzer,
     _shared: &SharedSpectrum,
     _now: f64,
+    pretty_mode: &mut bool,
 ) -> Response {
     // `analyzer` is ticked in `AudioMeterApp::ui` so the spectrum decays when audio stops even
     // if the History tab is visible.
@@ -261,21 +282,46 @@ pub fn show_spectrum(
                 .collect();
 
             if pts.len() >= 2 {
+                // Per-vertex colours for the fill-mesh top row and the stroke, indexed by
+                // the same pixel position that drives the trace y-value. In pretty mode the
+                // colour is sampled from the warm→cool palette at each pixel's frequency;
+                // in default mode every pixel shares `FILL_TOP` / `LINE_COL` so we simply
+                // reuse those constants.
+                let pretty = *pretty_mode;
+                let fill_top_colors: Vec<Color32> = if pretty {
+                    (0..pts.len())
+                        .map(|i| {
+                            let t = i as f32 / pixel_count as f32;
+                            let f = 10.0_f32.powf(log_fmin + t * log_range);
+                            premul_alpha(pretty_rgb_at_hz(f), PRETTY_FILL_ALPHA)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
                 // Gradient-filled mesh under the curve.
                 let mut mesh = Mesh::default();
                 mesh.vertices.reserve(pts.len() * 2);
                 mesh.indices.reserve((pts.len() - 1) * 6);
                 let bottom_y = plot.bottom();
-                for p in &pts {
+                for (i, p) in pts.iter().enumerate() {
+                    let (top_c, bot_c) = if pretty {
+                        // Fade to fully transparent at the bottom so the hue dissolves into
+                        // the gradient background instead of banding against `FILL_BOT`.
+                        (fill_top_colors[i], Color32::TRANSPARENT)
+                    } else {
+                        (FILL_TOP, FILL_BOT)
+                    };
                     mesh.vertices.push(Vertex {
                         pos: *p,
                         uv: WHITE_UV,
-                        color: FILL_TOP,
+                        color: top_c,
                     });
                     mesh.vertices.push(Vertex {
                         pos: pos2(p.x, bottom_y),
                         uv: WHITE_UV,
-                        color: FILL_BOT,
+                        color: bot_c,
                     });
                 }
                 for i in 0..pts.len() - 1 {
@@ -288,9 +334,17 @@ pub fn show_spectrum(
                 painter.add(Shape::mesh(mesh));
 
                 // Single thin stroke (dual wide+halo layers caused a doubled edge on the right).
-                let line_stroke = Stroke::new(1.05, LINE_COL);
-                for w in pts.windows(2) {
-                    painter.line_segment([w[0], w[1]], line_stroke);
+                // Colour per segment is the palette sample at the segment midpoint so the
+                // stroke gradient lines up visually with the mesh fill.
+                for (i, w) in pts.windows(2).enumerate() {
+                    let stroke_col = if pretty {
+                        let mid = (i as f32 + 0.5) / pixel_count as f32;
+                        let f = 10.0_f32.powf(log_fmin + mid * log_range);
+                        premul_alpha(pretty_rgb_at_hz(f), PRETTY_LINE_ALPHA)
+                    } else {
+                        LINE_COL
+                    };
+                    painter.line_segment([w[0], w[1]], Stroke::new(1.05, stroke_col));
                 }
             }
         }
@@ -304,8 +358,69 @@ pub fn show_spectrum(
         egui::StrokeKind::Inside,
     );
 
+    // Top-right "Pretty" toggle. Placed via `ui.put` so it paints on top of the trace and
+    // stays clickable even though the plot itself claimed its rect with `Sense::hover()`.
+    {
+        const CB_W: f32 = 78.0;
+        const CB_H: f32 = 18.0;
+        const CB_MARGIN_R: f32 = 10.0;
+        const CB_MARGIN_T: f32 = 6.0;
+        let cb_rect = Rect::from_min_size(
+            pos2(rect.right() - CB_W - CB_MARGIN_R, rect.top() + CB_MARGIN_T),
+            vec2(CB_W, CB_H),
+        );
+        ui.put(
+            cb_rect,
+            Checkbox::new(
+                pretty_mode,
+                RichText::new("Pretty").size(11.0).color(LABEL_COL),
+            ),
+        );
+    }
+
     let _ = vec2(0.0, 0.0); // keep `vec2` used.
     response
+}
+
+/// Sample the warm→cool pretty-mode palette at `f_hz`. Interpolates linearly in log-frequency
+/// between the five anchor colours so transitions between bands are smooth gradients instead
+/// of hard stripes.
+fn pretty_rgb_at_hz(f_hz: f32) -> (u8, u8, u8) {
+    let anchors = &PRETTY_ANCHORS_HZ;
+    let cols = &PRETTY_ANCHORS_RGB;
+    if !f_hz.is_finite() || f_hz <= anchors[0] {
+        return cols[0];
+    }
+    if f_hz >= anchors[4] {
+        return cols[4];
+    }
+    for i in 0..4 {
+        if f_hz >= anchors[i] && f_hz < anchors[i + 1] {
+            let ln_f = f_hz.ln();
+            let ln_a = anchors[i].ln();
+            let ln_b = anchors[i + 1].ln();
+            let t = ((ln_f - ln_a) / (ln_b - ln_a).max(1e-9)).clamp(0.0, 1.0);
+            let a = cols[i];
+            let b = cols[i + 1];
+            let lerp8 =
+                |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round().clamp(0.0, 255.0) as u8;
+            return (lerp8(a.0, b.0), lerp8(a.1, b.1), lerp8(a.2, b.2));
+        }
+    }
+    cols[4]
+}
+
+/// Apply premultiplied alpha: `rgb` is the visible unpremultiplied colour, the returned
+/// `Color32` is the correctly-premultiplied form egui needs for its gradient meshes.
+#[inline]
+fn premul_alpha(rgb: (u8, u8, u8), alpha: u8) -> Color32 {
+    let af = alpha as f32 / 255.0;
+    Color32::from_rgba_premultiplied(
+        (rgb.0 as f32 * af).round() as u8,
+        (rgb.1 as f32 * af).round() as u8,
+        (rgb.2 as f32 * af).round() as u8,
+        alpha,
+    )
 }
 
 /// Uniform Catmull-Rom cubic interpolation of `bucket_vals` in log-frequency at `f_hz`.
