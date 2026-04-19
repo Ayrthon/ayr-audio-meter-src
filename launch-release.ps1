@@ -28,6 +28,26 @@ $Cache = Join-Path $env:LOCALAPPDATA "AudioMeter"
 if (-not (Test-Path $Cache)) {
     New-Item -ItemType Directory -Path $Cache | Out-Null
 }
+
+# Close dev/staged instances so Copy-Item is not blocked and we always run the fresh build.
+Write-Host "==> Stopping running Audio Meter (if any)" -ForegroundColor Cyan
+$cacheFull = (Resolve-Path $Cache).Path
+foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+    try {
+        $exePath = $p.MainModule.FileName
+    } catch {
+        continue
+    }
+    if (-not $exePath) { continue }
+    $dir = [IO.Path]::GetDirectoryName($exePath)
+    $leaf = [IO.Path]::GetFileName($exePath)
+    if ($dir.Equals($cacheFull, [StringComparison]::OrdinalIgnoreCase) -and ($leaf -like 'audio-meter-rs*.exe')) {
+        Write-Host ('    Stopping PID ' + $p.Id + ' ' + $leaf) -ForegroundColor DarkGray
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+Start-Sleep -Milliseconds 400
+
 $LocalExe = Join-Path $Cache "audio-meter-rs.exe"
 Copy-Item -Path $Exe -Destination $LocalExe -Force
 # Strip any Mark-of-the-Web ADS that may have been attached (no-op when absent).

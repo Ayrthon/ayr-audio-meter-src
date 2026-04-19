@@ -14,6 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::{Mutex, RwLock};
 
 use crate::clip_capture::{ClipSettings, SharedClipCapture, SharedClipSettings, SharedClipStatus};
+use crate::user_settings::SharedUserSettings;
 use crate::dsp::{INF_FLOOR_DB, block_peak_rms};
 use crate::history_graph::SharedHistory;
 use crate::loudness::{LoudnessAnalyzer, SharedLoudness};
@@ -160,6 +161,7 @@ impl AudioEngine {
         clip_settings: SharedClipSettings,
         clip_capture: SharedClipCapture,
         clip_status: SharedClipStatus,
+        clip_dirs: SharedUserSettings,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop.clone();
@@ -175,6 +177,7 @@ impl AudioEngine {
         let clip_settings_th = clip_settings.clone();
         let clip_capture_th = clip_capture.clone();
         let clip_status_th = clip_status.clone();
+        let clip_dirs_th = clip_dirs.clone();
         let device_name = device.name.clone();
         let kind = device.kind;
 
@@ -197,6 +200,7 @@ impl AudioEngine {
                         &clip_settings_th,
                         &clip_capture_th,
                         &clip_status_th,
+                        &clip_dirs_th,
                         &stop_for_thread,
                     ),
                     #[cfg(windows)]
@@ -215,6 +219,7 @@ impl AudioEngine {
                         &clip_settings_th,
                         &clip_capture_th,
                         &clip_status_th,
+                        &clip_dirs_th,
                         &stop_for_thread,
                     ),
                     #[cfg(not(windows))]
@@ -276,6 +281,7 @@ fn run_cpal_input(
     clip_settings: &SharedClipSettings,
     clip_capture: &SharedClipCapture,
     clip_status: &SharedClipStatus,
+    clip_dirs: &SharedUserSettings,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     let host = cpal::default_host();
@@ -326,6 +332,7 @@ fn run_cpal_input(
     let clip_settings_cb = clip_settings.clone();
     let clip_capture_cb = clip_capture.clone();
     let clip_status_cb = clip_status.clone();
+    let clip_dirs_cb = clip_dirs.clone();
     let meter_mode_cb = meter_mode.clone();
     let clip_states_cb = clip_trigger_states.clone();
     let meter_tp_f32 = meter_true_peak.clone();
@@ -361,6 +368,7 @@ fn run_cpal_input(
                     clip_settings_cb.as_ref(),
                     &clip_capture_cb,
                     &clip_status_cb,
+                    &clip_dirs_cb,
                     trig,
                 );
                 if let Some(a) = analyzer.as_mut() {
@@ -402,6 +410,7 @@ fn run_cpal_input(
                     clip_settings_cb.as_ref(),
                     &clip_capture_cb,
                     &clip_status_cb,
+                    &clip_dirs_cb,
                     trig,
                 );
                 if let Some(a) = analyzer.as_mut() {
@@ -443,6 +452,7 @@ fn run_cpal_input(
                     clip_settings_cb.as_ref(),
                     &clip_capture_cb,
                     &clip_status_cb,
+                    &clip_dirs_cb,
                     trig,
                 );
                 if let Some(a) = analyzer.as_mut() {
@@ -503,6 +513,7 @@ fn process_clip(
     settings: &ClipSettings,
     capture: &SharedClipCapture,
     status: &SharedClipStatus,
+    clip_dirs: &SharedUserSettings,
     trigger_peak_db: f32,
 ) {
     capture.lock().process_block(
@@ -512,6 +523,7 @@ fn process_clip(
         settings,
         status,
         trigger_peak_db,
+        clip_dirs,
     );
 }
 
@@ -636,6 +648,7 @@ mod windows_loopback {
         clip_settings: &SharedClipSettings,
         clip_capture: &SharedClipCapture,
         clip_status: &SharedClipStatus,
+        clip_dirs: &SharedUserSettings,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
         initialize_mta().ok();
@@ -775,6 +788,7 @@ mod windows_loopback {
                     clip_settings.as_ref(),
                     clip_capture,
                     clip_status,
+                    clip_dirs,
                     trig,
                 );
                 if let Some(a) = analyzer.as_mut() {

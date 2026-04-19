@@ -1,5 +1,5 @@
 //! When peak level crosses a user threshold, save 5 s pre-roll + 5 s post-roll
-//! to a float WAV under the app data directory (timestamp filename).
+//! to a float WAV under the app data directory (`Clip YYYY-MM-DD HH-MM-SS-mmm.wav`).
 //!
 //! Triggering uses a **latch**: the level must drop **below** the threshold before a fire can
 //! occur, and changing the threshold resets that requirement. That way lowering the red line
@@ -10,8 +10,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{
+    DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike,
+    Utc,
+};
 use parking_lot::Mutex;
+
+use crate::user_settings::{resolve_clips_dir, SharedUserSettings, UserSettingsData};
 
 /// Seconds of audio kept before the trigger (ring buffer).
 pub const PRE_ROLL_SECS: f64 = 5.0;
@@ -196,6 +201,7 @@ impl ClipCapture {
         settings: &ClipSettings,
         status: &SharedClipStatus,
         trigger_peak_db: f32,
+        clip_dirs: &SharedUserSettings,
     ) {
         if channels == 0 || data.is_empty() {
             return;
@@ -218,7 +224,13 @@ impl ClipCapture {
                     self.cooldown_until =
                         Some(Instant::now() + Duration::from_secs_f64(COOLDOWN_SECS));
                     pre.extend(post);
-                    spawn_wav_write(pre, channels as u16, sample_rate, status.clone());
+                    spawn_wav_write(
+                        pre,
+                        channels as u16,
+                        sample_rate,
+                        status.clone(),
+                        clip_dirs.clone(),
+                    );
                     self.phase = Phase::Idle;
                 } else {
                     self.phase = Phase::CollectingPost {
@@ -280,38 +292,95 @@ impl ClipCapture {
     }
 }
 
-fn clips_dir() -> Option<PathBuf> {
-    let base = dirs::data_local_dir()?;
-    let dir = base.join("audio-meter-rs").join("clips");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
-/// Display path for the UI (folder is created on first successful save).
-pub fn clips_directory_display() -> String {
-    clips_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(could not resolve app data folder)".into())
-}
-
-/// Resolved clips folder (creates it if possible). For "open in explorer" etc.
-pub fn clips_dir_path() -> Option<PathBuf> {
-    clips_dir()
-}
-
 /// One `.wav` file in the clips folder (newest files first).
 #[derive(Clone, Debug)]
 pub struct ClipFileInfo {
     pub path: PathBuf,
     pub file_name: String,
+    /// File modification time (used as “recorded” time; matches write completion).
+    pub modified: Option<std::time::SystemTime>,
 }
 
-/// Lists `*.wav` / `*.WAV` in the clips directory, **newest modification time first**.
-pub fn list_clip_wavs() -> Vec<ClipFileInfo> {
-    let Some(dir) = clips_dir() else {
+/// One-line title for list rows and dialogs (handles new `Clip …` names and legacy timestamps).
+pub fn clip_file_display_name(file_name: &str) -> String {
+    let stem = file_name
+        .strip_suffix(".wav")
+        .or_else(|| file_name.strip_suffix(".WAV"))
+        .unwrap_or(file_name);
+    if stem.starts_with("Clip ") {
+        return stem.to_string();
+    }
+    if let Some(dt) = parse_legacy_clip_stem_datetime(stem) {
+        return dt.format("Recording · %B %d, %Y").to_string();
+    }
+    stem.to_string()
+}
+
+/// Casual date/time for list subtitles (Today / Yesterday / weekday / full date + time).
+pub fn format_clip_captured_casual(modified: Option<std::time::SystemTime>) -> String {
+    let Some(st) = modified else {
+        return "Time unknown".to_string();
+    };
+    let utc: DateTime<Utc> = st.into();
+    let t = utc.with_timezone(&Local);
+    let now = Local::now();
+    let day = t.date_naive();
+    let today = now.date_naive();
+    let yday = today - chrono::Duration::days(1);
+    let time_str = trim_leading_space(&t.format("%l:%M %p").to_string());
+
+    if day == today {
+        format!("Today · {time_str}")
+    } else if day == yday {
+        format!("Yesterday · {time_str}")
+    } else if day.year() == today.year() {
+        format!(
+            "{} · {time_str}",
+            trim_leading_space(&t.format("%a %b %e").to_string())
+        )
+    } else {
+        format!(
+            "{} · {time_str}",
+            trim_leading_space(&t.format("%b %e, %Y").to_string())
+        )
+    }
+}
+
+fn trim_leading_space(s: &str) -> String {
+    s.trim_start().to_string()
+}
+
+/// Legacy filenames: `YYYYMMDD_HHMMSS_mmm` stem (no extension).
+fn parse_legacy_clip_stem_datetime(stem: &str) -> Option<DateTime<Local>> {
+    let mut parts = stem.split('_');
+    let ymd = parts.next()?;
+    let hms = parts.next()?;
+    let _millis = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if ymd.len() != 8 || hms.len() != 6 {
+        return None;
+    }
+    let naive_date = NaiveDate::parse_from_str(ymd, "%Y%m%d").ok()?;
+    let naive_time = NaiveTime::parse_from_str(hms, "%H%M%S").ok()?;
+    let naive = NaiveDateTime::new(naive_date, naive_time);
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Some(dt),
+        LocalResult::None => None,
+    }
+}
+
+/// Lists `*.wav` / `*.WAV` in the resolved clips directory for `settings`, **newest first**.
+pub fn list_clip_wavs_from_settings(settings: &UserSettingsData) -> Vec<ClipFileInfo> {
+    let Some(dir) = resolve_clips_dir(settings) else {
         return Vec::new();
     };
-    let Ok(rd) = std::fs::read_dir(&dir) else {
+    list_clip_wavs_in_dir(&dir)
+}
+
+fn list_clip_wavs_in_dir(dir: &std::path::Path) -> Vec<ClipFileInfo> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut v: Vec<ClipFileInfo> = rd
@@ -323,20 +392,19 @@ pub fn list_clip_wavs() -> Vec<ClipFileInfo> {
             if !lower.ends_with(".wav") {
                 return None;
             }
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             Some(ClipFileInfo {
                 path,
                 file_name: name,
+                modified,
             })
         })
         .collect();
-    v.sort_by(|a, b| {
-        let ta = std::fs::metadata(&a.path)
-            .and_then(|m| m.modified())
-            .ok();
-        let tb = std::fs::metadata(&b.path)
-            .and_then(|m| m.modified())
-            .ok();
-        tb.cmp(&ta)
+    v.sort_by(|a, b| match (a.modified, b.modified) {
+        (Some(ta), Some(tb)) => tb.cmp(&ta),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.file_name.cmp(&b.file_name),
     });
     v
 }
@@ -346,18 +414,23 @@ fn spawn_wav_write(
     channels: u16,
     sample_rate: u32,
     status: SharedClipStatus,
+    clip_dirs: SharedUserSettings,
 ) {
     if samples.is_empty() {
         return;
     }
-    let Some(dir) = clips_dir() else {
+    let Some(dir) = resolve_clips_dir(&*clip_dirs.lock()) else {
         status.lock().last_error = Some("Could not create clips folder.".into());
         return;
     };
     let ts = Local::now();
+    // Human-readable, Windows-safe (no `:` etc. in the file name).
     let name = format!(
-        "{}_{:03}.wav",
-        ts.format("%Y%m%d_%H%M%S"),
+        "Clip {} {:02}-{:02}-{:02}-{:03}.wav",
+        ts.format("%Y-%m-%d"),
+        ts.hour(),
+        ts.minute(),
+        ts.second(),
         ts.timestamp_subsec_millis()
     );
     let path = dir.join(name);

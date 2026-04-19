@@ -1,6 +1,7 @@
 //! Main application: device picker, meter mode selector, level meters
 //! and scrolling history graph.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -24,10 +25,14 @@ use crate::meter_widget::{
     MeterPaintArgs, MeterState, channel_label, show_meter, show_reference_label,
 };
 use crate::clip_capture::{
-    clips_directory_display, make_shared_clip_capture, make_shared_clip_settings,
-    make_shared_clip_status, SharedClipCapture, SharedClipSettings, SharedClipStatus,
+    make_shared_clip_capture, make_shared_clip_settings, make_shared_clip_status, SharedClipCapture,
+    SharedClipSettings, SharedClipStatus,
 };
 use crate::clip_playlist_ui::ClipPlaylistState;
+use crate::user_settings::{
+    clips_path_display, load_settings_file, make_shared_user_settings, resolve_clips_dir,
+    save_settings_file, SharedUserSettings,
+};
 use crate::spectrum::{SharedSpectrum, SpectrumAnalyzer, make_shared_spectrum};
 use crate::spectrum_view::show_spectrum;
 use crate::weighting::{FreqWeighting, MeterScratch};
@@ -89,6 +94,8 @@ pub struct AudioMeterApp {
     /// [`ClipStatus::total_clips_saved`] when the user last turned **Arm Record Trigger** on.
     clip_session_baseline: u64,
     clip_playlist: ClipPlaylistState,
+    user_settings: SharedUserSettings,
+    user_settings_path: Option<PathBuf>,
     /// Full clip list + waveform live in a separate viewport (left column stays compact).
     clips_library_open: bool,
     /// First-frame position for the clips library native window (set when opening from the button).
@@ -131,7 +138,7 @@ const WINDOW_W_MIN_WITH_GRAPH: f32 = 1140.0;
 
 /// Default inner size of the clips library viewport (`ViewportBuilder::with_inner_size`).
 /// Also used to place that window centered over the main app frame when it opens.
-const CLIPS_LIBRARY_VIEW_INNER: egui::Vec2 = egui::vec2(340.0, 520.0);
+const CLIPS_LIBRARY_VIEW_INNER: egui::Vec2 = egui::vec2(480.0, 760.0);
 
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
@@ -181,6 +188,9 @@ impl AudioMeterApp {
         let history = make_shared_history();
         history.write().set_channels(2);
 
+        let (settings_data, settings_path) = load_settings_file();
+        let user_settings = make_shared_user_settings(settings_data);
+
         Self {
             devices,
             selected_device,
@@ -203,7 +213,9 @@ impl AudioMeterApp {
             clip_capture: make_shared_clip_capture(),
             clip_status: make_shared_clip_status(),
             clip_session_baseline: 0,
-            clip_playlist: ClipPlaylistState::new(),
+            clip_playlist: ClipPlaylistState::new(user_settings.clone()),
+            user_settings,
+            user_settings_path: settings_path,
             clips_library_open: false,
             clips_library_spawn_pos: None,
             history_trace: make_shared_history_trace(),
@@ -268,6 +280,7 @@ impl AudioMeterApp {
             self.clip_settings.clone(),
             self.clip_capture.clone(),
             self.clip_status.clone(),
+            self.user_settings.clone(),
         )?;
         self.engine = Some(engine);
         let kind_label = match dev.kind {
@@ -610,6 +623,15 @@ impl eframe::App for AudioMeterApp {
 }
 
 impl AudioMeterApp {
+    fn persist_user_settings(&self) {
+        if let Some(ref p) = self.user_settings_path {
+            let data = self.user_settings.lock().clone();
+            if let Err(e) = save_settings_file(p, &data) {
+                log::warn!("failed to save settings: {e}");
+            }
+        }
+    }
+
     fn show_clips_library_window(&mut self, ctx: &egui::Context) {
         if !self.clips_library_open {
             return;
@@ -626,7 +648,7 @@ impl AudioMeterApp {
         let mut builder = ViewportBuilder::default()
             .with_title("Clips library")
             .with_inner_size(CLIPS_LIBRARY_VIEW_INNER)
-            .with_min_inner_size(egui::vec2(300.0, 360.0))
+            .with_min_inner_size(egui::vec2(380.0, 560.0))
             .with_resizable(true);
         if let Some(p) = self.clips_library_spawn_pos.take() {
             builder = builder.with_position(p);
@@ -638,45 +660,105 @@ impl AudioMeterApp {
                 self.clips_library_open = false;
             }
 
-            CollapsingHeader::new("How capture works")
-                .default_open(false)
+            Frame::new()
+                .inner_margin(Margin::symmetric(16, 14))
                 .show(ui, |ui| {
+                    CollapsingHeader::new("How capture works").show(ui, |ui| {
+                            ui.label(
+                                RichText::new(clip_detail.as_str())
+                                    .size(9.5)
+                                    .color(Color32::from_gray(125)),
+                            );
+                        });
+                    ui.add_space(10.0);
                     ui.label(
-                        RichText::new(clip_detail.as_str())
-                            .size(9.5)
-                            .color(Color32::from_gray(125)),
+                        RichText::new("Save folder:")
+                            .color(Color32::from_gray(115))
+                            .size(9.5),
                     );
+                    ui.add_space(5.0);
+                    let clips_path_label =
+                        clips_path_display(&*self.user_settings.lock());
+                    Frame::new()
+                        .fill(Color32::from_rgb(0x18, 0x18, 0x22))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x32, 0x34, 0x42)))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(10, 10))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(clips_path_label)
+                                    .size(9.5)
+                                    .color(Color32::from_gray(210))
+                                    .family(egui::FontFamily::Monospace),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                        if ui
+                            .add_sized(
+                                [140.0, 28.0],
+                                egui::Button::new(RichText::new("Choose folder…").size(11.5)),
+                            )
+                            .clicked()
+                        {
+                            let start = resolve_clips_dir(&*self.user_settings.lock());
+                            let mut dlg = rfd::FileDialog::new();
+                            if let Some(ref p) = start {
+                                dlg = dlg.set_directory(p);
+                            }
+                            if let Some(folder) = dlg.pick_folder() {
+                                self.user_settings.lock().clips_save_dir = Some(folder);
+                                self.persist_user_settings();
+                                self.clip_playlist.reload_clip_list();
+                            }
+                        }
+                        let custom = self
+                            .user_settings
+                            .lock()
+                            .clips_save_dir
+                            .is_some();
+                        if ui
+                            .add_enabled(
+                                custom,
+                                egui::Button::new(RichText::new("Use default folder").size(11.5)),
+                            )
+                            .clicked()
+                        {
+                            self.user_settings.lock().clips_save_dir = None;
+                            self.persist_user_settings();
+                            self.clip_playlist.reload_clip_list();
+                        }
+                    });
+                    ui.add_space(10.0);
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::new(RichText::new("📂  Open clips folder").size(12.0)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(p) = resolve_clips_dir(&*self.user_settings.lock()) {
+                            #[cfg(windows)]
+                            let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                            #[cfg(target_os = "macos")]
+                            let _ = std::process::Command::new("open").arg(&p).spawn();
+                            #[cfg(all(not(windows), not(target_os = "macos")))]
+                            let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Peaks at or above the threshold start a capture.")
+                            .color(Color32::from_gray(120))
+                            .size(9.5),
+                    );
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    let ctx_clips = ui.ctx().clone();
+                    self.clip_playlist.show(ui, &ctx_clips, total_clips);
                 });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!("Save folder: {}", clips_directory_display()))
-                    .color(Color32::from_gray(115))
-                    .size(9.5),
-            );
-            if ui
-                .add_sized([ui.available_width(), 26.0], egui::Button::new("Open clips folder"))
-                .clicked()
-            {
-                if let Some(p) = crate::clip_capture::clips_dir_path() {
-                    #[cfg(windows)]
-                    let _ = std::process::Command::new("explorer").arg(&p).spawn();
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("open").arg(&p).spawn();
-                    #[cfg(all(not(windows), not(target_os = "macos")))]
-                    let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
-                }
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Peaks at or above the threshold start a capture.")
-                    .color(Color32::from_gray(120))
-                    .size(9.5),
-            );
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(6.0);
-            let ctx_clips = ui.ctx().clone();
-            self.clip_playlist.show(ui, &ctx_clips, total_clips);
         });
     }
 
