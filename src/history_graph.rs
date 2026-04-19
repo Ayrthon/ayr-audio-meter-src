@@ -5,20 +5,27 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
+use egui::{
+    Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, pos2, vec2,
+};
 use parking_lot::RwLock;
 
-use crate::clip_capture::SharedClipStatus;
+use crate::clip_capture::{
+    SharedClipSettings, SharedClipStatus, CLIP_THRESHOLD_SLIDER_MAX_DB,
+    CLIP_THRESHOLD_SLIDER_MIN_DB,
+};
 use crate::dsp::INF_FLOOR_DB;
-use crate::meter::{MeterMode, MeterScale, MeterScaleKind, MIN_DB, config_for};
+use crate::meter::{ColorPalette, MeterMode, MeterScale, MeterScaleKind, MIN_DB, config_for};
 use crate::meter_widget::{
-    BAR_BOTTOM_PAD_WITH_LABEL, BAR_TOP_PAD, COL_BG, COL_BORDER, COL_REFERENCE, COL_TEXT_DIM,
+    BAR_TOP_PAD, COL_BG, COL_BORDER, COL_REFERENCE, COL_TEXT_DIM, meter_bar_bottom_pad_for_strip,
     paint_zone_backgrounds, zone_styles, zone_tops_db,
 };
 
 const SAMPLES: usize = 600; // 30 s @ 20 Hz
 pub const SAMPLE_HZ: f32 = 20.0;
-const SMOOTH_WIN: usize = 5;
+/// No averaging — points are the same per-sample dB values fed from the meters (`history_trace`),
+/// so the trace lines up with the live bar in every meter mode.
+const SMOOTH_WIN: usize = 1;
 const WINDOW_SECS: f32 = SAMPLES as f32 / SAMPLE_HZ;
 /// Red overlay on the history plot when clip capture triggers.
 const TRIGGER_FLASH_DURATION: Duration = Duration::from_millis(520);
@@ -148,8 +155,7 @@ pub fn show_history_graph(
     shared: &SharedHistory,
     mode: MeterMode,
     _now: f64,
-    clip_armed: bool,
-    clip_threshold_db: f32,
+    clip_settings: &SharedClipSettings,
     clip_status: &SharedClipStatus,
 ) -> Response {
     let graph = shared.read();
@@ -170,7 +176,8 @@ pub fn show_history_graph(
     // the graph area (it's center-aligned on the rightmost time tick).
     let right_pad = 22.0;
     let top = rect.top() + BAR_TOP_PAD;
-    let bottom = rect.bottom() - BAR_BOTTOM_PAD_WITH_LABEL;
+    let bottom_pad = meter_bar_bottom_pad_for_strip(graph.channels);
+    let bottom = rect.bottom() - bottom_pad;
     let left = rect.left() + left_pad;
     let right = rect.right() - right_pad;
     let plot = Rect::from_min_max(pos2(left, top), pos2(right, bottom));
@@ -230,7 +237,7 @@ pub fn show_history_graph(
         draw_dashed_h(&painter, left, right, y, COL_REFERENCE, 4.0, 3.0, 1.1);
     }
 
-    // Per-channel smoothed line — "now" is anchored to the right edge and
+    // Per-channel line — "now" is anchored to the right edge and
     // older samples stream leftward.  When the ring is not yet full, the
     // left side of the plot is simply empty instead of pinning the newest
     // sample somewhere in the middle.
@@ -269,25 +276,64 @@ pub fn show_history_graph(
         }
     }
 
-    // Clip capture threshold (dotted red) + label when armed
+    // Clip capture threshold (dotted) + label — always visible; red when armed, grey when not.
+    // OBS uses a slightly thicker stroke / dash spacing so the line reads on busy meter colours.
     const COL_CLIP_TRIGGER: Color32 = Color32::from_rgb(0xe8, 0x4a, 0x55);
-    if clip_armed && clip_threshold_db.is_finite() && clip_threshold_db > INF_FLOOR_DB + 0.5 {
-        let y = scale.dbfs_to_y(clip_threshold_db, top, bottom);
-        if y >= top - 0.5 && y <= bottom + 0.5 {
-            draw_dotted_h(&painter, left, right, y, COL_CLIP_TRIGGER, 2.0, 5.0, 1.25);
-            let (text_y, align) = if y - 14.0 > top + 2.0 {
-                (y - 4.0, egui::Align2::LEFT_BOTTOM)
-            } else {
-                (y + 4.0, egui::Align2::LEFT_TOP)
-            };
-            painter.text(
-                pos2(left + 6.0, text_y),
-                align,
-                "Armed Record Trigger",
-                FontId::proportional(9.0),
-                COL_CLIP_TRIGGER,
-            );
+    const COL_CLIP_TRIGGER_INACTIVE: Color32 = Color32::from_rgb(0x6a, 0x6e, 0x78);
+    let clip_threshold_db = clip_settings.threshold_db();
+    let mut response = response;
+    if clip_threshold_db.is_finite() {
+        let armed = clip_settings.enabled();
+        let line_color = if armed {
+            COL_CLIP_TRIGGER
+        } else {
+            COL_CLIP_TRIGGER_INACTIVE
+        };
+        let y_raw = scale.dbfs_to_y(clip_threshold_db, top, bottom);
+        let y = y_raw.clamp(top, bottom);
+        let obs = cfg.palette == ColorPalette::Obs;
+        let (stroke_w, dot, gap) = if obs {
+            (2.15_f32, 3.5_f32, 4.0_f32)
+        } else {
+            (1.25_f32, 2.0_f32, 5.0_f32)
+        };
+        draw_dotted_h(&painter, left, right, y, line_color, dot, gap, stroke_w);
+        let (text_y, align) = if y - 14.0 > top + 2.0 {
+            (y - 4.0, egui::Align2::LEFT_BOTTOM)
+        } else {
+            (y + 4.0, egui::Align2::LEFT_TOP)
+        };
+        let font = if obs {
+            FontId::proportional(10.0)
+        } else {
+            FontId::proportional(9.0)
+        };
+        painter.text(
+            pos2(left + 6.0, text_y),
+            align,
+            "Armed Record Trigger",
+            font,
+            line_color,
+        );
+
+        const HIT_PAD: f32 = 10.0;
+        let hit_rect = Rect::from_min_max(pos2(left, y - HIT_PAD), pos2(right, y + HIT_PAD))
+            .intersect(plot);
+        let drag_id = ui.id().with("history_clip_threshold_drag");
+        let drag_resp = ui.interact(hit_rect, drag_id, Sense::click_and_drag());
+        if drag_resp.hovered() || drag_resp.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
         }
+        if drag_resp.drag_started() || drag_resp.dragged() {
+            if let Some(pos) = drag_resp.interact_pointer_pos() {
+                let new_thr = scale
+                    .y_to_dbfs(pos.y, top, bottom)
+                    .clamp(CLIP_THRESHOLD_SLIDER_MIN_DB, CLIP_THRESHOLD_SLIDER_MAX_DB);
+                clip_settings.set_threshold_db(new_thr);
+            }
+            ui.ctx().request_repaint();
+        }
+        response = response.union(drag_resp);
     }
 
     // Clip trigger flash — brief red tint over the plot (set from audio thread on threshold).

@@ -49,6 +49,16 @@ impl MeterMode {
         }
     }
 
+    /// The part of [`display_name`](Self::display_name) before `(`,
+    /// end-trimmed. For the closed meter combo label (stable width, readable).
+    pub fn name_outside_paren(self) -> &'static str {
+        let s = self.display_name();
+        match s.split_once('(') {
+            Some((head, _)) => head.trim_end(),
+            None => s.trim_end(),
+        }
+    }
+
     pub fn short_label(self) -> &'static str {
         match self {
             MeterMode::SamplePeak => "PEAK",
@@ -424,6 +434,25 @@ impl MeterScale {
         }
     }
 
+    /// Inverse of [`Self::dbfs_to_y`]: map a vertical pixel **inside** the bar to dBFS.
+    pub fn y_to_dbfs(&self, y: f32, bar_top: f32, bar_bottom: f32) -> f32 {
+        let h = bar_bottom - bar_top;
+        if h.abs() < 1e-6 {
+            return MIN_DB;
+        }
+        match self.kind {
+            MeterScaleKind::Dbf => MAX_DB - (y - bar_top) / h * (MAX_DB - MIN_DB),
+            MeterScaleKind::Vu | MeterScaleKind::K => {
+                let span = self.disp_max - self.disp_min;
+                if span <= 0.0 {
+                    return self.reference_dbfs + self.disp_min;
+                }
+                let frac = ((bar_bottom - y) / h).clamp(0.0, 1.0);
+                self.reference_dbfs + self.disp_min + frac * span
+            }
+        }
+    }
+
     pub fn tick_display_values(&self) -> &'static [f32] {
         self.ticks
     }
@@ -485,6 +514,18 @@ impl MeterScale {
             MeterScaleKind::K => "0 K",
         }
     }
+}
+
+/// Wall-clock seconds since the Unix epoch. Used for meter ballistics and the
+/// clip-trigger path so UI `MeterState` and audio-thread `clip_trigger_states`
+/// stay on the same time base (egui’s `input.time` is not comparable to stream
+/// elapsed time).
+#[inline]
+pub fn wall_clock_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Exponential approach (tau-based).

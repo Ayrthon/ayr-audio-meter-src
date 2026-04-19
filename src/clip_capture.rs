@@ -20,6 +20,10 @@ pub const POST_ROLL_SECS: f64 = 5.0;
 /// Minimum time between saved clips (avoids flooding the disk).
 pub const COOLDOWN_SECS: f64 = 5.0;
 
+/// Clip threshold slider / graph-drag range (dBFS), kept in sync with the UI slider.
+pub const CLIP_THRESHOLD_SLIDER_MIN_DB: f32 = -48.0;
+pub const CLIP_THRESHOLD_SLIDER_MAX_DB: f32 = 0.0;
+
 /// User-toggled capture + threshold (read from the audio thread).
 pub struct ClipSettings {
     enabled: AtomicBool,
@@ -180,9 +184,10 @@ impl ClipCapture {
 
     /// Call from the audio callback on **raw** float samples (same samples written to WAV).
     ///
-    /// `trigger_peak_db` must match what you see on the meters / history graph: same **frequency
-    /// weighting**, **true peak** setting, **meter mode** ballistics, and **peak-hold** (`hold_db`)
-    /// after [`crate::audio::process_weighted_levels`] (not the raw block peak).
+    /// `trigger_peak_db` must match the **peak-hold** white line on the meters: same **frequency
+    /// weighting**, **true peak** setting, and **meter mode** ballistics after
+    /// [`crate::audio::process_weighted_levels`] (not the raw block peak). The history graph
+    /// traces the coloured bar fill, not this hold value.
     pub fn process_block(
         &mut self,
         data: &[f32],

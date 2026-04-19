@@ -17,7 +17,7 @@ use crate::clip_capture::{ClipSettings, SharedClipCapture, SharedClipSettings, S
 use crate::dsp::{INF_FLOOR_DB, block_peak_rms};
 use crate::history_graph::SharedHistory;
 use crate::loudness::{LoudnessAnalyzer, SharedLoudness};
-use crate::meter::{MeterMode, config_for};
+use crate::meter::{MeterMode, config_for, wall_clock_secs};
 use crate::meter_widget::MeterState;
 use crate::spectrum::{self, SharedSpectrum};
 use crate::weighting::{FreqWeighting, MeterScratch};
@@ -75,7 +75,7 @@ pub fn make_shared_history_trace() -> SharedHistoryTrace {
 }
 
 /// Ballistic meter state driven on the audio thread so clip threshold compares to the same
-/// peak-hold (`hold_db`) as the white line / history graph, not the raw block peak.
+/// **peak-hold** (`hold_db`) as the white line on each meter, not the raw block peak.
 pub type SharedClipTriggerStates = Arc<Mutex<[MeterState; MAX_CHANNELS]>>;
 
 pub fn make_shared_clip_trigger_states() -> SharedClipTriggerStates {
@@ -147,7 +147,7 @@ pub struct AudioEngine {
 impl AudioEngine {
     pub fn start(
         device: &DeviceInfo,
-        true_peak: bool,
+        meter_true_peak: Arc<AtomicBool>,
         levels: SharedLevels,
         loudness: SharedLoudness,
         spectrum: SharedSpectrum,
@@ -184,7 +184,7 @@ impl AudioEngine {
                 let result = match kind {
                     SourceKind::Input => run_cpal_input(
                         &device_name,
-                        true_peak,
+                        meter_true_peak.clone(),
                         &levels_for_thread,
                         &loudness_for_thread,
                         &spectrum_for_thread,
@@ -202,7 +202,7 @@ impl AudioEngine {
                     #[cfg(windows)]
                     SourceKind::Loopback => windows_loopback::run(
                         &device_name,
-                        true_peak,
+                        meter_true_peak.clone(),
                         &levels_for_thread,
                         &loudness_for_thread,
                         &spectrum_for_thread,
@@ -263,7 +263,7 @@ impl Drop for AudioEngine {
 
 fn run_cpal_input(
     device_name: &str,
-    true_peak: bool,
+    meter_true_peak: Arc<AtomicBool>,
     levels: &SharedLevels,
     loudness: &SharedLoudness,
     spectrum: &SharedSpectrum,
@@ -328,21 +328,24 @@ fn run_cpal_input(
     let clip_status_cb = clip_status.clone();
     let meter_mode_cb = meter_mode.clone();
     let clip_states_cb = clip_trigger_states.clone();
+    let meter_tp_f32 = meter_true_peak.clone();
+    let meter_tp_i16 = meter_true_peak.clone();
+    let meter_tp_u16 = meter_true_peak.clone();
     let err_fn = |e| log::error!("cpal stream error: {e}");
-    let stream_t0 = std::time::Instant::now();
 
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             &stream_config,
             move |data: &[f32], _| {
-                let now = stream_t0.elapsed().as_secs_f64();
+                let now = wall_clock_secs();
+                let tp = meter_tp_f32.load(Ordering::Relaxed);
                 let snap = process_weighted_levels(
                     &scratch_clone,
                     &weight_clone,
                     data,
                     channels,
                     sample_rate,
-                    true_peak,
+                    tp,
                     &levels_clone,
                 );
                 let trig = clip_trigger_hold_max_db(
@@ -371,7 +374,8 @@ fn run_cpal_input(
         SampleFormat::I16 => device.build_input_stream(
             &stream_config,
             move |data: &[i16], _| {
-                let now = stream_t0.elapsed().as_secs_f64();
+                let now = wall_clock_secs();
+                let tp = meter_tp_i16.load(Ordering::Relaxed);
                 let mut buf = Vec::with_capacity(data.len());
                 for &s in data {
                     buf.push(s as f32 / i16::MAX as f32);
@@ -382,7 +386,7 @@ fn run_cpal_input(
                     &buf,
                     channels,
                     sample_rate,
-                    true_peak,
+                    tp,
                     &levels_clone,
                 );
                 let trig = clip_trigger_hold_max_db(
@@ -411,7 +415,8 @@ fn run_cpal_input(
         SampleFormat::U16 => device.build_input_stream(
             &stream_config,
             move |data: &[u16], _| {
-                let now = stream_t0.elapsed().as_secs_f64();
+                let now = wall_clock_secs();
+                let tp = meter_tp_u16.load(Ordering::Relaxed);
                 let mut buf = Vec::with_capacity(data.len());
                 for &s in data {
                     buf.push((s as f32 - 32768.0) / 32768.0);
@@ -422,7 +427,7 @@ fn run_cpal_input(
                     &buf,
                     channels,
                     sample_rate,
-                    true_peak,
+                    tp,
                     &levels_clone,
                 );
                 let trig = clip_trigger_hold_max_db(
@@ -464,8 +469,8 @@ fn run_cpal_input(
     Ok(())
 }
 
-/// Snapshot per-channel **peak-hold** levels (written from the UI thread, same
-/// as the white line on each meter) into the history ring and advance it.
+/// Snapshot per-channel **meter bar** levels (written from the UI thread — same
+/// ballistic peak or RMS as the coloured fill) into the history ring and advance it.
 /// Runs from the audio thread so it keeps ticking when the window is minimized
 /// (values may plateau until the next UI update).
 fn tick_shared_history(
@@ -540,7 +545,7 @@ fn process_weighted_levels(
 }
 
 /// Advances per-channel [`MeterState`] on the audio thread and returns the worst-channel
-/// **peak-hold** level — the same quantity as the white line / history graph trace.
+/// **peak-hold** level — the same quantity as the white line on each meter.
 fn clip_trigger_hold_max_db(
     states: &mut [MeterState; MAX_CHANNELS],
     mode_discriminant: u8,
@@ -618,7 +623,7 @@ mod windows_loopback {
 
     pub fn run(
         device_name: &str,
-        true_peak: bool,
+        meter_true_peak: Arc<AtomicBool>,
         levels: &SharedLevels,
         loudness: &SharedLoudness,
         spectrum: &SharedSpectrum,
@@ -746,14 +751,15 @@ mod windows_loopback {
                 f32_scratch.clear();
                 f32_scratch.reserve(frames * channels);
                 decode(&contig, &mut f32_scratch, bytes_per_sample, is_float);
-                let now = start_instant.elapsed().as_secs_f64();
+                let now = crate::meter::wall_clock_secs();
+                let tp = meter_true_peak.load(Ordering::Relaxed);
                 let snap = super::process_weighted_levels(
                     meter_scratch,
                     weighting,
                     &f32_scratch,
                     channels,
                     sample_rate,
-                    true_peak,
+                    tp,
                     levels,
                 );
                 let trig = super::clip_trigger_hold_max_db(

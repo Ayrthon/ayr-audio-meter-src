@@ -1,7 +1,7 @@
 //! Main application: device picker, meter mode selector, level meters
 //! and scrolling history graph.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -19,7 +19,7 @@ use crate::audio::{
 };
 use crate::history_graph::{SharedHistory, make_shared_history, show_history_graph};
 use crate::loudness::{NEG_INF_LUFS, SharedLoudness, make_shared_loudness};
-use crate::meter::{MeterMode, config_for};
+use crate::meter::{FillSource, MeterMode, config_for, wall_clock_secs};
 use crate::meter_widget::{
     MeterPaintArgs, MeterState, channel_label, show_meter, show_reference_label,
 };
@@ -77,7 +77,9 @@ pub struct AudioMeterApp {
     weighting_atomic: Arc<AtomicU8>,
     /// [`MeterMode`] discriminant for clip trigger ballistics (mirrors `self.mode` while capturing).
     clip_meter_mode: Arc<AtomicU8>,
-    /// Ballistics + peak-hold state driven on the audio thread for clip threshold (matches graph).
+    /// True-peak vs sample-peak for `process_weighted_levels` on the audio thread (follows mode).
+    meter_true_peak: Arc<AtomicBool>,
+    /// Ballistics + peak-hold on the audio thread for clip threshold (matches the white hold line).
     clip_trigger_states: SharedClipTriggerStates,
     meter_scratch: Arc<Mutex<MeterScratch>>,
     clip_settings: SharedClipSettings,
@@ -85,7 +87,7 @@ pub struct AudioMeterApp {
     clip_status: SharedClipStatus,
     /// [`ClipStatus::total_clips_saved`] when the user last turned **Arm Record Trigger** on.
     clip_session_baseline: u64,
-    /// Peak-hold levels for the history graph (same as the white line on each meter).
+    /// Per-channel levels fed to the history ring (same as each meter **bar fill**).
     history_trace: SharedHistoryTrace,
     levels: SharedLevels,
     loudness: SharedLoudness,
@@ -131,10 +133,9 @@ fn window_w_without_graph(channels: usize) -> f32 {
     const GUTTERS: f32 = 20.0;
     // CentralPanel / window-frame padding on each side.
     const OUTER_PAD: f32 = 18.0;
-    // Allocated meters-column width inside `meters_and_graph`.
-    let meter_col = (channels.max(1) as f32)
-        * (crate::meter_widget::METER_WIDTH + 4.0)
-        + 60.0;
+    // Allocated meters-column width inside `meters_and_graph` (must match
+    // `meter_strip_content_width` + any in-strip extras).
+    let meter_col = crate::meter_widget::meter_strip_content_width(channels);
     LEFT_PANEL + GUTTERS + meter_col + OUTER_PAD
 }
 
@@ -185,6 +186,7 @@ impl AudioMeterApp {
             initial_min_sent: false,
             weighting_atomic: Arc::new(AtomicU8::new(FreqWeighting::Z as u8)),
             clip_meter_mode: Arc::new(AtomicU8::new(MeterMode::SamplePeak.to_discriminant())),
+            meter_true_peak: Arc::new(AtomicBool::new(config_for(MeterMode::SamplePeak).true_peak)),
             clip_trigger_states: make_shared_clip_trigger_states(),
             meter_scratch: Arc::new(Mutex::new(MeterScratch::new())),
             clip_settings: make_shared_clip_settings(),
@@ -235,10 +237,12 @@ impl AudioMeterApp {
         let cfg = config_for(self.mode);
         self.clip_meter_mode
             .store(self.mode.to_discriminant(), Ordering::Relaxed);
+        self.meter_true_peak
+            .store(cfg.true_peak, Ordering::Relaxed);
         *self.clip_trigger_states.lock() = std::array::from_fn(|_| MeterState::default());
         let engine = AudioEngine::start(
             &dev,
-            cfg.true_peak,
+            self.meter_true_peak.clone(),
             self.levels.clone(),
             self.loudness.clone(),
             self.spectrum.clone(),
@@ -450,7 +454,8 @@ impl AudioMeterApp {
         }
     }
 
-    fn tick_meters(&mut self, now: f64) {
+    fn tick_meters(&mut self) {
+        let now = wall_clock_secs();
         self.sync_channels();
         let lv = self.levels.read();
         let peaks = lv.peak_db;
@@ -475,18 +480,20 @@ impl AudioMeterApp {
             self.meter_states[i].tick(&cfg, now);
         }
 
-        // History graph tracks **peak hold** (`hold_db`) — the white horizontal line —
-        // not the moving bar top. The bar can read lower while hold is still up.
+        // History graph follows the same dB as the coloured bar (peak or RMS per mode).
         let mut ht = self.history_trace.lock();
         for i in 0..crate::audio::MAX_CHANNELS {
             ht[i] = if active && i < ch && i < self.meter_states.len() {
-                self.meter_states[i].hold_db
+                let s = &self.meter_states[i];
+                match cfg.fill_source {
+                    FillSource::Peak => s.peak_db,
+                    FillSource::Rms => s.rms_db,
+                }
             } else {
                 crate::dsp::INF_FLOOR_DB
             };
         }
 
-        let _ = now;
     }
 
 }
@@ -495,7 +502,7 @@ impl eframe::App for AudioMeterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
-        self.tick_meters(now);
+        self.tick_meters();
         // Spectrum: run the analyzer while the tab is open, and keep decaying after Stop even if
         // another panel is selected (otherwise FFT state never reaches the noise floor).
         let spectrum_capturing = self.spectrum.read().active;
@@ -723,7 +730,11 @@ impl AudioMeterApp {
                             let rail_h = 20.0_f32;
                             let slider_resp = ui.add_sized(
                                 egui::vec2(slider_w, rail_h),
-                                egui::Slider::new(&mut thr, -48.0_f32..=0.0_f32)
+                                egui::Slider::new(
+                                    &mut thr,
+                                    crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
+                                        ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
+                                )
                                     .fixed_decimals(1)
                                     .show_value(false)
                                     .trailing_fill(true),
@@ -819,9 +830,14 @@ impl AudioMeterApp {
                         high_name,
                         cfg.zone_high_top_db,
                     );
+                    let mode_combo_hover = format!(
+                        "{}\n\n{}",
+                        self.mode.display_name(),
+                        mode_zone_hint
+                    );
                     let mode_combo = egui::ComboBox::from_id_salt("mode_combo")
                         .width(width)
-                        .selected_text(self.mode.display_name())
+                        .selected_text(self.mode.name_outside_paren())
                         .show_ui(ui, |ui| {
                             for mode in MeterMode::ALL {
                                 if ui
@@ -831,6 +847,10 @@ impl AudioMeterApp {
                                     self.mode = mode;
                                     self.clip_meter_mode
                                         .store(mode.to_discriminant(), Ordering::Relaxed);
+                                    self.meter_true_peak.store(
+                                        config_for(mode).true_peak,
+                                        Ordering::Relaxed,
+                                    );
                                     *self.clip_trigger_states.lock() =
                                         std::array::from_fn(|_| MeterState::default());
                                     for s in &mut self.meter_states {
@@ -842,7 +862,7 @@ impl AudioMeterApp {
                                 }
                             }
                         });
-                    mode_combo.response.on_hover_text(mode_zone_hint);
+                    mode_combo.response.on_hover_text(mode_combo_hover);
 
                     ui.add_space(5.0);
                     section_header(ui, "FREQUENCY WEIGHTING");
@@ -1045,12 +1065,16 @@ impl AudioMeterApp {
             |ui| {
             ui.allocate_ui_with_layout(
                 egui::Vec2::new(
-                    (self.meter_states.len() as f32) * (crate::meter_widget::METER_WIDTH + 4.0) + 60.0,
+                    crate::meter_widget::meter_strip_content_width(self.meter_states.len()),
                     ui.available_height(),
                 ),
                 Layout::left_to_right(Align::TOP),
                 |ui| {
-                    ui.add_space(6.0);
+                    let prev_spacing = ui.spacing().item_spacing;
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, prev_spacing.y);
+
+                    ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_START);
+                    let n = self.meter_states.len();
                     for (i, state) in self.meter_states.iter().enumerate() {
                         let label = channel_label(self.channels, i).to_string();
                         show_meter(
@@ -1062,9 +1086,15 @@ impl AudioMeterApp {
                             },
                             now,
                         );
-                        ui.add_space(2.0);
+                        if i + 1 < n {
+                            ui.add_space(crate::meter_widget::METER_STRIP_GAP_X);
+                        }
                     }
-                    show_reference_label(ui, self.mode);
+                    ui.add_space(crate::meter_widget::METER_STRIP_GAP_TO_REF);
+                    show_reference_label(ui, self.mode, self.channels);
+                    ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_END);
+
+                    ui.spacing_mut().item_spacing = prev_spacing;
                 },
             );
 
@@ -1080,8 +1110,7 @@ impl AudioMeterApp {
                                 &self.history,
                                 self.mode,
                                 now,
-                                self.clip_settings.enabled(),
-                                self.clip_settings.threshold_db(),
+                                &self.clip_settings,
                                 &self.clip_status,
                             );
                         });

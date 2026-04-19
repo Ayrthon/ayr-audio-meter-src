@@ -148,6 +148,26 @@ pub const BAR_TOP_PAD: f32 = 26.0;
 pub const BAR_BOTTOM_PAD_WITH_LABEL: f32 = 58.0;
 /// Bottom padding when no channel label (still need readout + strip).
 pub const BAR_BOTTOM_PAD_NO_LABEL: f32 = 40.0;
+
+/// Same bottom inset as [`show_meter`] uses from `has_label = !args.label.is_empty()`.
+#[inline]
+pub fn meter_bar_bottom_pad_from_label_nonempty(has_label: bool) -> f32 {
+    if has_label {
+        BAR_BOTTOM_PAD_WITH_LABEL
+    } else {
+        BAR_BOTTOM_PAD_NO_LABEL
+    }
+}
+
+/// Bottom inset for a strip with `channels` meters, matching each [`show_meter`] call
+/// that uses [`channel_label`]`(channels, i)` for `i in 0..channels`.
+pub fn meter_bar_bottom_pad_for_strip(channels: usize) -> f32 {
+    if channels == 0 {
+        return BAR_BOTTOM_PAD_WITH_LABEL;
+    }
+    let any_labeled = (0..channels).any(|i| !channel_label(channels, i).is_empty());
+    meter_bar_bottom_pad_from_label_nonempty(any_labeled)
+}
 /// Thin status strip beneath the bar (OBS-style input indicator concept).
 /// Its colour tracks the currently "active" band in real time.
 pub const BAR_INPUT_INDICATOR_H: f32 = 6.0;
@@ -160,6 +180,32 @@ pub const READOUT_GAP: f32 = 2.0;
 
 pub const METER_WIDTH: f32 = 92.0;
 pub const METER_MIN_HEIGHT: f32 = 300.0;
+
+/// Horizontal inset before the first channel meter (inside the strip `Ui`).
+pub const METER_STRIP_MARGIN_START: f32 = 2.0;
+/// Space between adjacent channel meters (L/R). The strip forces horizontal
+/// `item_spacing` to **0**, so this is the only inter-meter gap.
+pub const METER_STRIP_GAP_X: f32 = 2.0;
+/// Space between the last meter and the reference column (hairline gap).
+pub const METER_STRIP_GAP_TO_REF: f32 = 2.0;
+/// Width passed to [`show_reference_label`]; must stay in sync with its
+/// `allocate_exact_size` width.
+pub const METER_STRIP_REF_COLUMN_W: f32 = 54.0;
+/// Trailing margin after the reference column.
+pub const METER_STRIP_MARGIN_END: f32 = 2.0;
+
+/// Total width for `channels` meters plus reference column and strip margins.
+#[inline]
+pub fn meter_strip_content_width(channels: usize) -> f32 {
+    let n = channels.max(1) as f32;
+    let inter = (channels.max(1).saturating_sub(1) as f32) * METER_STRIP_GAP_X;
+    METER_STRIP_MARGIN_START
+        + n * METER_WIDTH
+        + inter
+        + METER_STRIP_GAP_TO_REF
+        + METER_STRIP_REF_COLUMN_W
+        + METER_STRIP_MARGIN_END
+}
 
 // Typography — sized so readouts and scale labels stay legible.
 pub const FONT_TICK: f32 = 10.5;
@@ -321,12 +367,7 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     let scale_w = 22.0_f32;
     let bar_x = rect.left() + scale_w;
     let bar_w = (w - scale_w - scale_w).max(1.0);
-    let has_label = !args.label.is_empty();
-    let bottom_pad = if has_label {
-        BAR_BOTTOM_PAD_WITH_LABEL
-    } else {
-        BAR_BOTTOM_PAD_NO_LABEL
-    };
+    let bottom_pad = meter_bar_bottom_pad_from_label_nonempty(!args.label.is_empty());
     let bar_top = rect.top() + BAR_TOP_PAD;
     // `bar_bottom` is the **physical bottom edge of the meter bar** — the
     // dB scale maps linearly between `bar_top` (0 dBFS) and `bar_bottom`
@@ -551,7 +592,7 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     );
 
     // --- channel label ----------------------------------------
-    if has_label {
+    if !args.label.is_empty() {
         painter.text(
             pos2(rect.center().x, rect.bottom() - 2.0),
             egui::Align2::CENTER_BOTTOM,
@@ -650,14 +691,15 @@ fn draw_dashed_h(
 
 /// Free-standing widget that shows the reference label (0 dBFS / 0 VU / 0 K)
 /// aligned with the dashed reference line of the adjacent meter.
-pub fn show_reference_label(ui: &mut Ui, mode: MeterMode) -> Response {
+pub fn show_reference_label(ui: &mut Ui, mode: MeterMode, strip_channels: usize) -> Response {
     let available = ui.available_height().max(METER_MIN_HEIGHT);
-    let (rect, response) = ui.allocate_exact_size(vec2(54.0, available), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(METER_STRIP_REF_COLUMN_W, available), Sense::hover());
     let painter = ui.painter_at(rect);
     let cfg = config_for(mode);
     let scale = MeterScale::for_mode(mode);
     let bar_top = rect.top() + BAR_TOP_PAD;
-    let bar_bottom = rect.bottom() - BAR_BOTTOM_PAD_WITH_LABEL;
+    let bar_bottom = rect.bottom() - meter_bar_bottom_pad_for_strip(strip_channels);
     if cfg.reference_db > MIN_DB && cfg.reference_db <= 0.0 {
         let y = scale.dbfs_to_y(cfg.reference_db, bar_top, bar_bottom);
         let ref_col = if cfg.palette == ColorPalette::Obs {
