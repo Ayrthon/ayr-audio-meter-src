@@ -7,8 +7,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use eframe::egui;
 use egui::{
-    Align, Color32, CornerRadius, CursorIcon, Frame, Label, Layout, Margin, OpenUrl, RichText,
-    ScrollArea, Sense, Stroke,
+    Align, CollapsingHeader, Color32, CornerRadius, CursorIcon, Frame, Label, Layout, Margin,
+    OpenUrl, RichText, ScrollArea, Sense, Stroke, ViewportBuilder, ViewportId,
 };
 use parking_lot::Mutex;
 
@@ -27,6 +27,7 @@ use crate::clip_capture::{
     clips_directory_display, make_shared_clip_capture, make_shared_clip_settings,
     make_shared_clip_status, SharedClipCapture, SharedClipSettings, SharedClipStatus,
 };
+use crate::clip_playlist_ui::ClipPlaylistState;
 use crate::spectrum::{SharedSpectrum, SpectrumAnalyzer, make_shared_spectrum};
 use crate::spectrum_view::show_spectrum;
 use crate::weighting::{FreqWeighting, MeterScratch};
@@ -34,7 +35,7 @@ use crate::weighting::{FreqWeighting, MeterScratch};
 const BG: Color32 = Color32::from_rgb(0x0c, 0x0c, 0x10);
 const PANEL_BG: Color32 = Color32::from_rgb(0x15, 0x15, 0x1b);
 const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
-const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
+pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
 const AYRTHON_URL: &str = "https://ayrthon.com";
 
@@ -87,6 +88,11 @@ pub struct AudioMeterApp {
     clip_status: SharedClipStatus,
     /// [`ClipStatus::total_clips_saved`] when the user last turned **Arm Record Trigger** on.
     clip_session_baseline: u64,
+    clip_playlist: ClipPlaylistState,
+    /// Full clip list + waveform live in a separate viewport (left column stays compact).
+    clips_library_open: bool,
+    /// First-frame position for the clips library native window (set when opening from the button).
+    clips_library_spawn_pos: Option<egui::Pos2>,
     /// Per-channel levels fed to the history ring (same as each meter **bar fill**).
     history_trace: SharedHistoryTrace,
     levels: SharedLevels,
@@ -122,6 +128,10 @@ const WINDOW_W_WITH_GRAPH: f32 = 1140.0;
 /// axis to be readable).  Matches the graph snap width so the user
 /// always sees a full-width graph when it's on.
 const WINDOW_W_MIN_WITH_GRAPH: f32 = 1140.0;
+
+/// Default inner size of the clips library viewport (`ViewportBuilder::with_inner_size`).
+/// Also used to place that window centered over the main app frame when it opens.
+const CLIPS_LIBRARY_VIEW_INNER: egui::Vec2 = egui::vec2(340.0, 520.0);
 
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
@@ -193,6 +203,9 @@ impl AudioMeterApp {
             clip_capture: make_shared_clip_capture(),
             clip_status: make_shared_clip_status(),
             clip_session_baseline: 0,
+            clip_playlist: ClipPlaylistState::new(),
+            clips_library_open: false,
+            clips_library_spawn_pos: None,
             history_trace: make_shared_history_trace(),
             levels: make_shared_levels(),
             loudness: make_shared_loudness(),
@@ -590,11 +603,83 @@ impl eframe::App for AudioMeterApp {
             });
         });
 
+        self.show_clips_library_window(&ctx);
+
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
 impl AudioMeterApp {
+    fn show_clips_library_window(&mut self, ctx: &egui::Context) {
+        if !self.clips_library_open {
+            return;
+        }
+        let clip_detail = format!(
+            "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
+             Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
+             The moving meter can still read a little lower between blocks or because of ballistics.",
+            crate::clip_capture::PRE_ROLL_SECS,
+            crate::clip_capture::POST_ROLL_SECS
+        );
+        let total_clips = self.clip_status.lock().total_clips_saved;
+
+        let mut builder = ViewportBuilder::default()
+            .with_title("Clips library")
+            .with_inner_size(CLIPS_LIBRARY_VIEW_INNER)
+            .with_min_inner_size(egui::vec2(300.0, 360.0))
+            .with_resizable(true);
+        if let Some(p) = self.clips_library_spawn_pos.take() {
+            builder = builder.with_position(p);
+        }
+
+        let clips_vp = ViewportId::from_hash_of("audio_meter_clips_library");
+        ctx.show_viewport_immediate(clips_vp, builder, |ui, _class| {
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                self.clips_library_open = false;
+            }
+
+            CollapsingHeader::new("How capture works")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(clip_detail.as_str())
+                            .size(9.5)
+                            .color(Color32::from_gray(125)),
+                    );
+                });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("Save folder: {}", clips_directory_display()))
+                    .color(Color32::from_gray(115))
+                    .size(9.5),
+            );
+            if ui
+                .add_sized([ui.available_width(), 26.0], egui::Button::new("Open clips folder"))
+                .clicked()
+            {
+                if let Some(p) = crate::clip_capture::clips_dir_path() {
+                    #[cfg(windows)]
+                    let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(&p).spawn();
+                    #[cfg(all(not(windows), not(target_os = "macos")))]
+                    let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Peaks at or above the threshold start a capture.")
+                    .color(Color32::from_gray(120))
+                    .size(9.5),
+            );
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            let ctx_clips = ui.ctx().clone();
+            self.clip_playlist.show(ui, &ctx_clips, total_clips);
+        });
+    }
+
     fn left_controls(&mut self, ui: &mut egui::Ui, now: f64) {
         Frame::new()
             .fill(PANEL_BG)
@@ -666,14 +751,12 @@ impl AudioMeterApp {
                     ui.separator();
                     ui.add_space(5.0);
 
-                    // ── CLIP CAPTURE ───────────────────────────────────────
+                    // ── CLIP CAPTURE (compact — full list + wave in Clips library window) ──
                     section_header(ui, "CLIP CAPTURE");
                     ui.add_space(3.0);
 
-                    let clip_detail = format!(
-                        "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
-                         Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
-                         The moving meter can still read a little lower between blocks or because of ballistics.",
+                    let clip_detail_short = format!(
+                        "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Open “Clips library” for the list, waveform, and folder.",
                         crate::clip_capture::PRE_ROLL_SECS,
                         crate::clip_capture::POST_ROLL_SECS
                     );
@@ -686,7 +769,7 @@ impl AudioMeterApp {
                         .show(ui, |ui| {
                             ui.set_width(width);
                             let rec_on = self.clip_settings.enabled();
-                            let arm_h = 34.0_f32;
+                            let arm_h = 32.0_f32;
                             let arm_resp = arm_record_trigger_button(
                                 ui,
                                 now,
@@ -701,33 +784,33 @@ impl AudioMeterApp {
                                         self.clip_status.lock().total_clips_saved;
                                 }
                             }
-                            arm_resp.on_hover_text(&clip_detail);
+                            arm_resp.on_hover_text(&clip_detail_short);
 
-                            ui.add_space(6.0);
+                            ui.add_space(5.0);
 
                             let mut thr = self.clip_settings.threshold_db();
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new("Threshold")
-                                        .size(12.0)
+                                        .size(11.5)
                                         .color(TITLE_COL)
                                         .strong(),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(
                                         RichText::new(format!("{thr:.1} dBFS"))
-                                            .size(13.0)
+                                            .size(12.5)
                                             .color(ACCENT)
                                             .strong(),
                                     );
                                 });
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(3.0);
 
                             let slider_w = ui.available_width();
                             let prev_slider_w = ui.style().spacing.slider_width;
                             ui.style_mut().spacing.slider_width = slider_w;
-                            let rail_h = 20.0_f32;
+                            let rail_h = 18.0_f32;
                             let slider_resp = ui.add_sized(
                                 egui::vec2(slider_w, rail_h),
                                 egui::Slider::new(
@@ -744,28 +827,32 @@ impl AudioMeterApp {
                                 self.clip_settings.set_threshold_db(thr);
                             }
 
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new("Peaks at or above this level start a capture.")
-                                    .color(Color32::from_gray(120))
-                                    .size(9.5),
-                            );
-
-                            ui.add_space(5.0);
-                            ui.label(
-                                RichText::new(format!("Save folder: {}", clips_directory_display()))
-                                    .color(Color32::from_gray(115))
-                                    .size(9.5),
-                            );
-                            #[cfg(windows)]
-                            if ui
-                                .add_sized([ui.available_width(), 24.0], egui::Button::new("Open clips folder"))
-                                .clicked()
-                            {
-                                if let Some(p) = crate::clip_capture::clips_dir_path() {
-                                    let _ = std::process::Command::new("explorer").arg(p).spawn();
-                                }
+                            ui.add_space(6.0);
+                            let lib = ui
+                                .add_sized(
+                                    egui::vec2(width, 26.0),
+                                    egui::Button::new(if self.clips_library_open {
+                                        "Clips library (open)…"
+                                    } else {
+                                        "Clips library…"
+                                    }),
+                                )
+                                .on_hover_text(
+                                    "List, preview, folder, delete — Space plays/pauses the waveform",
+                                );
+                            if lib.clicked() {
+                                self.clips_library_spawn_pos = ui.ctx().input(|i| {
+                                    i.viewport().outer_rect.map(|r| {
+                                        let c = r.center();
+                                        egui::pos2(
+                                            c.x - CLIPS_LIBRARY_VIEW_INNER.x * 0.5,
+                                            c.y - CLIPS_LIBRARY_VIEW_INNER.y * 0.5,
+                                        )
+                                    })
+                                });
+                                self.clips_library_open = true;
                             }
+
                             {
                                 let st = self.clip_status.lock();
                                 let armed_now = self.clip_settings.enabled();
@@ -784,7 +871,7 @@ impl AudioMeterApp {
                                     ui.add_space(5.0);
                                     ui.label(
                                         RichText::new(counter_text)
-                                            .size(11.0)
+                                            .size(10.5)
                                             .strong()
                                             .color(counter_color),
                                     );

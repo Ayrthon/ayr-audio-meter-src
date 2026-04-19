@@ -299,6 +299,48 @@ pub fn clips_dir_path() -> Option<PathBuf> {
     clips_dir()
 }
 
+/// One `.wav` file in the clips folder (newest files first).
+#[derive(Clone, Debug)]
+pub struct ClipFileInfo {
+    pub path: PathBuf,
+    pub file_name: String,
+}
+
+/// Lists `*.wav` / `*.WAV` in the clips directory, **newest modification time first**.
+pub fn list_clip_wavs() -> Vec<ClipFileInfo> {
+    let Some(dir) = clips_dir() else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<ClipFileInfo> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
+            if !lower.ends_with(".wav") {
+                return None;
+            }
+            Some(ClipFileInfo {
+                path,
+                file_name: name,
+            })
+        })
+        .collect();
+    v.sort_by(|a, b| {
+        let ta = std::fs::metadata(&a.path)
+            .and_then(|m| m.modified())
+            .ok();
+        let tb = std::fs::metadata(&b.path)
+            .and_then(|m| m.modified())
+            .ok();
+        tb.cmp(&ta)
+    });
+    v
+}
+
 fn spawn_wav_write(
     samples: Vec<f32>,
     channels: u16,

@@ -3,6 +3,8 @@
 mod app;
 mod audio;
 mod clip_capture;
+mod clip_playback;
+mod clip_playlist_ui;
 mod dsp;
 mod history_graph;
 mod loudness;
