@@ -805,12 +805,6 @@ impl AudioMeterApp {
                     let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
                 }
             }
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("Peaks at or above the threshold start a capture.")
-                    .color(LEFT_LABEL_SECONDARY)
-                    .size(9.5),
-            );
         });
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
