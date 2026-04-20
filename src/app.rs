@@ -46,10 +46,23 @@ use crate::weighting::{FreqWeighting, MeterScratch};
 /// Darkest edge of the vignetted metal background (`#232328`, matches `paint_metallic_background` edge).
 const BG: Color32 = Color32::from_rgb(0x23, 0x23, 0x28);
 const PANEL_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x30);
-/// Accordion title strip (`#222328`).
-const LEFT_SECTION_HEADER_BG: Color32 = Color32::from_rgb(0x22, 0x23, 0x28);
+/// Outer “card” fill for each left-panel section (reference: ~`#18181B`).
+const LEFT_SECTION_CARD_BG: Color32 = Color32::from_rgb(0x18, 0x18, 0x1b);
+/// 1 px outer card outline (reference: black edge).
+const LEFT_SECTION_CARD_OUTER_STROKE: Color32 = Color32::BLACK;
+/// Subtle inset highlight along the top of stacked bands (title row, content row).
+const LEFT_SECTION_INNER_HIGHLIGHT: Color32 =
+    Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x22);
+/// Upper line of the header / body separator (dark, above the highlight).
+const LEFT_SECTION_DIVIDER_DARK: Color32 = Color32::from_rgb(0x12, 0x12, 0x14);
+/// 1 px stroke for nested panels (clips path, etc.) — slightly softer than pure black.
+const LEFT_SECTION_INNER_BOX_STROKE: Color32 = Color32::from_rgb(0x2d, 0x2d, 0x30);
+/// Accordion title strip (matches card top; same as card bg for a flat header).
+const LEFT_SECTION_HEADER_BG: Color32 = Color32::from_rgb(0x18, 0x18, 0x1b);
 /// Body fill under each section header (`#2C2B30`).
 const LEFT_SECTION_BODY_BG: Color32 = Color32::from_rgb(0x2c, 0x2b, 0x30);
+/// Outer corner radius for section cards (reference ~8–12 px).
+const LEFT_SECTION_CARD_RADIUS: u8 = 10;
 /// ComboBox closed button and popup menu fill (`#1E1C22`).
 const LEFT_COMBO_BG: Color32 = Color32::from_rgb(0x1e, 0x1c, 0x22);
 /// Small caps / secondary labels in the left column (`#A0A0A0`).
@@ -717,7 +730,7 @@ impl AudioMeterApp {
             let clips_path_label = clips_path_display(&*self.user_settings.lock());
             Frame::new()
                 .fill(LEFT_COMBO_BG)
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x40, 0x3e, 0x48)))
+                .stroke(Stroke::new(1.0, LEFT_SECTION_INNER_BOX_STROKE))
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::symmetric(10, 10))
                 .show(ui, |ui| {
@@ -1992,7 +2005,15 @@ fn left_panel_chevron_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Re
     }
 }
 
-/// Collapsible block in the left column: title strip + body (no outer bordered “card” frame).
+/// Paints a full-width 1 px horizontal band (used for inset highlights and dividers).
+fn left_panel_1px_band(ui: &mut egui::Ui, color: Color32) {
+    let w = ui.available_width().max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, color);
+}
+
+/// Collapsible block: one rounded card (black stroke + fill) with stacked inset highlights.
 fn left_panel_collapsing<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
@@ -2004,57 +2025,69 @@ fn left_panel_collapsing<R>(
 
     let card_w = ui.available_width().max(1.0);
     let o = state.openness(ui.ctx());
-    let header_corners = if o > 0.05 {
-        CornerRadius {
-            nw: 4,
-            ne: 4,
-            sw: 0,
-            se: 0,
-        }
-    } else {
-        CornerRadius::same(4)
-    };
+    let show_divider = o > 0.05;
+    let card_radius = CornerRadius::same(LEFT_SECTION_CARD_RADIUS);
 
     ui.set_width(card_w);
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    Frame::new()
+        .fill(LEFT_SECTION_CARD_BG)
+        .stroke(Stroke::new(1.0, LEFT_SECTION_CARD_OUTER_STROKE))
+        .corner_radius(card_radius)
+        .inner_margin(Margin::ZERO)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-        Frame::new()
-            .fill(LEFT_SECTION_HEADER_BG)
-            .corner_radius(header_corners)
-            .inner_margin(Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-                    ui.label(
-                        RichText::new(title.to_uppercase())
-                            .color(TITLE_COL)
-                            .size(12.5)
-                            .strong(),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(8.0);
-                        state.show_toggle_button(ui, left_panel_chevron_icon);
+                // Inset highlight along the top of the card (inside the black stroke).
+                left_panel_1px_band(ui, LEFT_SECTION_INNER_HIGHLIGHT);
+
+                Frame::new()
+                    .fill(LEFT_SECTION_HEADER_BG)
+                    .corner_radius(CornerRadius::ZERO)
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                            ui.label(
+                                RichText::new(title.to_uppercase())
+                                    .color(TITLE_COL)
+                                    .size(12.5)
+                                    .strong(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(8.0);
+                                state.show_toggle_button(ui, left_panel_chevron_icon);
+                            });
+                        });
                     });
+
+                if show_divider {
+                    // Stacked band: dark line, then light highlight (reference “inset” divider).
+                    left_panel_1px_band(ui, LEFT_SECTION_DIVIDER_DARK);
+                    left_panel_1px_band(ui, LEFT_SECTION_INNER_HIGHLIGHT);
+                }
+
+                let _ = state.show_body_unindented(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    Frame::new()
+                        .fill(LEFT_SECTION_BODY_BG)
+                        .corner_radius(CornerRadius::ZERO)
+                        .inner_margin(Margin::ZERO)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            // Same top treatment as the title band: light edge on the content block.
+                            left_panel_1px_band(ui, LEFT_SECTION_INNER_HIGHLIGHT);
+                            Frame::new()
+                                .inner_margin(Margin::symmetric(14, 12))
+                                .show(ui, |ui| add_contents(ui))
+                                .inner
+                        })
+                        .inner
                 });
             });
-
-        let _ = state.show_body_unindented(ui, |ui| {
-            ui.set_width(ui.available_width());
-            Frame::new()
-                .fill(LEFT_SECTION_BODY_BG)
-                .corner_radius(CornerRadius {
-                    nw: 0,
-                    ne: 0,
-                    sw: 4,
-                    se: 4,
-                })
-                .inner_margin(Margin::symmetric(10, 10))
-                .show(ui, |ui| add_contents(ui))
-                .inner
         });
-    });
 }
 
 /// Popup list styling for left-panel [`egui::ComboBox`] menus (`Frame::menu` uses [`Visuals::window_fill`]).
@@ -2088,6 +2121,11 @@ fn with_left_panel_combo_style<R>(
         v.hovered.bg_stroke = stroke;
         v.active.bg_stroke = stroke;
         v.open.bg_stroke = stroke;
+        let r = CornerRadius::same(5);
+        v.inactive.corner_radius = r;
+        v.hovered.corner_radius = r;
+        v.active.corner_radius = r;
+        v.open.corner_radius = r;
         content(ui)
     })
     .inner
