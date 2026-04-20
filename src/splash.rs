@@ -59,10 +59,12 @@ pub fn spawn(total_lifetime: Duration, fade_out: Duration) -> SplashHandle {
     let done = Arc::new(AtomicBool::new(false));
     let done_for_thread = done.clone();
     let join = thread::spawn(move || {
+        crate::startup_log::log("splash: thread started");
         // Safety: the thread owns all resources it creates and tears them
         // down before returning, and the `done` flag is only observed, not
         // dereferenced, across threads.
         unsafe { run(done_for_thread, total_lifetime, fade_out) };
+        crate::startup_log::log("splash: thread exiting");
     });
     SplashHandle {
         done,

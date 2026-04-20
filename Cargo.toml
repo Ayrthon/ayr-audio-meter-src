@@ -1,18 +1,12 @@
 [package]
 name = "audio-meter-rs"
-version = "1.6.4"
+version = "1.6.5"
 edition = "2024"
 description = "Real-time audio meter and level history viewer."
 
 [dependencies]
 anyhow = "1"
 cpal = "0.17"
-eframe = { version = "0.34", default-features = false, features = [
-    "default_fonts",
-    "glow",
-    "wayland",
-    "x11",
-] }
 egui = "0.34"
 env_logger = "0.11"
 log = "0.4"
@@ -28,7 +22,40 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Linux / macOS: Glow (OpenGL). Repo's visual baseline was tuned against
+# Glow on Linux, and Wayland/X11 wgpu has its own quirks we haven't
+# validated for this app.
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.34", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+
+# Windows: **wgpu only** — explicitly no `glow` feature.
+#
+# Compiling `glow` in pulls `opengl32.dll` (and `GLU32.dll`) as static
+# link-time dependencies, which causes Windows' OpenGL loader to install
+# the NVIDIA user-mode driver (`nvoglv64.dll`) into our process even
+# though we pick `Renderer::Wgpu` at runtime. On a machine where
+# another process is actively using the GPU — e.g. Battlefield 6 in
+# borderless fullscreen — `nvoglv64.dll`'s init path recursively blows
+# its own stack (`EXCEPTION_STACK_OVERFLOW` at offset ~+0xB1302B). The
+# resulting SEH exception terminates our process before `eframe` can
+# even invoke its creator callback, producing the user-visible
+# "splash plays, app never launches" symptom.
+#
+# Dropping `glow` from the Windows feature set means `opengl32.dll` is
+# never imported by our binary, so `nvoglv64.dll` never loads, so the
+# crash never fires. The diagnostic trail that pinned this down (panic
+# hook + SEH filter + periodic module-load tracer) lives in
+# `src/startup_log.rs`.
 [target.'cfg(windows)'.dependencies]
+eframe = { version = "0.34", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+] }
 wasapi = "0.23"
 
 [build-dependencies]

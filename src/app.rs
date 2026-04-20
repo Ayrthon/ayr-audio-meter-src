@@ -167,6 +167,17 @@ pub struct AudioMeterApp {
     status: String,
     /// Tiled fine grain for the main window backdrop (cool charcoal noise).
     bg_noise: TextureHandle,
+    /// Wall-clock time at which `AudioMeterApp::new` returned. Used on
+    /// Windows to decide when to teleport the main window from its
+    /// off-screen parking spot to the primary-monitor center (see
+    /// `main.rs` for why we no longer block the main thread at startup).
+    #[cfg(windows)]
+    launched_at: Instant,
+    /// Windows-only: set to `true` the first time we teleport the main
+    /// window on-screen, so we only send the `OuterPosition` + `Focus`
+    /// viewport commands once rather than fighting any user drag later.
+    #[cfg(windows)]
+    main_window_revealed: bool,
 }
 
 /// Target window widths for the two UI modes.  The app snaps to one
@@ -217,19 +228,39 @@ fn window_w_without_graph(channels: usize) -> f32 {
 
 impl AudioMeterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::startup_log::log("AudioMeterApp::new: begin");
         apply_theme(&cc.egui_ctx);
+        crate::startup_log::log("AudioMeterApp::new: theme applied");
         let bg_noise = cc.egui_ctx.load_texture(
             "am_metallic_noise",
             build_metallic_noise_image(),
             TextureOptions::LINEAR_REPEAT,
         );
+        crate::startup_log::log("AudioMeterApp::new: bg noise texture uploaded");
         log_gl_caps(cc);
+        crate::startup_log::log("AudioMeterApp::new: GL caps logged, calling list_devices");
         let devices = list_devices().unwrap_or_default();
+        crate::startup_log::log(format!(
+            "AudioMeterApp::new: list_devices returned ({} devices)",
+            devices.len()
+        ));
 
         // Prefer the system default output (loopback) so the user sees
         // something move the first time they hit Start.  Fall back to
         // the default input, then to any device.
-        let selected_device = default_output_name()
+        crate::startup_log::log("AudioMeterApp::new: resolving default_output_name");
+        let default_out = default_output_name();
+        crate::startup_log::log(format!(
+            "AudioMeterApp::new: default_output_name = {:?}",
+            default_out
+        ));
+        crate::startup_log::log("AudioMeterApp::new: resolving default_input_name");
+        let default_in = default_input_name();
+        crate::startup_log::log(format!(
+            "AudioMeterApp::new: default_input_name = {:?}",
+            default_in
+        ));
+        let selected_device = default_out
             .as_ref()
             .and_then(|n| {
                 devices
@@ -237,7 +268,7 @@ impl AudioMeterApp {
                     .position(|d| d.kind == SourceKind::Loopback && d.name == *n)
             })
             .or_else(|| {
-                default_input_name().as_ref().and_then(|n| {
+                default_in.as_ref().and_then(|n| {
                     devices
                         .iter()
                         .position(|d| d.kind == SourceKind::Input && d.name == *n)
@@ -255,7 +286,7 @@ impl AudioMeterApp {
         let (settings_data, settings_path) = load_settings_file();
         let user_settings = make_shared_user_settings(settings_data);
 
-        Self {
+        let _app = Self {
             devices,
             selected_device,
             mode: MeterMode::SamplePeak,
@@ -295,7 +326,14 @@ impl AudioMeterApp {
             channels: 2,
             status: "Idle".into(),
             bg_noise,
-        }
+            #[cfg(windows)]
+            launched_at: Instant::now(),
+            #[cfg(windows)]
+            main_window_revealed: false,
+        };
+        crate::startup_log::log("AudioMeterApp::new: end");
+        #[allow(clippy::let_and_return)]
+        return _app;
     }
 
     fn refresh_devices(&mut self) {
@@ -593,8 +631,47 @@ impl AudioMeterApp {
 
 impl eframe::App for AudioMeterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        paint_metallic_background(&ui.painter(), ui.max_rect(), &self.bg_noise);
         let ctx = ui.ctx().clone();
+
+        // Log the first frame so we can tell from launch.log whether the
+        // event loop is actually pumping at all (vs eframe getting wedged
+        // during window / GL creation before the first repaint).
+        static FIRST_UI: once_cell::sync::OnceCell<()> = once_cell::sync::OnceCell::new();
+        let _ = FIRST_UI.get_or_init(|| {
+            crate::startup_log::log("ui: first frame");
+        });
+
+        // On Windows we launch with the main viewport parked far off-screen
+        // so the splash icon (a separate always-on-top Win32 layered window)
+        // has the screen to itself during its solo phase. After that phase
+        // we teleport the window to the primary-monitor center and pull it
+        // to the foreground. Driving the reveal from here — rather than a
+        // `thread::sleep` in `main` — keeps the launch within Windows'
+        // foreground-privilege window so we can still steal focus even if
+        // the user launched us from a fullscreen game.
+        #[cfg(windows)]
+        if !self.main_window_revealed {
+            let elapsed = self.launched_at.elapsed();
+            if elapsed >= crate::SPLASH_SOLO_DURATION {
+                let center = crate::centered_launch_position(crate::MAIN_W, crate::MAIN_H);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(center));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.main_window_revealed = true;
+                crate::startup_log::log(format!(
+                    "ui: main window revealed at {:.1}x{:.1}",
+                    center.x, center.y
+                ));
+            } else {
+                // Tick the event loop so we come back right after the solo
+                // phase ends rather than sleeping until the next user input.
+                let remaining = crate::SPLASH_SOLO_DURATION
+                    .saturating_sub(elapsed)
+                    .saturating_add(std::time::Duration::from_millis(16));
+                ctx.request_repaint_after(remaining);
+            }
+        }
+
+        paint_metallic_background(&ui.painter(), ui.max_rect(), &self.bg_noise);
         let now = ctx.input(|i| i.time);
         self.tick_meters();
         // Spectrum: run the analyzer while the tab is open, and keep decaying after Stop even if
@@ -1772,9 +1849,24 @@ fn format_runtime_hms(start: Option<Instant>) -> String {
 /// requests. Logging the actual `GL_SAMPLES` count makes the difference between
 /// "the trace is stair-stepped because the anti-aliasing plan is wrong" and "the
 /// trace is stair-stepped because MSAA silently isn't running" trivially debuggable.
+/// On non-Windows, probes the Glow (OpenGL) capabilities we actually
+/// received and logs them. We ask for 8× MSAA but the driver is free
+/// to give us fewer samples — NVIDIA Optimus and some Intel Arc
+/// profiles force "application-controlled MSAA" off regardless of
+/// what the app requests. Logging `GL_SAMPLES` makes the difference
+/// between "trace is stair-stepped because AA plan is wrong" and
+/// "trace is stair-stepped because MSAA silently isn't running"
+/// trivially debuggable.
+///
+/// On Windows the function is a thin one-liner — the binary doesn't
+/// compile the `glow` feature on purpose (see the comment in
+/// `Cargo.toml` about `nvoglv64.dll`), so there's no GL context to
+/// probe and no `eframe::glow` module to reach for.
+#[cfg(not(windows))]
 fn log_gl_caps(cc: &eframe::CreationContext<'_>) {
     let Some(gl) = cc.gl.as_ref() else {
-        log::warn!("No glow context available at startup (wgpu renderer?)");
+        log::info!("renderer: wgpu (no glow context)");
+        crate::startup_log::log("renderer: wgpu");
         return;
     };
     use eframe::glow::HasContext;
@@ -1786,6 +1878,9 @@ fn log_gl_caps(cc: &eframe::CreationContext<'_>) {
         log::info!(
             "GL renderer='{renderer}' version='{version}' MSAA samples={samples} sample_buffers={sample_buffers}"
         );
+        crate::startup_log::log(format!(
+            "renderer: glow (GL renderer='{renderer}', version='{version}', MSAA samples={samples})"
+        ));
         if samples < 2 {
             log::warn!(
                 "MSAA not active (GL_SAMPLES={samples}). Requested 8× in main.rs but the driver declined. \
@@ -1793,6 +1888,12 @@ fn log_gl_caps(cc: &eframe::CreationContext<'_>) {
             );
         }
     }
+}
+
+#[cfg(windows)]
+fn log_gl_caps(_cc: &eframe::CreationContext<'_>) {
+    log::info!("renderer: wgpu (glow feature intentionally disabled on Windows)");
+    crate::startup_log::log("renderer: wgpu (glow feature disabled)");
 }
 
 /// Deterministic hash for procedural noise (no `rand` dependency).
