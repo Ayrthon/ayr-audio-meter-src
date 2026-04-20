@@ -613,7 +613,7 @@ impl eframe::App for AudioMeterApp {
                 // `with_layout` below would get zero width (invisible in release builds).
                 ui.add_space(14.0);
                 ui.label(
-                    RichText::new("Audio Meter")
+                    RichText::new("AYR Audio Meter")
                         .color(TITLE_COL)
                         .size(18.0)
                         .strong(),
@@ -677,9 +677,11 @@ impl eframe::App for AudioMeterApp {
                         self.left_controls(ui);
                     },
                 );
-                ui.add_space(6.0);
+                // A bit of clearance on the left for the left-column's scrollbar,
+                // tighter on the meter side so the divider hugs the meters column.
+                ui.add_space(3.0);
                 inset_vertical_divider(ui);
-                ui.add_space(6.0);
+                ui.add_space(2.0);
                 self.meters_and_graph(ui, now);
             });
 
@@ -823,8 +825,8 @@ impl AudioMeterApp {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(clip_detail.as_str())
-                        .size(9.5)
-                        .color(LEFT_LABEL_SECONDARY),
+                        .size(11.0)
+                        .color(crate::meter_widget::COL_RULER_TEXT),
                 );
             },
         );
@@ -1303,8 +1305,6 @@ impl AudioMeterApp {
         // the window / status bar so the readouts don't feel crammed
         // against the edge.
         const METERS_BOTTOM_PAD: f32 = 18.0;
-        // Gap between meter strip and right-hand graph column.
-        const RIGHT_COL_GAP_FROM_METERS: f32 = 8.0;
         let row_h = (ui.available_height() - METERS_BOTTOM_PAD)
             .max(crate::meter_widget::METER_MIN_HEIGHT);
         ui.allocate_ui_with_layout(
@@ -1346,7 +1346,9 @@ impl AudioMeterApp {
                     },
                 );
 
-                ui.add_space(RIGHT_COL_GAP_FROM_METERS);
+                ui.add_space(3.0);
+                inset_vertical_divider(ui);
+                ui.add_space(3.0);
                 let right_col_w = ui.available_width().max(1.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(right_col_w, row_h),
@@ -1397,6 +1399,10 @@ impl AudioMeterApp {
                                                     now,
                                                     &mut self.spectrum_pretty_mode,
                                                     &mut self.spectrum_anchors,
+                                                    FreqWeighting::from_u8(
+                                                        self.weighting_atomic
+                                                            .load(Ordering::Relaxed),
+                                                    ),
                                                 );
                                             });
                                     }
@@ -1459,8 +1465,8 @@ impl AudioMeterApp {
                     let view_lr = ui.vertical(|ui| {
                         ui.label(
                             RichText::new("View")
-                                .size(8.5)
-                                .color(Color32::from_gray(130)),
+                                .size(10.5)
+                                .color(crate::meter_widget::COL_RULER_TEXT),
                         );
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
@@ -1538,8 +1544,8 @@ impl AudioMeterApp {
                                 ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                                     ui.label(
                                         RichText::new("Current runtime")
-                                            .size(8.5)
-                                            .color(Color32::from_gray(130)),
+                                            .size(10.5)
+                                            .color(crate::meter_widget::COL_RULER_TEXT),
                                     );
                                 });
                                 ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {

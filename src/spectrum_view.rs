@@ -16,6 +16,7 @@ use egui::{
 use crate::spectrum::{
     SharedSpectrum, SpectrumAnalyzer, SPECTRUM_FLOOR_DB, spectrum_pro_q_display_db,
 };
+use crate::weighting::FreqWeighting;
 
 /// Pro-Q 3 analyzer vertical: 0 dB (top) … −100 dB (bottom), piecewise-linear.
 const PRO_Q_ANALYZER_DB_TOP: f32 = 0.0;
@@ -133,6 +134,7 @@ pub fn show_spectrum(
     _now: f64,
     pretty_mode: &mut bool,
     anchors: &mut Vec<f32>,
+    weighting: FreqWeighting,
 ) -> Response {
     // `analyzer` is ticked in `AudioMeterApp::ui` so the spectrum decays when audio stops even
     // if the History tab is visible.
@@ -282,7 +284,12 @@ pub fn show_spectrum(
                 let m = bucket_catmull_db(f, &analyzer.bucket_freqs, &analyzer.bucket_dbs);
                 let h = bucket_catmull_db(f, &analyzer.bucket_freqs, &analyzer.peak_hold_db);
 
-                let comp = spectrum_pro_q_display_db(f) + DISPLAY_OFFSET_DB;
+                // `weighting.response_db(f)` applies the selected IEC curve (A / C / Z)
+                // directly in log-frequency space, so the analyzer state (buckets +
+                // peak-hold) stays in calibrated dBFS and the weighting can change
+                // instantly without resetting the EMA.
+                let comp =
+                    spectrum_pro_q_display_db(f) + DISPLAY_OFFSET_DB + weighting.response_db(f);
                 mags.push((m + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
                 holds.push((h + comp).clamp(SPECTRUM_FLOOR_DB, 12.0));
             }

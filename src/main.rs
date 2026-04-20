@@ -50,9 +50,11 @@ fn main() -> eframe::Result {
     let min_inner = [600.0_f32, 520.0_f32];
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1140.0, 640.0])
+        // Inner size is logical (DPI-independent). Windows adds the title bar +
+        // 1 px borders on top, ~31 px at default chrome, so inner 649 ≈ outer 680.
+        .with_inner_size([1140.0, 649.0])
         .with_min_inner_size(min_inner)
-        .with_title("Audio Meter")
+        .with_title("AYR Audio Meter")
         .with_decorations(true)
         .with_resizable(true);
     if let Some(icon) = app_icon() {
@@ -84,7 +86,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Audio Meter",
+        "AYR Audio Meter",
         native_options,
         Box::new(|cc| Ok(Box::new(app::AudioMeterApp::new(cc)))),
     )

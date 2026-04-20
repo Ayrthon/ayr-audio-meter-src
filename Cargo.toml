@@ -1,6 +1,6 @@
 [package]
 name = "audio-meter-rs"
-version = "1.4.1"
+version = "1.6.4"
 edition = "2024"
 description = "Real-time audio meter and level history viewer."
 

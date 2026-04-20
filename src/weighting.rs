@@ -49,6 +49,58 @@ impl FreqWeighting {
             FreqWeighting::C => " · C",
         }
     }
+
+    /// Analytical IEC 61672–1 frequency response in dB at `f_hz`.
+    ///
+    /// Used for frequency-domain weighting of the spectrum analyzer (the
+    /// meter path uses the matched biquad cascade further down this file).
+    /// Returns 0 dB for `Z` (broadband / unweighted) and clamps to the
+    /// spectrum floor at DC / negative inputs to avoid `log10(0)`.
+    #[inline]
+    pub fn response_db(self, f_hz: f32) -> f32 {
+        if !f_hz.is_finite() || f_hz <= 0.0 {
+            return match self {
+                FreqWeighting::Z => 0.0,
+                // Both A and C roll off toward -infinity at DC; clamp hard.
+                _ => -120.0,
+            };
+        }
+        match self {
+            FreqWeighting::Z => 0.0,
+            FreqWeighting::A => a_weight_db(f_hz),
+            FreqWeighting::C => c_weight_db(f_hz),
+        }
+    }
+}
+
+/// IEC 61672-1 A-weighting analytical response (dB).
+/// Pole frequencies: 20.598997, 107.65265, 737.86223, 12194.217 Hz.
+/// Normalized so `R_A(1 kHz) ≈ 0 dB` via the standard +2.00 dB offset.
+#[inline]
+fn a_weight_db(f: f32) -> f32 {
+    let f2 = f * f;
+    let f4 = f2 * f2;
+    const FL2: f32 = 20.598_997 * 20.598_997;
+    const FM2: f32 = 107.652_65 * 107.652_65;
+    const FN2: f32 = 737.862_24 * 737.862_24;
+    const FH2: f32 = 12_194.217 * 12_194.217;
+    let num = FH2 * f4;
+    let den = (f2 + FL2) * ((f2 + FM2) * (f2 + FN2)).sqrt() * (f2 + FH2);
+    let ra = num / den.max(1e-30);
+    20.0 * ra.max(1e-30).log10() + 2.00
+}
+
+/// IEC 61672-1 C-weighting analytical response (dB).
+/// Same low/high pole pair as A but without the middle band; +0.0619 dB 1-kHz normalisation.
+#[inline]
+fn c_weight_db(f: f32) -> f32 {
+    let f2 = f * f;
+    const FL2: f32 = 20.598_997 * 20.598_997;
+    const FH2: f32 = 12_194.217 * 12_194.217;
+    let num = FH2 * f2;
+    let den = (f2 + FL2) * (f2 + FH2);
+    let rc = num / den.max(1e-30);
+    20.0 * rc.max(1e-30).log10() + 0.0619
 }
 
 /// One second-order section in scipy `sos` row order: `[b0, b1, b2, a0, a1, a2]` with `a0 = 1`.

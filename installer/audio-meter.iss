@@ -2,11 +2,11 @@
 ; Build: install Inno Setup 6, run ..\installer\build-installer.ps1 from repo root (or ISCC this file after `cargo build --release`).
 ; Bump MyAppVersion when you bump version in Cargo.toml.
 
-#define MyAppName      "Audio Meter"
-#define MyAppVersion   "1.4.1"
+#define MyAppName      "AYR Audio Meter"
+#define MyAppVersion   "1.6.4"
 #define MyAppPublisher "Ayrthon"
 #define MyAppURL       "https://ayrthon.com"
-#define MyAppExeName   "Audio Meter.exe"
+#define MyAppExeName   "AYR Audio Meter.exe"
 ; Installed beside the .exe so shortcuts use an explicit .ico (Shell often ignores icons embedded in some Rust/GUI exes).
 #define MyAppIconFile  "AudioMeter.ico"
 

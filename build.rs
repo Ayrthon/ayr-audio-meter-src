@@ -38,8 +38,8 @@ fn main() {
     {
         let mut res = winres::WindowsResource::new();
         res.set_icon(ico_path.to_str().expect("ico path utf-8"));
-        res.set("FileDescription", "Audio Meter");
-        res.set("ProductName", "Audio Meter");
+        res.set("FileDescription", "AYR Audio Meter");
+        res.set("ProductName", "AYR Audio Meter");
         res.compile().expect("WindowsResource::compile");
     }
 }
