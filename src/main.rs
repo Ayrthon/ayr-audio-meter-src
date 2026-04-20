@@ -1,4 +1,8 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Always build as a Windows GUI binary (not a console app) so the user never
+// sees an auxiliary terminal window pop up behind the app at launch. We used
+// to keep the console subsystem for debug builds to get stderr logging, but
+// that meant any dev-time launch flashed a command prompt on screen.
+#![windows_subsystem = "windows"]
 
 mod app;
 mod audio;
@@ -13,9 +17,27 @@ mod meter;
 mod meter_widget;
 mod spectrum;
 mod spectrum_view;
+#[cfg(windows)]
+mod splash;
 mod weighting;
 
+use std::time::Duration;
+
 use eframe::egui;
+
+/// How long the splash icon is the only thing on screen before we bring up
+/// the main window behind it.
+const SPLASH_SOLO: Duration = Duration::from_secs(3);
+/// How long the splash sits on top of the (now visible) main window at full
+/// alpha before the fade-out begins.
+const SPLASH_OVER_APP: Duration = Duration::from_secs(2);
+/// Fade-out duration for the final handoff from splash to main window.
+const SPLASH_FADE_OUT: Duration = Duration::from_millis(500);
+
+/// Initial outer size of the main window in logical pixels, used to compute
+/// a centered launch position.
+const MAIN_W: f32 = 1140.0;
+const MAIN_H: f32 = 649.0;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -49,14 +71,32 @@ fn main() -> eframe::Result {
     // shrink freely when the right-hand panel is hidden.
     let min_inner = [600.0_f32, 520.0_f32];
 
+    // Kick off the transparent splash icon ASAP — it runs on its own thread
+    // with a Win32 layered window, so it appears before any GL / audio init
+    // work this thread is about to do. We keep the returned handle in scope
+    // through `run_native` so the splash thread's lifetime is bounded by
+    // `main` (it will also auto-close after the configured lifetime).
+    #[cfg(windows)]
+    let _splash = splash::spawn(SPLASH_SOLO + SPLASH_OVER_APP + SPLASH_FADE_OUT, SPLASH_FADE_OUT);
+
+    // Give the splash the whole solo phase before we start standing up the
+    // main window. Blocking this thread is fine — nothing else is running
+    // here yet, and the splash lives on its own thread with its own pump.
+    #[cfg(windows)]
+    std::thread::sleep(SPLASH_SOLO);
+
     let mut viewport = egui::ViewportBuilder::default()
         // Inner size is logical (DPI-independent). Windows adds the title bar +
         // 1 px borders on top, ~31 px at default chrome, so inner 649 ≈ outer 680.
-        .with_inner_size([1140.0, 649.0])
+        .with_inner_size([MAIN_W, MAIN_H])
         .with_min_inner_size(min_inner)
         .with_title("AYR Audio Meter")
         .with_decorations(true)
-        .with_resizable(true);
+        .with_resizable(true)
+        // Open centered on the primary monitor so the app appears exactly
+        // under the splash icon that's been sitting there for the last few
+        // seconds, instead of at some OS-chosen cascading default.
+        .with_position(centered_launch_position(MAIN_W, MAIN_H));
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -90,6 +130,34 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| Ok(Box::new(app::AudioMeterApp::new(cc)))),
     )
+}
+
+/// Computes a launch position (outer window top-left) that centers a window
+/// of the given logical size on the primary monitor. On non-Windows platforms
+/// we fall back to a reasonable default; the splash intro is Windows-only
+/// anyway, so exact centering there is a nice-to-have, not a correctness
+/// requirement.
+fn centered_launch_position(width: f32, height: f32) -> egui::Pos2 {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetSystemMetrics(index: i32) -> i32;
+        }
+        const SM_CXSCREEN: i32 = 0;
+        const SM_CYSCREEN: i32 = 1;
+        let (sw, sh) = unsafe {
+            (
+                GetSystemMetrics(SM_CXSCREEN) as f32,
+                GetSystemMetrics(SM_CYSCREEN) as f32,
+            )
+        };
+        return egui::pos2(((sw - width) * 0.5).max(0.0), ((sh - height) * 0.5).max(0.0));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (width, height);
+        egui::pos2(80.0, 80.0)
+    }
 }
 
 fn app_icon() -> Option<egui::IconData> {
