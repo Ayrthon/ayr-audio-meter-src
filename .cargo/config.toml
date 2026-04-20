@@ -8,5 +8,8 @@ rustflags = ["-C", "target-feature=+crt-static"]
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]
 
-# If you use MSVC (`rustup default stable-x86_64-pc-windows-msvc` + VS Build Tools with C++),
-# these flags are not used; the exe depends on the normal VC++ Redistributable instead.
+# MSVC host: static-link the VC++ runtime so the installer does not have to ship or require
+# the user-facing "Microsoft Visual C++ Redistributable". The resulting .exe is a few hundred
+# kB larger but has zero external DLL dependencies beyond stock Windows components.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

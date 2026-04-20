@@ -29,7 +29,8 @@ PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=AudioMeter-Setup-{#MyAppVersion}
+; File name includes the full brand (spaces → hyphens so it's web/email-safe).
+OutputBaseFilename=AYR-Audio-Meter-Setup-{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

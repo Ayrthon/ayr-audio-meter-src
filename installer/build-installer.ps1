@@ -8,7 +8,11 @@
 #   $env:AUDIO_METER_BUILD = "$(git describe --tags --always)"; .\installer\build-installer.ps1
 
 $ErrorActionPreference = "Stop"
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+# Avoid `Resolve-Path (Join-Path $PSScriptRoot "..")` — under PowerShell the
+# UNC / `\\wsl.localhost\...` provider rewrites that into a malformed
+# `Microsoft.PowerShell.Core\FileSystem::\\...` path that breaks `cargo build`.
+# `Split-Path -Parent` keeps the path normal on both local drives and UNC.
+$Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
 # Cursor/agent sandboxes may set CARGO_TARGET_DIR to a temp folder — force the normal project
@@ -44,4 +48,4 @@ Write-Host "==> & `"$ISCC`" `"$Iss`"" -ForegroundColor Cyan
 $Dist = Join-Path $Root "dist"
 Write-Host ""
 Write-Host "Done. Installer:" -ForegroundColor Green
-Get-ChildItem $Dist -Filter "AudioMeter-Setup-*.exe" | ForEach-Object { Write-Host "  $($_.FullName)" }
+Get-ChildItem $Dist -Filter "AYR-Audio-Meter-Setup-*.exe" | ForEach-Object { Write-Host "  $($_.FullName)" }
