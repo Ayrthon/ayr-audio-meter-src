@@ -15,6 +15,8 @@ use egui::{
     Widget,
 };
 use egui::collapsing_header::CollapsingState;
+use egui::containers::menu::menu_style;
+use egui::style::StyleModifier;
 use parking_lot::Mutex;
 
 use crate::audio::{
@@ -44,12 +46,12 @@ use crate::weighting::{FreqWeighting, MeterScratch};
 /// Darkest edge of the vignetted metal background (`#232328`, matches `paint_metallic_background` edge).
 const BG: Color32 = Color32::from_rgb(0x23, 0x23, 0x28);
 const PANEL_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x30);
-/// Left column chrome (matches reference mockup: near-black panel behind section cards).
-const LEFT_PANEL_BG: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
-/// Accordion title strip on section cards (`#2A2A2A`).
-const LEFT_SECTION_HEADER_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
-/// 1 px card outline on the left column.
-const LEFT_SECTION_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x3e);
+/// Accordion title strip (`#222328`).
+const LEFT_SECTION_HEADER_BG: Color32 = Color32::from_rgb(0x22, 0x23, 0x28);
+/// Body fill under each section header (`#2C2B30`).
+const LEFT_SECTION_BODY_BG: Color32 = Color32::from_rgb(0x2c, 0x2b, 0x30);
+/// ComboBox closed button and popup menu fill (`#1E1C22`).
+const LEFT_COMBO_BG: Color32 = Color32::from_rgb(0x1e, 0x1c, 0x22);
 /// Small caps / secondary labels in the left column (`#A0A0A0`).
 const LEFT_LABEL_SECONDARY: Color32 = Color32::from_rgb(0xa0, 0xa0, 0xa0);
 /// Vertical gap between stacked accordion cards in the left column.
@@ -714,8 +716,8 @@ impl AudioMeterApp {
             ui.add_space(5.0);
             let clips_path_label = clips_path_display(&*self.user_settings.lock());
             Frame::new()
-                .fill(Color32::from_rgb(0x18, 0x18, 0x22))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x32, 0x34, 0x42)))
+                .fill(LEFT_COMBO_BG)
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x40, 0x3e, 0x48)))
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::symmetric(10, 10))
                 .show(ui, |ui| {
@@ -858,33 +860,36 @@ impl AudioMeterApp {
                 self.mode.display_name(),
                 mode_zone_hint
             );
-            let mode_combo = egui::ComboBox::from_id_salt("mode_combo")
-                .width(width)
-                .selected_text(self.mode.name_outside_paren())
-                .show_ui(ui, |ui| {
-                    for mode in MeterMode::ALL {
-                        if ui
-                            .selectable_label(self.mode == mode, mode.display_name())
-                            .clicked()
-                        {
-                            self.mode = mode;
-                            self.clip_meter_mode
-                                .store(mode.to_discriminant(), Ordering::Relaxed);
-                            self.meter_true_peak.store(
-                                config_for(mode).true_peak,
-                                Ordering::Relaxed,
-                            );
-                            *self.clip_trigger_states.lock() =
-                                std::array::from_fn(|_| MeterState::default());
-                            for s in &mut self.meter_states {
-                                s.clear();
+            let mode_combo = with_left_panel_combo_style(ui, |ui| {
+                egui::ComboBox::from_id_salt("mode_combo")
+                    .width(width)
+                    .selected_text(self.mode.name_outside_paren())
+                    .popup_style(left_panel_combo_popup_style())
+                    .show_ui(ui, |ui| {
+                        for mode in MeterMode::ALL {
+                            if ui
+                                .selectable_label(self.mode == mode, mode.display_name())
+                                .clicked()
+                            {
+                                self.mode = mode;
+                                self.clip_meter_mode
+                                    .store(mode.to_discriminant(), Ordering::Relaxed);
+                                self.meter_true_peak.store(
+                                    config_for(mode).true_peak,
+                                    Ordering::Relaxed,
+                                );
+                                *self.clip_trigger_states.lock() =
+                                    std::array::from_fn(|_| MeterState::default());
+                                for s in &mut self.meter_states {
+                                    s.clear();
+                                }
+                                // Leave `self.history` alone — the
+                                // user wants the scrolling graph to
+                                // carry over when switching modes.
                             }
-                            // Leave `self.history` alone — the
-                            // user wants the scrolling graph to
-                            // carry over when switching modes.
                         }
-                    }
-                });
+                    })
+            });
             mode_combo.response.on_hover_text(mode_combo_hover);
         });
 
@@ -894,19 +899,22 @@ impl AudioMeterApp {
             ui.add_space(4.0);
             let mut w =
                 FreqWeighting::from_u8(self.weighting_atomic.load(Ordering::Relaxed));
-            let w_combo = egui::ComboBox::from_id_salt("freq_weight_combo")
-                .width(width)
-                .selected_text(w.label())
-                .show_ui(ui, |ui| {
-                    for ww in FreqWeighting::ALL {
-                        if ui
-                            .selectable_label(w == ww, ww.list_entry())
-                            .clicked()
-                        {
-                            w = ww;
+            let w_combo = with_left_panel_combo_style(ui, |ui| {
+                egui::ComboBox::from_id_salt("freq_weight_combo")
+                    .width(width)
+                    .selected_text(w.label())
+                    .popup_style(left_panel_combo_popup_style())
+                    .show_ui(ui, |ui| {
+                        for ww in FreqWeighting::ALL {
+                            if ui
+                                .selectable_label(w == ww, ww.list_entry())
+                                .clicked()
+                            {
+                                w = ww;
+                            }
                         }
-                    }
-                });
+                    })
+            });
             w_combo.response.on_hover_text(
                 "Applies to peak, RMS, and level history only.\n\
                  LUFS and the spectrum use full-band BS.1770 K-weighting.",
@@ -924,110 +932,103 @@ impl AudioMeterApp {
 
         left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", |ui| {
             ui.add_space(4.0);
-            Frame::new()
-                .fill(Color32::from_rgb(0x11, 0x12, 0x18))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x34, 0x36, 0x44)))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(width);
+            let content_w = ui.available_width();
+            ui.set_width(content_w);
 
-                    let mut thr = self.clip_settings.threshold_db();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("Threshold")
-                                .size(11.5)
-                                .color(TITLE_COL)
-                                .strong(),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{thr:.1} dBFS"))
-                                    .size(12.5)
-                                    .color(ACCENT)
-                                    .strong(),
-                            );
-                        });
-                    });
-                    ui.add_space(3.0);
-
-                    let slider_w = ui.available_width();
-                    let prev_slider_w = ui.style().spacing.slider_width;
-                    ui.style_mut().spacing.slider_width = slider_w;
-                    let rail_h = 18.0_f32;
-                    let slider_resp = ui.add_sized(
-                        egui::vec2(slider_w, rail_h),
-                        egui::Slider::new(
-                            &mut thr,
-                            crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
-                                ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
-                        )
-                            .fixed_decimals(1)
-                            .show_value(false)
-                            .trailing_fill(true),
+            let mut thr = self.clip_settings.threshold_db();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Threshold")
+                        .size(11.5)
+                        .color(TITLE_COL)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{thr:.1} dBFS"))
+                            .size(12.5)
+                            .color(ACCENT)
+                            .strong(),
                     );
-                    ui.style_mut().spacing.slider_width = prev_slider_w;
-                    if slider_resp.changed() {
-                        self.clip_settings.set_threshold_db(thr);
-                    }
-                    slider_resp.on_hover_text(&clip_detail_short);
-
-                    ui.add_space(6.0);
-                    let lib = ui
-                        .add_sized(
-                            egui::vec2(width, 26.0),
-                            egui::Button::new(if self.left_tab == LeftPanelTab::Clips {
-                                "Clips library (open)…"
-                            } else {
-                                "Clips library…"
-                            }),
-                        )
-                        .on_hover_text(
-                            "List, preview, folder, delete — Space plays/pauses the waveform",
-                        );
-                    if lib.clicked() {
-                        self.left_tab = LeftPanelTab::Clips;
-                    }
-
-                    {
-                        let st = self.clip_status.lock();
-                        let armed_now = self.clip_settings.enabled();
-                        if armed_now {
-                            let n = st
-                                .total_clips_saved
-                                .saturating_sub(self.clip_session_baseline);
-                            let (counter_text, counter_color) = if n == 0 {
-                                (
-                                    "Clips saved this arm: 0".into(),
-                                    Color32::from_gray(130),
-                                )
-                            } else {
-                                (format!("Clips saved this arm: {n}"), ACCENT)
-                            };
-                            ui.add_space(5.0);
-                            ui.label(
-                                RichText::new(counter_text)
-                                    .size(10.5)
-                                    .strong()
-                                    .color(counter_color),
-                            );
-                        }
-                        if let Some(ref e) = st.last_error {
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new(format!("Error: {e}"))
-                                    .color(Color32::from_rgb(200, 100, 100))
-                                    .size(9.5),
-                            );
-                        }
-                    }
                 });
+            });
+            ui.add_space(3.0);
+
+            let slider_w = ui.available_width();
+            let prev_slider_w = ui.style().spacing.slider_width;
+            ui.style_mut().spacing.slider_width = slider_w;
+            let rail_h = 18.0_f32;
+            let slider_resp = ui.add_sized(
+                egui::vec2(slider_w, rail_h),
+                egui::Slider::new(
+                    &mut thr,
+                    crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
+                        ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
+                )
+                    .fixed_decimals(1)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            ui.style_mut().spacing.slider_width = prev_slider_w;
+            if slider_resp.changed() {
+                self.clip_settings.set_threshold_db(thr);
+            }
+            slider_resp.on_hover_text(&clip_detail_short);
+
+            ui.add_space(6.0);
+            let lib = ui
+                .add_sized(
+                    egui::vec2(ui.available_width(), 26.0),
+                    egui::Button::new(if self.left_tab == LeftPanelTab::Clips {
+                        "Clips library (open)…"
+                    } else {
+                        "Clips library…"
+                    }),
+                )
+                .on_hover_text(
+                    "List, preview, folder, delete — Space plays/pauses the waveform",
+                );
+            if lib.clicked() {
+                self.left_tab = LeftPanelTab::Clips;
+            }
+
+            {
+                let st = self.clip_status.lock();
+                let armed_now = self.clip_settings.enabled();
+                if armed_now {
+                    let n = st
+                        .total_clips_saved
+                        .saturating_sub(self.clip_session_baseline);
+                    let (counter_text, counter_color) = if n == 0 {
+                        (
+                            "Clips saved this arm: 0".into(),
+                            Color32::from_gray(130),
+                        )
+                    } else {
+                        (format!("Clips saved this arm: {n}"), ACCENT)
+                    };
+                    ui.add_space(5.0);
+                    ui.label(
+                        RichText::new(counter_text)
+                            .size(10.5)
+                            .strong()
+                            .color(counter_color),
+                    );
+                }
+                if let Some(ref e) = st.last_error {
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new(format!("Error: {e}"))
+                            .color(Color32::from_rgb(200, 100, 100))
+                            .size(9.5),
+                    );
+                }
+            }
         });
     }
 
     fn left_controls(&mut self, ui: &mut egui::Ui) {
         Frame::new()
-            .fill(LEFT_PANEL_BG)
             .inner_margin(egui::Margin::symmetric(10, 10))
             .show(ui, |ui| {
                 ui.set_width(LEFT_COLUMN_INNER_W);
@@ -1108,9 +1109,11 @@ impl AudioMeterApp {
         // devices.
         let metering_active = self.engine.is_some();
         let combo_resp = ui.add_enabled_ui(!metering_active, |ui| {
+            with_left_panel_combo_style(ui, |ui| {
             egui::ComboBox::from_id_salt(id)
                 .width(width)
                 .selected_text(truncate(&current_label, 36))
+                .popup_style(left_panel_combo_popup_style())
                 .show_ui(ui, |ui| {
                 let has_inputs = self.devices.iter().any(|d| d.kind == SourceKind::Input);
                 let has_outputs = self
@@ -1164,6 +1167,7 @@ impl AudioMeterApp {
                     );
                 }
                 })
+            })
         }).response;
 
         if metering_active {
@@ -1988,7 +1992,7 @@ fn left_panel_chevron_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Re
     }
 }
 
-/// Collapsible block in the left column: bordered card, `#2A2A2A` title strip, chevron on the right.
+/// Collapsible block in the left column: title strip + body (no outer bordered “card” frame).
 fn left_panel_collapsing<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
@@ -2011,53 +2015,82 @@ fn left_panel_collapsing<R>(
         CornerRadius::same(4)
     };
 
-    Frame::new()
-        .fill(LEFT_PANEL_BG)
-        .stroke(Stroke::new(1.0, LEFT_SECTION_BORDER))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::ZERO)
-        .show(ui, |ui| {
-            ui.set_width(card_w);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    ui.set_width(card_w);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                Frame::new()
-                    .fill(LEFT_SECTION_HEADER_BG)
-                    .corner_radius(header_corners)
-                    .inner_margin(Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-                            ui.label(
-                                RichText::new(title.to_uppercase())
-                                    .color(TITLE_COL)
-                                    .size(12.5)
-                                    .strong(),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add_space(8.0);
-                                state.show_toggle_button(ui, left_panel_chevron_icon);
-                            });
-                        });
+        Frame::new()
+            .fill(LEFT_SECTION_HEADER_BG)
+            .corner_radius(header_corners)
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    ui.label(
+                        RichText::new(title.to_uppercase())
+                            .color(TITLE_COL)
+                            .size(12.5)
+                            .strong(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        state.show_toggle_button(ui, left_panel_chevron_icon);
                     });
-
-                let _ = state.show_body_unindented(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    Frame::new()
-                        .fill(LEFT_PANEL_BG)
-                        .corner_radius(CornerRadius {
-                            nw: 0,
-                            ne: 0,
-                            sw: 4,
-                            se: 4,
-                        })
-                        .inner_margin(Margin::symmetric(10, 10))
-                        .show(ui, |ui| add_contents(ui))
-                        .inner
                 });
             });
+
+        let _ = state.show_body_unindented(ui, |ui| {
+            ui.set_width(ui.available_width());
+            Frame::new()
+                .fill(LEFT_SECTION_BODY_BG)
+                .corner_radius(CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 4,
+                    se: 4,
+                })
+                .inner_margin(Margin::symmetric(10, 10))
+                .show(ui, |ui| add_contents(ui))
+                .inner
         });
+    });
+}
+
+/// Popup list styling for left-panel [`egui::ComboBox`] menus (`Frame::menu` uses [`Visuals::window_fill`]).
+fn left_panel_combo_popup_style() -> StyleModifier {
+    StyleModifier::new(|s| {
+        menu_style(s);
+        s.visuals.window_fill = LEFT_COMBO_BG;
+    })
+}
+
+/// Closed combo button uses [`WidgetVisuals::weak_bg_fill`]; tint hover/active slightly.
+fn with_left_panel_combo_style<R>(
+    ui: &mut egui::Ui,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope(|ui| {
+        let v = &mut ui.style_mut().visuals.widgets;
+        let f = LEFT_COMBO_BG;
+        let hover = Color32::from_rgb(0x2a, 0x28, 0x2e);
+        let active = Color32::from_rgb(0x32, 0x30, 0x36);
+        v.inactive.weak_bg_fill = f;
+        v.inactive.bg_fill = f;
+        v.hovered.weak_bg_fill = hover;
+        v.hovered.bg_fill = hover;
+        v.active.weak_bg_fill = active;
+        v.active.bg_fill = active;
+        v.open.weak_bg_fill = f;
+        v.open.bg_fill = f;
+        let stroke = Stroke::new(1.0, Color32::from_rgb(0x40, 0x3e, 0x48));
+        v.inactive.bg_stroke = stroke;
+        v.hovered.bg_stroke = stroke;
+        v.active.bg_stroke = stroke;
+        v.open.bg_stroke = stroke;
+        content(ui)
+    })
+    .inner
 }
 
 fn draw_badge(ui: &mut egui::Ui, label: &str, bg: Color32) {
