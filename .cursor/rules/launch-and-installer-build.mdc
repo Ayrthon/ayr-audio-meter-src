@@ -1,18 +1,50 @@
 ---
-description: Use the repo target folder for run/installer builds when launching Audio Meter
+description: Use the repo launch scripts so the correct Windows build runs (not the WSL Linux binary)
 alwaysApply: true
 ---
 
 # Audio Meter — launch and installer builds
 
-When the user asks to **launch** or **run** Audio Meter (or "my app" in this Rust project context), do **not** run a bare `cargo run` if the environment may set `CARGO_TARGET_DIR` to a sandbox path.
+## Which binary is “the app”?
 
-Instead, from the `audio-meter-rs` repo root, run:
+This repo is developed from **WSL** with the project on the Linux filesystem, but the product you run day to day is usually the **Windows** `audio-meter-rs.exe`, not a native Linux ELF.
+
+- Running `cargo build` **inside WSL** produces **`target/release/audio-meter-rs`** as a **Linux** executable. That is **not** the same build as the Windows `.exe` from the PowerShell launchers.
+- **`launch-dev.ps1`** builds a **Windows debug** `.exe` under `%LOCALAPPDATA%\AudioMeter\cargo-target-dev\debug\` and copies it to `%LOCALAPPDATA%\AudioMeter\audio-meter-rs.exe` (fast iteration; avoids UNC incremental issues).
+- **`launch-release.ps1`** sets `CARGO_TARGET_DIR` to this repo’s `target\`, runs **`cargo build --release` for Windows**, and stages the same path the installer uses: `target\release\audio-meter-rs.exe` (then copies to `%LOCALAPPDATA%\AudioMeter\` for a trusted launch).
+
+When the user asks to **launch**, **run**, or **relaunch** Audio Meter, **do not** start `./target/release/audio-meter-rs` from a WSL shell unless they explicitly want the **Linux** build.
+
+## Windows (repo root, PowerShell)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\launch-release.ps1
 ```
 
-(with `required_permissions: ["all"]` in the agent shell tool when needed).
+For faster UI iteration (debug build + same staging as above):
 
-That script sets `CARGO_TARGET_DIR` to this repo’s `target\`, runs `cargo build --release`, and starts `target\release\audio-meter-rs.exe` — the **same** binary path that `installer\build-installer.ps1` packages into the Inno installer.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\launch-dev.ps1
+```
+
+Use `required_permissions: ["all"]` in the agent shell when needed so `cargo` / Windows interop is not blocked.
+
+## WSL shell (repo root) — use the wrappers
+
+These call **Windows PowerShell** so the build is **Windows**, not Linux:
+
+```bash
+./launch-release.sh
+```
+
+or (debug / daily dev):
+
+```bash
+./launch-dev.sh
+```
+
+Requires `powershell.exe` and `wslpath` (normal WSL + Windows interop).
+
+## Bare `cargo run` / sandbox `CARGO_TARGET_DIR`
+
+Do **not** rely on a bare `cargo run` if the environment may redirect `CARGO_TARGET_DIR` to a sandbox path. Prefer the scripts above so outputs land in the expected `target\` or `%LOCALAPPDATA%\AudioMeter\cargo-target-dev\` trees.

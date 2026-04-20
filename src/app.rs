@@ -10,10 +10,11 @@ use anyhow::Result;
 use eframe::egui;
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
-    Align, Align2, CollapsingHeader, Color32, CornerRadius, CursorIcon, FontId, Frame, Label,
-    Layout, Margin, OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Widget,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Label, Layout, Margin,
+    OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions,
+    Widget,
 };
+use egui::collapsing_header::CollapsingState;
 use parking_lot::Mutex;
 
 use crate::audio::{
@@ -43,6 +44,16 @@ use crate::weighting::{FreqWeighting, MeterScratch};
 /// Darkest edge of the vignetted metal background (`#232328`, matches `paint_metallic_background` edge).
 const BG: Color32 = Color32::from_rgb(0x23, 0x23, 0x28);
 const PANEL_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x30);
+/// Left column chrome (matches reference mockup: near-black panel behind section cards).
+const LEFT_PANEL_BG: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
+/// Accordion title strip on section cards (`#2A2A2A`).
+const LEFT_SECTION_HEADER_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
+/// 1 px card outline on the left column.
+const LEFT_SECTION_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x3e);
+/// Small caps / secondary labels in the left column (`#A0A0A0`).
+const LEFT_LABEL_SECONDARY: Color32 = Color32::from_rgb(0xa0, 0xa0, 0xa0);
+/// Vertical gap between stacked accordion cards in the left column.
+const LEFT_SECTION_STACK_GAP: f32 = 8.0;
 const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
 pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
@@ -688,16 +699,16 @@ impl AudioMeterApp {
             ui.label(
                 RichText::new(clip_detail.as_str())
                     .size(9.5)
-                    .color(Color32::from_gray(125)),
+                    .color(LEFT_LABEL_SECONDARY),
             );
         });
-        ui.add_space(6.0);
+        ui.add_space(LEFT_SECTION_STACK_GAP);
 
         left_panel_collapsing(ui, "clips_tab_save_folder", "SAVE FOLDER", |ui| {
             ui.add_space(4.0);
             ui.label(
                 RichText::new("Current location:")
-                    .color(Color32::from_gray(115))
+                    .color(LEFT_LABEL_SECONDARY)
                     .size(9.5),
             );
             ui.add_space(5.0);
@@ -773,11 +784,11 @@ impl AudioMeterApp {
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Peaks at or above the threshold start a capture.")
-                    .color(Color32::from_gray(120))
+                    .color(LEFT_LABEL_SECONDARY)
                     .size(9.5),
             );
         });
-        ui.add_space(6.0);
+        ui.add_space(LEFT_SECTION_STACK_GAP);
 
         left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", |ui| {
             ui.add_space(4.0);
@@ -808,7 +819,7 @@ impl AudioMeterApp {
                 draw_badge(ui, badge, badge_bg);
                 ui.label(
                     RichText::new(hint)
-                        .color(Color32::from_gray(150))
+                        .color(LEFT_LABEL_SECONDARY)
                         .size(10.5),
                 );
             });
@@ -823,7 +834,7 @@ impl AudioMeterApp {
             }
         });
 
-        ui.add_space(6.0);
+        ui.add_space(LEFT_SECTION_STACK_GAP);
 
         left_panel_collapsing(ui, "left_tab_ctrl_meter_mode", "METER MODE", |ui| {
             ui.add_space(4.0);
@@ -877,7 +888,7 @@ impl AudioMeterApp {
             mode_combo.response.on_hover_text(mode_combo_hover);
         });
 
-        ui.add_space(6.0);
+        ui.add_space(LEFT_SECTION_STACK_GAP);
 
         left_panel_collapsing(ui, "left_tab_ctrl_weight", "FREQUENCY WEIGHTING", |ui| {
             ui.add_space(4.0);
@@ -903,7 +914,7 @@ impl AudioMeterApp {
             self.weighting_atomic.store(w as u8, Ordering::Relaxed);
         });
 
-        ui.add_space(6.0);
+        ui.add_space(LEFT_SECTION_STACK_GAP);
 
         let clip_detail_short = format!(
             "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Use the Clips tab for the list, waveform, and folder.",
@@ -1016,7 +1027,7 @@ impl AudioMeterApp {
 
     fn left_controls(&mut self, ui: &mut egui::Ui) {
         Frame::new()
-            .fill(PANEL_BG)
+            .fill(LEFT_PANEL_BG)
             .inner_margin(egui::Margin::symmetric(10, 10))
             .show(ui, |ui| {
                 ui.set_width(LEFT_COLUMN_INNER_W);
@@ -1025,12 +1036,17 @@ impl AudioMeterApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
                         for (tab, label) in [
-                            (LeftPanelTab::Controls, "Controls"),
-                            (LeftPanelTab::Loudness, "Loudness"),
-                            (LeftPanelTab::Clips, "Clips"),
+                            (LeftPanelTab::Controls, "CONTROLS"),
+                            (LeftPanelTab::Loudness, "LOUDNESS"),
+                            (LeftPanelTab::Clips, "CLIPS"),
                         ] {
                             let selected = self.left_tab == tab;
-                            if ui.selectable_label(selected, label).clicked() {
+                            let text = RichText::new(label).size(12.0).color(if selected {
+                                TITLE_COL
+                            } else {
+                                LEFT_LABEL_SECONDARY
+                            });
+                            if ui.selectable_label(selected, text).clicked() {
                                 self.left_tab = tab;
                             }
                         }
@@ -1105,7 +1121,7 @@ impl AudioMeterApp {
                 if has_outputs {
                     ui.label(
                         RichText::new("OUTPUT  (speakers / loopback)")
-                            .color(Color32::from_gray(150))
+                            .color(LEFT_LABEL_SECONDARY)
                             .size(10.0)
                             .strong(),
                     );
@@ -1127,7 +1143,7 @@ impl AudioMeterApp {
                     }
                     ui.label(
                         RichText::new("INPUT  (microphones)")
-                            .color(Color32::from_gray(150))
+                            .color(LEFT_LABEL_SECONDARY)
                             .size(10.0)
                             .strong(),
                     );
@@ -1950,22 +1966,98 @@ fn lufs_box(
         });
 }
 
-/// Collapsible block in the left column (muted lavender caps, matches the old section headers).
+/// Thin chevron on the right of each accordion header (open = points up, closed = points down).
+fn left_panel_chevron_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
+    let open = openness > 0.5;
+    let c = response.rect.center();
+    let s = 3.5;
+    let stroke = Stroke::new(1.5, Color32::WHITE);
+    let p = ui.painter();
+    if open {
+        let tip = egui::pos2(c.x, c.y - s * 0.45);
+        let l = egui::pos2(c.x - s, c.y + s * 0.35);
+        let r = egui::pos2(c.x + s, c.y + s * 0.35);
+        p.line_segment([l, tip], stroke);
+        p.line_segment([tip, r], stroke);
+    } else {
+        let tip = egui::pos2(c.x, c.y + s * 0.45);
+        let l = egui::pos2(c.x - s, c.y - s * 0.35);
+        let r = egui::pos2(c.x + s, c.y - s * 0.35);
+        p.line_segment([l, tip], stroke);
+        p.line_segment([tip, r], stroke);
+    }
+}
+
+/// Collapsible block in the left column: bordered card, `#2A2A2A` title strip, chevron on the right.
 fn left_panel_collapsing<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
     title: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> egui::CollapsingResponse<R> {
-    CollapsingHeader::new(
-        RichText::new(title)
-            .color(Color32::from_rgb(0xb4, 0xb4, 0xcc))
-            .size(10.0)
-            .strong(),
-    )
-    .id_salt(id_salt)
-    .default_open(true)
-    .show(ui, add_contents)
+) {
+    let id = ui.make_persistent_id(id_salt);
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+
+    let card_w = ui.available_width().max(1.0);
+    let o = state.openness(ui.ctx());
+    let header_corners = if o > 0.05 {
+        CornerRadius {
+            nw: 4,
+            ne: 4,
+            sw: 0,
+            se: 0,
+        }
+    } else {
+        CornerRadius::same(4)
+    };
+
+    Frame::new()
+        .fill(LEFT_PANEL_BG)
+        .stroke(Stroke::new(1.0, LEFT_SECTION_BORDER))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::ZERO)
+        .show(ui, |ui| {
+            ui.set_width(card_w);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                Frame::new()
+                    .fill(LEFT_SECTION_HEADER_BG)
+                    .corner_radius(header_corners)
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                            ui.label(
+                                RichText::new(title.to_uppercase())
+                                    .color(TITLE_COL)
+                                    .size(12.5)
+                                    .strong(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(8.0);
+                                state.show_toggle_button(ui, left_panel_chevron_icon);
+                            });
+                        });
+                    });
+
+                let _ = state.show_body_unindented(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    Frame::new()
+                        .fill(LEFT_PANEL_BG)
+                        .corner_radius(CornerRadius {
+                            nw: 0,
+                            ne: 0,
+                            sw: 4,
+                            se: 4,
+                        })
+                        .inner_margin(Margin::symmetric(10, 10))
+                        .show(ui, |ui| add_contents(ui))
+                        .inner
+                });
+            });
+        });
 }
 
 fn draw_badge(ui: &mut egui::Ui, label: &str, bg: Color32) {
