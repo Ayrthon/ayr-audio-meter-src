@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, pos2, vec2,
+    Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui,
+    pos2,
 };
 use parking_lot::RwLock;
 
@@ -17,7 +18,7 @@ use crate::clip_capture::{
 use crate::dsp::INF_FLOOR_DB;
 use crate::meter::{ColorPalette, MeterMode, MeterScale, MeterScaleKind, MIN_DB, config_for};
 use crate::meter_widget::{
-    BAR_TOP_PAD, COL_BG, COL_BORDER, COL_REFERENCE, COL_TEXT_DIM, meter_bar_bottom_pad_for_strip,
+    BAR_TOP_PAD, COL_BG, COL_REFERENCE, COL_TEXT_DIM, meter_bar_bottom_pad_for_strip,
     paint_zone_backgrounds, zone_styles, zone_tops_db,
 };
 
@@ -29,6 +30,12 @@ const SMOOTH_WIN: usize = 1;
 const WINDOW_SECS: f32 = SAMPLES as f32 / SAMPLE_HZ;
 /// Red overlay on the history plot when clip capture triggers.
 const TRIGGER_FLASH_DURATION: Duration = Duration::from_millis(520);
+
+/// Same values as `spectrum_view::show_spectrum`: breathing room from the window edge + min width.
+const RIGHT_MARGIN: f32 = 16.0;
+const MIN_WIDTH: f32 = 360.0;
+/// `spectrum_view` “soft outer border” — ties the panel to the rest of the chrome.
+const PANEL_OUTER_STROKE: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
 
 const CHANNEL_COLORS: [Color32; 8] = [
     Color32::from_rgb(0x4c, 0xaf, 0x50),
@@ -159,11 +166,9 @@ pub fn show_history_graph(
     clip_status: &SharedClipStatus,
 ) -> Response {
     let graph = shared.read();
-    let available = ui.available_size();
-    let desired = vec2(
-        available.x.max(200.0),
-        available.y.max(crate::meter_widget::METER_MIN_HEIGHT),
-    );
+    let mut desired = ui.available_size();
+    desired.x = (desired.x - RIGHT_MARGIN).max(MIN_WIDTH);
+    desired.y = desired.y.max(crate::meter_widget::METER_MIN_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
 
@@ -353,12 +358,12 @@ pub fn show_history_graph(
         }
     }
 
-    // Plot border
+    // Soft outer border — same role as `spectrum_view` (single frame, not a nested card).
     painter.rect_stroke(
-        plot,
-        0.0,
-        Stroke::new(1.0, COL_BORDER),
-        egui::StrokeKind::Inside,
+        rect,
+        CornerRadius::same(6),
+        Stroke::new(1.0, PANEL_OUTER_STROKE),
+        StrokeKind::Inside,
     );
 
     response
