@@ -196,6 +196,9 @@ fn left_panel_section_content_w(column_w: f32) -> f32 {
     (column_w - 2.0 * LEFT_SECTION_CARD_BODY_PAD_X as f32).max(1.0)
 }
 
+/// LUFS 2×2 grid uses this fraction of the section body width so tiles sit inside the accordion comfortably.
+const LUFS_GRID_WIDTH_FRAC: f32 = 0.86;
+
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
 /// dynamic means mono / stereo / 5.1 / 7.1 all snap to the right size.
@@ -1202,7 +1205,9 @@ impl AudioMeterApp {
 
     fn loudness_panel(&mut self, ui: &mut egui::Ui) {
         let state = *self.loudness.read();
-        let row_w = ui.available_width().max(1.0);
+        let body_w = ui.available_width().max(1.0);
+        // Narrower than full body so the grid matches the collapsible tab width visually.
+        let grid_w = (body_w * LUFS_GRID_WIDTH_FRAC).max(1.0);
         // Each box's Frame adds 4 px inner_margin on left + right (8 px
         // total per box).  Two boxes share a 4 px gap.  The *content* width we
         // ask the inner ui to lock to must leave room for both, or the
@@ -1211,7 +1216,7 @@ impl AudioMeterApp {
         const LUFS_PAIR_GAP: f32 = 4.0;
         const LUFS_FRAME_PAD_X: f32 = 4.0;
         let outer_h = 2.0 * LUFS_FRAME_PAD_X;
-        let cell_w = (((row_w - LUFS_PAIR_GAP) * 0.5) - outer_h).floor().max(52.0);
+        let cell_w = (((grid_w - LUFS_PAIR_GAP) * 0.5) - outer_h).floor().max(52.0);
         let pair_outer_w = 2.0 * (cell_w + outer_h) + LUFS_PAIR_GAP;
 
         let draw_meters = |ui: &mut egui::Ui| {
@@ -1258,11 +1263,13 @@ impl AudioMeterApp {
             });
         };
 
-        ui.allocate_ui_with_layout(
-            egui::vec2(pair_outer_w, 0.0),
-            Layout::top_down(Align::Min),
-            draw_meters,
-        );
+        ui.vertical_centered(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(pair_outer_w, 0.0),
+                Layout::top_down(Align::Min),
+                draw_meters,
+            );
+        });
 
         ui.add_space(4.0);
 
