@@ -9,7 +9,7 @@ use anyhow::Result;
 use eframe::egui;
 use egui::{
     Align, CollapsingHeader, Color32, CornerRadius, CursorIcon, Frame, Label, Layout, Margin,
-    OpenUrl, RichText, ScrollArea, Sense, Stroke, ViewportBuilder, ViewportId,
+    OpenUrl, RichText, ScrollArea, Sense, Stroke,
 };
 use parking_lot::Mutex;
 
@@ -57,6 +57,14 @@ pub enum GraphView {
     Spectrum,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LeftPanelTab {
+    #[default]
+    Controls,
+    Loudness,
+    Clips,
+}
+
 pub struct AudioMeterApp {
     devices: Vec<DeviceInfo>,
     selected_device: Option<usize>,
@@ -96,10 +104,8 @@ pub struct AudioMeterApp {
     clip_playlist: ClipPlaylistState,
     user_settings: SharedUserSettings,
     user_settings_path: Option<PathBuf>,
-    /// Full clip list + waveform live in a separate viewport (left column stays compact).
-    clips_library_open: bool,
-    /// First-frame position for the clips library native window (set when opening from the button).
-    clips_library_spawn_pos: Option<egui::Pos2>,
+    /// Which section of the left column is visible (Controls / Loudness / Clips).
+    left_tab: LeftPanelTab,
     /// Per-channel levels fed to the history ring (same as each meter **bar fill**).
     history_trace: SharedHistoryTrace,
     levels: SharedLevels,
@@ -136,16 +142,15 @@ const WINDOW_W_WITH_GRAPH: f32 = 1140.0;
 /// always sees a full-width graph when it's on.
 const WINDOW_W_MIN_WITH_GRAPH: f32 = 1140.0;
 
-/// Default inner size of the clips library viewport (`ViewportBuilder::with_inner_size`).
-/// Also used to place that window centered over the main app frame when it opens.
-const CLIPS_LIBRARY_VIEW_INNER: egui::Vec2 = egui::vec2(480.0, 760.0);
+/// Fixed outer width of the left column (matches `left_controls` min/max).
+const LEFT_COLUMN_OUTER_W: f32 = 340.0;
 
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
 /// dynamic means mono / stereo / 5.1 / 7.1 all snap to the right size.
 fn window_w_without_graph(channels: usize) -> f32 {
-    // Left panel: inner max_width (~304) + Frame inner_margin (~10 per side).
-    const LEFT_PANEL: f32 = 324.0;
+    // Left column outer width (see `LEFT_COLUMN_OUTER_W` + frame margins in layout).
+    const LEFT_PANEL: f32 = LEFT_COLUMN_OUTER_W;
     // 6 px gap + vertical separator (~2 px + item_spacing) + 6 px gap.
     const GUTTERS: f32 = 20.0;
     // CentralPanel / window-frame padding on each side.
@@ -216,8 +221,7 @@ impl AudioMeterApp {
             clip_playlist: ClipPlaylistState::new(user_settings.clone()),
             user_settings,
             user_settings_path: settings_path,
-            clips_library_open: false,
-            clips_library_spawn_pos: None,
+            left_tab: LeftPanelTab::default(),
             history_trace: make_shared_history_trace(),
             levels: make_shared_levels(),
             loudness: make_shared_loudness(),
@@ -616,8 +620,6 @@ impl eframe::App for AudioMeterApp {
             });
         });
 
-        self.show_clips_library_window(&ctx);
-
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
@@ -632,10 +634,8 @@ impl AudioMeterApp {
         }
     }
 
-    fn show_clips_library_window(&mut self, ctx: &egui::Context) {
-        if !self.clips_library_open {
-            return;
-        }
+    /// Full clips library: folder chooser, “How capture works”, waveform list.
+    fn clips_library_panel(&mut self, ui: &mut egui::Ui) {
         let clip_detail = format!(
             "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
              Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
@@ -645,120 +645,370 @@ impl AudioMeterApp {
         );
         let total_clips = self.clip_status.lock().total_clips_saved;
 
-        let mut builder = ViewportBuilder::default()
-            .with_title("Clips library")
-            .with_inner_size(CLIPS_LIBRARY_VIEW_INNER)
-            .with_min_inner_size(egui::vec2(380.0, 560.0))
-            .with_resizable(true);
-        if let Some(p) = self.clips_library_spawn_pos.take() {
-            builder = builder.with_position(p);
-        }
+        left_panel_collapsing(ui, "clips_tab_how_capture", "HOW CAPTURE WORKS", |ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(clip_detail.as_str())
+                    .size(9.5)
+                    .color(Color32::from_gray(125)),
+            );
+        });
+        ui.add_space(6.0);
 
-        let clips_vp = ViewportId::from_hash_of("audio_meter_clips_library");
-        ctx.show_viewport_immediate(clips_vp, builder, |ui, _class| {
-            if ui.ctx().input(|i| i.viewport().close_requested()) {
-                self.clips_library_open = false;
+        left_panel_collapsing(ui, "clips_tab_save_folder", "SAVE FOLDER", |ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Current location:")
+                    .color(Color32::from_gray(115))
+                    .size(9.5),
+            );
+            ui.add_space(5.0);
+            let clips_path_label = clips_path_display(&*self.user_settings.lock());
+            Frame::new()
+                .fill(Color32::from_rgb(0x18, 0x18, 0x22))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x32, 0x34, 0x42)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 10))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(clips_path_label)
+                            .size(9.5)
+                            .color(Color32::from_gray(210))
+                            .family(egui::FontFamily::Monospace),
+                    );
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                if ui
+                    .add_sized(
+                        [140.0, 28.0],
+                        egui::Button::new(RichText::new("Choose folder…").size(11.5)),
+                    )
+                    .clicked()
+                {
+                    let start = resolve_clips_dir(&*self.user_settings.lock());
+                    let mut dlg = rfd::FileDialog::new();
+                    if let Some(ref p) = start {
+                        dlg = dlg.set_directory(p);
+                    }
+                    if let Some(folder) = dlg.pick_folder() {
+                        self.user_settings.lock().clips_save_dir = Some(folder);
+                        self.persist_user_settings();
+                        self.clip_playlist.reload_clip_list();
+                    }
+                }
+                let custom = self
+                    .user_settings
+                    .lock()
+                    .clips_save_dir
+                    .is_some();
+                if ui
+                    .add_enabled(
+                        custom,
+                        egui::Button::new(RichText::new("Use default folder").size(11.5)),
+                    )
+                    .clicked()
+                {
+                    self.user_settings.lock().clips_save_dir = None;
+                    self.persist_user_settings();
+                    self.clip_playlist.reload_clip_list();
+                }
+            });
+            ui.add_space(10.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new(RichText::new("📂  Open clips folder").size(12.0)),
+                )
+                .clicked()
+            {
+                if let Some(p) = resolve_clips_dir(&*self.user_settings.lock()) {
+                    #[cfg(windows)]
+                    let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(&p).spawn();
+                    #[cfg(all(not(windows), not(target_os = "macos")))]
+                    let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Peaks at or above the threshold start a capture.")
+                    .color(Color32::from_gray(120))
+                    .size(9.5),
+            );
+        });
+        ui.add_space(6.0);
+
+        left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", |ui| {
+            ui.add_space(4.0);
+            let ctx_clips = ui.ctx().clone();
+            self.clip_playlist.show(ui, &ctx_clips, total_clips);
+        });
+    }
+
+    fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, now: f64, width: f32) {
+        left_panel_collapsing(ui, "left_tab_ctrl_audio", "AUDIO SOURCE", |ui| {
+            ui.add_space(4.0);
+            self.device_dropdown(ui, "device_combo", width);
+
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let (badge, hint, badge_bg) = match self.active_kind() {
+                    SourceKind::Input => (
+                        "INPUT",
+                        "microphone / line-in",
+                        Color32::from_rgb(0x26, 0x49, 0x78),
+                    ),
+                    SourceKind::Loopback => (
+                        "OUTPUT",
+                        "speakers (loopback)",
+                        Color32::from_rgb(0x2a, 0x56, 0x3c),
+                    ),
+                };
+                draw_badge(ui, badge, badge_bg);
+                ui.label(
+                    RichText::new(hint)
+                        .color(Color32::from_gray(150))
+                        .size(10.5),
+                );
+            });
+
+            ui.add_space(8.0);
+
+            let playing = self.engine.is_some();
+            let btn_size = egui::vec2(width, 36.0);
+            if playing {
+                if breathing_stop_button(ui, now, btn_size).clicked() {
+                    self.stop_stream();
+                }
+            } else if start_meter_button(ui, btn_size).clicked() {
+                self.start_or_restart();
             }
 
+            ui.add_space(5.0);
+            if ui
+                .add_sized([width, 24.0], egui::Button::new("↻  Refresh devices"))
+                .clicked()
+            {
+                self.refresh_devices();
+            }
+        });
+
+        ui.add_space(6.0);
+
+        let clip_detail_short = format!(
+            "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Use the Clips tab for the list, waveform, and folder.",
+            crate::clip_capture::PRE_ROLL_SECS,
+            crate::clip_capture::POST_ROLL_SECS
+        );
+
+        left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", |ui| {
+            ui.add_space(4.0);
             Frame::new()
-                .inner_margin(Margin::symmetric(16, 14))
+                .fill(Color32::from_rgb(0x11, 0x12, 0x18))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x34, 0x36, 0x44)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                    CollapsingHeader::new("How capture works").show(ui, |ui| {
-                            ui.label(
-                                RichText::new(clip_detail.as_str())
-                                    .size(9.5)
-                                    .color(Color32::from_gray(125)),
-                            );
-                        });
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new("Save folder:")
-                            .color(Color32::from_gray(115))
-                            .size(9.5),
+                    ui.set_width(width);
+                    let rec_on = self.clip_settings.enabled();
+                    let arm_h = 32.0_f32;
+                    let arm_resp = arm_record_trigger_button(
+                        ui,
+                        now,
+                        rec_on,
+                        egui::vec2(width, arm_h),
                     );
-                    ui.add_space(5.0);
-                    let clips_path_label =
-                        clips_path_display(&*self.user_settings.lock());
-                    Frame::new()
-                        .fill(Color32::from_rgb(0x18, 0x18, 0x22))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x32, 0x34, 0x42)))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(Margin::symmetric(10, 10))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(clips_path_label)
-                                    .size(9.5)
-                                    .color(Color32::from_gray(210))
-                                    .family(egui::FontFamily::Monospace),
-                            );
-                        });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-                        if ui
-                            .add_sized(
-                                [140.0, 28.0],
-                                egui::Button::new(RichText::new("Choose folder…").size(11.5)),
-                            )
-                            .clicked()
-                        {
-                            let start = resolve_clips_dir(&*self.user_settings.lock());
-                            let mut dlg = rfd::FileDialog::new();
-                            if let Some(ref p) = start {
-                                dlg = dlg.set_directory(p);
-                            }
-                            if let Some(folder) = dlg.pick_folder() {
-                                self.user_settings.lock().clips_save_dir = Some(folder);
-                                self.persist_user_settings();
-                                self.clip_playlist.reload_clip_list();
-                            }
-                        }
-                        let custom = self
-                            .user_settings
-                            .lock()
-                            .clips_save_dir
-                            .is_some();
-                        if ui
-                            .add_enabled(
-                                custom,
-                                egui::Button::new(RichText::new("Use default folder").size(11.5)),
-                            )
-                            .clicked()
-                        {
-                            self.user_settings.lock().clips_save_dir = None;
-                            self.persist_user_settings();
-                            self.clip_playlist.reload_clip_list();
-                        }
-                    });
-                    ui.add_space(10.0);
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 34.0],
-                            egui::Button::new(RichText::new("📂  Open clips folder").size(12.0)),
-                        )
-                        .clicked()
-                    {
-                        if let Some(p) = resolve_clips_dir(&*self.user_settings.lock()) {
-                            #[cfg(windows)]
-                            let _ = std::process::Command::new("explorer").arg(&p).spawn();
-                            #[cfg(target_os = "macos")]
-                            let _ = std::process::Command::new("open").arg(&p).spawn();
-                            #[cfg(all(not(windows), not(target_os = "macos")))]
-                            let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                    if arm_resp.clicked() {
+                        let new_on = !rec_on;
+                        self.clip_settings.set_enabled(new_on);
+                        if new_on {
+                            self.clip_session_baseline =
+                                self.clip_status.lock().total_clips_saved;
                         }
                     }
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Peaks at or above the threshold start a capture.")
-                            .color(Color32::from_gray(120))
-                            .size(9.5),
+                    arm_resp.on_hover_text(&clip_detail_short);
+
+                    ui.add_space(5.0);
+
+                    let mut thr = self.clip_settings.threshold_db();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Threshold")
+                                .size(11.5)
+                                .color(TITLE_COL)
+                                .strong(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{thr:.1} dBFS"))
+                                    .size(12.5)
+                                    .color(ACCENT)
+                                    .strong(),
+                            );
+                        });
+                    });
+                    ui.add_space(3.0);
+
+                    let slider_w = ui.available_width();
+                    let prev_slider_w = ui.style().spacing.slider_width;
+                    ui.style_mut().spacing.slider_width = slider_w;
+                    let rail_h = 18.0_f32;
+                    let slider_resp = ui.add_sized(
+                        egui::vec2(slider_w, rail_h),
+                        egui::Slider::new(
+                            &mut thr,
+                            crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
+                                ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
+                        )
+                            .fixed_decimals(1)
+                            .show_value(false)
+                            .trailing_fill(true),
                     );
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    let ctx_clips = ui.ctx().clone();
-                    self.clip_playlist.show(ui, &ctx_clips, total_clips);
+                    ui.style_mut().spacing.slider_width = prev_slider_w;
+                    if slider_resp.changed() {
+                        self.clip_settings.set_threshold_db(thr);
+                    }
+
+                    ui.add_space(6.0);
+                    let lib = ui
+                        .add_sized(
+                            egui::vec2(width, 26.0),
+                            egui::Button::new(if self.left_tab == LeftPanelTab::Clips {
+                                "Clips library (open)…"
+                            } else {
+                                "Clips library…"
+                            }),
+                        )
+                        .on_hover_text(
+                            "List, preview, folder, delete — Space plays/pauses the waveform",
+                        );
+                    if lib.clicked() {
+                        self.left_tab = LeftPanelTab::Clips;
+                    }
+
+                    {
+                        let st = self.clip_status.lock();
+                        let armed_now = self.clip_settings.enabled();
+                        if armed_now {
+                            let n = st
+                                .total_clips_saved
+                                .saturating_sub(self.clip_session_baseline);
+                            let (counter_text, counter_color) = if n == 0 {
+                                (
+                                    "Clips saved this arm: 0".into(),
+                                    Color32::from_gray(130),
+                                )
+                            } else {
+                                (format!("Clips saved this arm: {n}"), ACCENT)
+                            };
+                            ui.add_space(5.0);
+                            ui.label(
+                                RichText::new(counter_text)
+                                    .size(10.5)
+                                    .strong()
+                                    .color(counter_color),
+                            );
+                        }
+                        if let Some(ref e) = st.last_error {
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(format!("Error: {e}"))
+                                    .color(Color32::from_rgb(200, 100, 100))
+                                    .size(9.5),
+                            );
+                        }
+                    }
                 });
+        });
+
+        ui.add_space(6.0);
+
+        left_panel_collapsing(ui, "left_tab_ctrl_right_panel", "RIGHT PANEL", |ui| {
+            ui.add_space(4.0);
+            graph_panel_checkboxes(ui, &mut self.panel);
+        });
+
+        ui.add_space(6.0);
+
+        left_panel_collapsing(ui, "left_tab_ctrl_meter_mode", "METER MODE", |ui| {
+            ui.add_space(4.0);
+            let cfg = config_for(self.mode);
+            let (mid_name, high_name) = match cfg.palette {
+                crate::meter::ColorPalette::ProTools => ("Green", "Orange"),
+                crate::meter::ColorPalette::Obs => ("Green", "Yellow"),
+                crate::meter::ColorPalette::Standard => ("Green", "Yellow"),
+            };
+            let mode_zone_hint = format!(
+                "Reference line: {:+.0} dBFS\n\
+                 Color zones: {} from {:+.0} dBFS, {} from {:+.0} dBFS (up to 0 dBFS).",
+                cfg.reference_db,
+                mid_name,
+                cfg.zone_mid_top_db,
+                high_name,
+                cfg.zone_high_top_db,
+            );
+            let mode_combo_hover = format!(
+                "{}\n\n{}",
+                self.mode.display_name(),
+                mode_zone_hint
+            );
+            let mode_combo = egui::ComboBox::from_id_salt("mode_combo")
+                .width(width)
+                .selected_text(self.mode.name_outside_paren())
+                .show_ui(ui, |ui| {
+                    for mode in MeterMode::ALL {
+                        if ui
+                            .selectable_label(self.mode == mode, mode.display_name())
+                            .clicked()
+                        {
+                            self.mode = mode;
+                            self.clip_meter_mode
+                                .store(mode.to_discriminant(), Ordering::Relaxed);
+                            self.meter_true_peak.store(
+                                config_for(mode).true_peak,
+                                Ordering::Relaxed,
+                            );
+                            *self.clip_trigger_states.lock() =
+                                std::array::from_fn(|_| MeterState::default());
+                            for s in &mut self.meter_states {
+                                s.clear();
+                            }
+                            // Leave `self.history` alone — the
+                            // user wants the scrolling graph to
+                            // carry over when switching modes.
+                        }
+                    }
+                });
+            mode_combo.response.on_hover_text(mode_combo_hover);
+        });
+
+        ui.add_space(6.0);
+
+        left_panel_collapsing(ui, "left_tab_ctrl_weight", "FREQUENCY WEIGHTING", |ui| {
+            ui.add_space(4.0);
+            let mut w =
+                FreqWeighting::from_u8(self.weighting_atomic.load(Ordering::Relaxed));
+            let w_combo = egui::ComboBox::from_id_salt("freq_weight_combo")
+                .width(width)
+                .selected_text(w.label())
+                .show_ui(ui, |ui| {
+                    for ww in FreqWeighting::ALL {
+                        if ui
+                            .selectable_label(w == ww, ww.list_entry())
+                            .clicked()
+                        {
+                            w = ww;
+                        }
+                    }
+                });
+            w_combo.response.on_hover_text(
+                "Applies to peak, RMS, and level history only.\n\
+                 LUFS and the spectrum use full-band BS.1770 K-weighting.",
+            );
+            self.weighting_atomic.store(w as u8, Ordering::Relaxed);
         });
     }
 
@@ -767,306 +1017,59 @@ impl AudioMeterApp {
             .fill(PANEL_BG)
             .inner_margin(egui::Margin::symmetric(10, 10))
             .show(ui, |ui| {
-                ui.set_min_width(280.0);
-                ui.set_max_width(304.0);
-                let avail_h = ui.available_height();
-                ScrollArea::vertical()
-                    .id_salt("left_controls_scroll")
-                    .max_height(avail_h)
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                    ui.vertical(|ui| {
+                ui.set_min_width(LEFT_COLUMN_OUTER_W);
+                ui.set_max_width(LEFT_COLUMN_OUTER_W);
+                ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-                    // Extra gutter on the right so the floating scrollbar
-                    // never overlaps combo boxes / checkboxes.
-                    let width = (ui.available_width() - 20.0).clamp(228.0, 270.0);
-
-                    // ── AUDIO SOURCE ───────────────────────────────────────
-                    section_header(ui, "AUDIO SOURCE");
-                    ui.add_space(3.0);
-                    self.device_dropdown(ui, "device_combo", width);
-
-                    ui.add_space(3.0);
                     ui.horizontal(|ui| {
-                        let (badge, hint, badge_bg) = match self.active_kind() {
-                            SourceKind::Input => (
-                                "INPUT",
-                                "microphone / line-in",
-                                Color32::from_rgb(0x26, 0x49, 0x78),
-                            ),
-                            SourceKind::Loopback => (
-                                "OUTPUT",
-                                "speakers (loopback)",
-                                Color32::from_rgb(0x2a, 0x56, 0x3c),
-                            ),
-                        };
-                        draw_badge(ui, badge, badge_bg);
-                        ui.label(
-                            RichText::new(hint)
-                                .color(Color32::from_gray(150))
-                                .size(10.5),
-                        );
-                    });
-
-                    ui.add_space(8.0);
-
-                    // ── PRIMARY START/STOP ────────────────────────────────
-                    let playing = self.engine.is_some();
-                    let btn_size = egui::vec2(width, 36.0);
-                    if playing {
-                        if breathing_stop_button(ui, now, btn_size).clicked() {
-                            self.stop_stream();
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                        for (tab, label) in [
+                            (LeftPanelTab::Controls, "Controls"),
+                            (LeftPanelTab::Loudness, "Loudness"),
+                            (LeftPanelTab::Clips, "Clips"),
+                        ] {
+                            let selected = self.left_tab == tab;
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.left_tab = tab;
+                            }
                         }
-                    } else if start_meter_button(ui, btn_size).clicked() {
-                        self.start_or_restart();
-                    }
-
-                    ui.add_space(5.0);
-                    if ui
-                        .add_sized([width, 24.0], egui::Button::new("↻  Refresh devices"))
-                        .clicked()
-                    {
-                        self.refresh_devices();
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(5.0);
-
-                    // ── CLIP CAPTURE (compact — full list + wave in Clips library window) ──
-                    section_header(ui, "CLIP CAPTURE");
-                    ui.add_space(3.0);
-
-                    let clip_detail_short = format!(
-                        "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Open “Clips library” for the list, waveform, and folder.",
-                        crate::clip_capture::PRE_ROLL_SECS,
-                        crate::clip_capture::POST_ROLL_SECS
-                    );
-
-                    Frame::new()
-                        .fill(Color32::from_rgb(0x11, 0x12, 0x18))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x34, 0x36, 0x44)))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(width);
-                            let rec_on = self.clip_settings.enabled();
-                            let arm_h = 32.0_f32;
-                            let arm_resp = arm_record_trigger_button(
-                                ui,
-                                now,
-                                rec_on,
-                                egui::vec2(width, arm_h),
-                            );
-                            if arm_resp.clicked() {
-                                let new_on = !rec_on;
-                                self.clip_settings.set_enabled(new_on);
-                                if new_on {
-                                    self.clip_session_baseline =
-                                        self.clip_status.lock().total_clips_saved;
-                                }
-                            }
-                            arm_resp.on_hover_text(&clip_detail_short);
-
-                            ui.add_space(5.0);
-
-                            let mut thr = self.clip_settings.threshold_db();
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Threshold")
-                                        .size(11.5)
-                                        .color(TITLE_COL)
-                                        .strong(),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.label(
-                                        RichText::new(format!("{thr:.1} dBFS"))
-                                            .size(12.5)
-                                            .color(ACCENT)
-                                            .strong(),
-                                    );
-                                });
-                            });
-                            ui.add_space(3.0);
-
-                            let slider_w = ui.available_width();
-                            let prev_slider_w = ui.style().spacing.slider_width;
-                            ui.style_mut().spacing.slider_width = slider_w;
-                            let rail_h = 18.0_f32;
-                            let slider_resp = ui.add_sized(
-                                egui::vec2(slider_w, rail_h),
-                                egui::Slider::new(
-                                    &mut thr,
-                                    crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
-                                        ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
-                                )
-                                    .fixed_decimals(1)
-                                    .show_value(false)
-                                    .trailing_fill(true),
-                            );
-                            ui.style_mut().spacing.slider_width = prev_slider_w;
-                            if slider_resp.changed() {
-                                self.clip_settings.set_threshold_db(thr);
-                            }
-
-                            ui.add_space(6.0);
-                            let lib = ui
-                                .add_sized(
-                                    egui::vec2(width, 26.0),
-                                    egui::Button::new(if self.clips_library_open {
-                                        "Clips library (open)…"
-                                    } else {
-                                        "Clips library…"
-                                    }),
-                                )
-                                .on_hover_text(
-                                    "List, preview, folder, delete — Space plays/pauses the waveform",
-                                );
-                            if lib.clicked() {
-                                self.clips_library_spawn_pos = ui.ctx().input(|i| {
-                                    i.viewport().outer_rect.map(|r| {
-                                        let c = r.center();
-                                        egui::pos2(
-                                            c.x - CLIPS_LIBRARY_VIEW_INNER.x * 0.5,
-                                            c.y - CLIPS_LIBRARY_VIEW_INNER.y * 0.5,
-                                        )
-                                    })
-                                });
-                                self.clips_library_open = true;
-                            }
-
-                            {
-                                let st = self.clip_status.lock();
-                                let armed_now = self.clip_settings.enabled();
-                                if armed_now {
-                                    let n = st
-                                        .total_clips_saved
-                                        .saturating_sub(self.clip_session_baseline);
-                                    let (counter_text, counter_color) = if n == 0 {
-                                        (
-                                            "Clips saved this arm: 0".into(),
-                                            Color32::from_gray(130),
-                                        )
-                                    } else {
-                                        (format!("Clips saved this arm: {n}"), ACCENT)
-                                    };
-                                    ui.add_space(5.0);
-                                    ui.label(
-                                        RichText::new(counter_text)
-                                            .size(10.5)
-                                            .strong()
-                                            .color(counter_color),
-                                    );
-                                }
-                                if let Some(ref e) = st.last_error {
-                                    ui.add_space(3.0);
-                                    ui.label(
-                                        RichText::new(format!("Error: {e}"))
-                                            .color(Color32::from_rgb(200, 100, 100))
-                                            .size(9.5),
-                                    );
-                                }
-                            }
-                        });
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(5.0);
-
-                    section_header(ui, "RIGHT PANEL");
-                    ui.add_space(3.0);
-                    graph_panel_checkboxes(ui, &mut self.panel);
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // ── METER MODE ─────────────────────────────────────────
-                    section_header(ui, "METER MODE");
-                    ui.add_space(3.0);
-                    let cfg = config_for(self.mode);
-                    let (mid_name, high_name) = match cfg.palette {
-                        crate::meter::ColorPalette::ProTools => ("Green", "Orange"),
-                        crate::meter::ColorPalette::Obs => ("Green", "Yellow"),
-                        crate::meter::ColorPalette::Standard => ("Green", "Yellow"),
-                    };
-                    let mode_zone_hint = format!(
-                        "Reference line: {:+.0} dBFS\n\
-                         Color zones: {} from {:+.0} dBFS, {} from {:+.0} dBFS (up to 0 dBFS).",
-                        cfg.reference_db,
-                        mid_name,
-                        cfg.zone_mid_top_db,
-                        high_name,
-                        cfg.zone_high_top_db,
-                    );
-                    let mode_combo_hover = format!(
-                        "{}\n\n{}",
-                        self.mode.display_name(),
-                        mode_zone_hint
-                    );
-                    let mode_combo = egui::ComboBox::from_id_salt("mode_combo")
-                        .width(width)
-                        .selected_text(self.mode.name_outside_paren())
-                        .show_ui(ui, |ui| {
-                            for mode in MeterMode::ALL {
-                                if ui
-                                    .selectable_label(self.mode == mode, mode.display_name())
-                                    .clicked()
-                                {
-                                    self.mode = mode;
-                                    self.clip_meter_mode
-                                        .store(mode.to_discriminant(), Ordering::Relaxed);
-                                    self.meter_true_peak.store(
-                                        config_for(mode).true_peak,
-                                        Ordering::Relaxed,
-                                    );
-                                    *self.clip_trigger_states.lock() =
-                                        std::array::from_fn(|_| MeterState::default());
-                                    for s in &mut self.meter_states {
-                                        s.clear();
-                                    }
-                                    // Leave `self.history` alone — the
-                                    // user wants the scrolling graph to
-                                    // carry over when switching modes.
-                                }
-                            }
-                        });
-                    mode_combo.response.on_hover_text(mode_combo_hover);
-
-                    ui.add_space(5.0);
-                    section_header(ui, "FREQUENCY WEIGHTING");
-                    ui.add_space(3.0);
-                    let mut w = FreqWeighting::from_u8(
-                        self.weighting_atomic.load(Ordering::Relaxed),
-                    );
-                    let w_combo = egui::ComboBox::from_id_salt("freq_weight_combo")
-                        .width(width)
-                        .selected_text(w.label())
-                        .show_ui(ui, |ui| {
-                            for ww in FreqWeighting::ALL {
-                                if ui
-                                    .selectable_label(w == ww, ww.list_entry())
-                                    .clicked()
-                                {
-                                    w = ww;
-                                }
-                            }
-                        });
-                    w_combo.response.on_hover_text(
-                        "Applies to peak, RMS, and level history only.\n\
-                         LUFS and the spectrum use full-band BS.1770 K-weighting.",
-                    );
-                    self.weighting_atomic.store(w as u8, Ordering::Relaxed);
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // ── LOUDNESS (EBU R128 / BS.1770) ──────────────────────
-                    section_header(ui, "LOUDNESS  (EBU R128)");
-                    ui.add_space(3.0);
-                    self.loudness_panel(ui, width);
                     });
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    let avail_h = ui.available_height();
+                    ScrollArea::vertical()
+                        .id_salt("left_controls_scroll")
+                        .max_height(avail_h)
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                // Extra gutter on the right so the floating scrollbar
+                                // never overlaps combo boxes / checkboxes.
+                                let width =
+                                    (ui.available_width() - 20.0).clamp(228.0, 310.0);
+                                match self.left_tab {
+                                    LeftPanelTab::Controls => {
+                                        self.left_controls_controls_tab(ui, now, width);
+                                    }
+                                    LeftPanelTab::Loudness => {
+                                        left_panel_collapsing(
+                                            ui,
+                                            "left_tab_loudness_r128",
+                                            "LOUDNESS  (EBU R128)",
+                                            |ui| {
+                                                ui.add_space(4.0);
+                                                self.loudness_panel(ui, width);
+                                            },
+                                        );
+                                    }
+                                    LeftPanelTab::Clips => {
+                                        self.clips_library_panel(ui);
+                                    }
+                                }
+                            });
+                        });
                 });
             });
     }
@@ -1438,13 +1441,22 @@ fn lufs_box(
         });
 }
 
-fn section_header(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        RichText::new(text)
+/// Collapsible block in the left column (muted lavender caps, matches the old section headers).
+fn left_panel_collapsing<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::CollapsingResponse<R> {
+    CollapsingHeader::new(
+        RichText::new(title)
             .color(Color32::from_rgb(0xb4, 0xb4, 0xcc))
             .size(10.0)
             .strong(),
-    );
+    )
+    .id_salt(id_salt)
+    .default_open(true)
+    .show(ui, add_contents)
 }
 
 /// Right-hand graph / spectrum panel — one of three mutually exclusive views.
