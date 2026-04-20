@@ -49,6 +49,8 @@ const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
 const AYRTHON_URL: &str = "https://ayrthon.com";
 /// Inset from the main window’s right edge (toolbar, graphs, title credits — same visual weight).
 const RIGHT_PANEL_GUTTER: f32 = 32.0;
+/// Vertical gap between the transport toolbar and the history/spectrum graph (tighter than `RIGHT_PANEL_GUTTER`).
+const RIGHT_PANEL_TOOLBAR_TO_GRAPH_GAP: f32 = 8.0;
 
 /// Optional CI/build stamp: `AUDIO_METER_BUILD=123 cargo build` — otherwise crate version.
 #[inline]
@@ -152,8 +154,14 @@ const WINDOW_W_WITH_GRAPH: f32 = 1140.0;
 /// always sees a full-width graph when it's on.
 const WINDOW_W_MIN_WITH_GRAPH: f32 = 1140.0;
 
-/// Fixed outer width of the left column (matches `left_controls` min/max).
+/// Fixed outer width of the left column (reserved in the main horizontal layout).
 const LEFT_COLUMN_OUTER_W: f32 = 340.0;
+/// Inner width inside the left column’s padded frame (`inner_margin` 10 px each side).
+const LEFT_COLUMN_INNER_W: f32 = LEFT_COLUMN_OUTER_W - 20.0;
+/// Reserve space for the vertical scrollbar so combo/slider width does not depend on tab content.
+const LEFT_COLUMN_SCROLL_GUTTER: f32 = 20.0;
+/// Fixed width for Controls / Loudness / Clips content (must not use `available_width()` — it changes per tab).
+const LEFT_COLUMN_CONTROL_W: f32 = (LEFT_COLUMN_INNER_W - LEFT_COLUMN_SCROLL_GUTTER).clamp(228.0, 310.0);
 
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
@@ -622,7 +630,16 @@ impl eframe::App for AudioMeterApp {
             ui.separator();
 
             ui.horizontal_top(|ui| {
-                self.left_controls(ui);
+                // Fixed width so Controls / Loudness / Clips never change the column width.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(LEFT_COLUMN_OUTER_W, ui.available_height()),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_width(LEFT_COLUMN_OUTER_W);
+                        ui.set_max_width(LEFT_COLUMN_OUTER_W);
+                        self.left_controls(ui);
+                    },
+                );
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -655,7 +672,8 @@ impl AudioMeterApp {
     }
 
     /// Full clips library: folder chooser, “How capture works”, waveform list.
-    fn clips_library_panel(&mut self, ui: &mut egui::Ui) {
+    fn clips_library_panel(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.set_max_width(width);
         let clip_detail = format!(
             "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
              Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
@@ -1001,8 +1019,7 @@ impl AudioMeterApp {
             .fill(PANEL_BG)
             .inner_margin(egui::Margin::symmetric(10, 10))
             .show(ui, |ui| {
-                ui.set_min_width(LEFT_COLUMN_OUTER_W);
-                ui.set_max_width(LEFT_COLUMN_OUTER_W);
+                ui.set_width(LEFT_COLUMN_INNER_W);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
                     ui.horizontal(|ui| {
@@ -1029,10 +1046,8 @@ impl AudioMeterApp {
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-                                // Extra gutter on the right so the floating scrollbar
-                                // never overlaps combo boxes / checkboxes.
-                                let width =
-                                    (ui.available_width() - 20.0).clamp(228.0, 310.0);
+                                // Fixed width — do not derive from `available_width()` (differs by tab / scrollbar).
+                                let width = LEFT_COLUMN_CONTROL_W;
                                 match self.left_tab {
                                     LeftPanelTab::Controls => {
                                         self.left_controls_controls_tab(ui, width);
@@ -1049,7 +1064,7 @@ impl AudioMeterApp {
                                         );
                                     }
                                     LeftPanelTab::Clips => {
-                                        self.clips_library_panel(ui);
+                                        self.clips_library_panel(ui, width);
                                     }
                                 }
                             });
@@ -1266,7 +1281,7 @@ impl AudioMeterApp {
                                 ui.set_min_height(row_h);
                                 ui.set_min_width(ui.available_width());
                                 self.right_panel_toolbar(ui);
-                                ui.add_space(RIGHT_PANEL_GUTTER);
+                                ui.add_space(RIGHT_PANEL_TOOLBAR_TO_GRAPH_GAP);
 
                                 let rest_h = ui.available_height().max(1.0);
                                 match self.panel {
@@ -1367,14 +1382,12 @@ impl AudioMeterApp {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
                             if ui
                                 .selectable_label(self.panel == GraphView::History, "History")
-                                .on_hover_text("Level history graph")
                                 .clicked()
                             {
                                 self.panel = GraphView::History;
                             }
                             if ui
                                 .selectable_label(self.panel == GraphView::Spectrum, "Spectrum")
-                                .on_hover_text("Spectrum analyzer")
                                 .clicked()
                             {
                                 self.panel = GraphView::Spectrum;
@@ -1397,7 +1410,6 @@ impl AudioMeterApp {
 
                         let play = ui.add_enabled_ui(!playing, |ui| {
                             ui.add_sized(ICON_BTN, ToolbarTransportIcon::Play)
-                                .on_hover_text("Start metering")
                         });
                         if play.inner.clicked() {
                             if let Err(e) = self.start_stream() {
@@ -1412,16 +1424,13 @@ impl AudioMeterApp {
                                     meter_active: playing,
                                 },
                             )
-                            .on_hover_text("Stop metering")
                         });
                         if stop.inner.clicked() {
                             self.stop_stream();
                         }
 
                         let rec_on = self.clip_settings.enabled();
-                        let arm = ui
-                            .add_sized(ARM_RECORD, RecordArmButton { armed: rec_on })
-                            .on_hover_text("Arm clip recording (toggle)");
+                        let arm = ui.add_sized(ARM_RECORD, RecordArmButton { armed: rec_on });
                         if arm.clicked() {
                             let new_on = !rec_on;
                             self.clip_settings.set_enabled(new_on);
