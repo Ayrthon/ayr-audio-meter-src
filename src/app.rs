@@ -40,9 +40,9 @@ use crate::spectrum::{SharedSpectrum, SpectrumAnalyzer, make_shared_spectrum};
 use crate::spectrum_view::show_spectrum;
 use crate::weighting::{FreqWeighting, MeterScratch};
 
-/// Darkest edge of the vignetted metal background (matches perimeter of `paint_metallic_background`).
-const BG: Color32 = Color32::from_rgb(0x08, 0x09, 0x0d);
-const PANEL_BG: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x25);
+/// Darkest edge of the vignetted metal background (`#232328`, matches `paint_metallic_background` edge).
+const BG: Color32 = Color32::from_rgb(0x23, 0x23, 0x28);
+const PANEL_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x30);
 const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
 pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
@@ -1751,9 +1751,9 @@ fn paint_metallic_background(
     let cx = rect.center().x;
     let cy = rect.top() + rect.height() * 0.20;
     let center = egui::pos2(cx, cy);
-    // Upper-center “key light” — cool slate, not a flat grey.
-    let c_col = Color32::from_rgb(0x32, 0x34, 0x3e);
-    let edge = Color32::from_rgb(0x0b, 0x0c, 0x11);
+    // Vignette: lighter center `#36353b` → darker edge `#232328`.
+    let c_col = Color32::from_rgb(0x36, 0x35, 0x3b);
+    let edge = Color32::from_rgb(0x23, 0x23, 0x28);
 
     let tl = rect.left_top();
     let tm = egui::pos2(cx, rect.top());
@@ -1787,11 +1787,11 @@ fn paint_metallic_background(
     }
     painter.add(Shape::mesh(fan));
 
-    // Soft horizontal highlight under the title bar (very subtle).
+    // Soft band under title bar — same palette as the main gradient (lighter → darker).
     let h = rect.height() * 0.28;
     let y1 = rect.top() + h;
-    let sheen_tl = Color32::from_rgba_unmultiplied(0xb8, 0xbc, 0xc8, 0x18);
-    let sheen_tr = Color32::from_rgba_unmultiplied(0x88, 0x8c, 0x98, 0x0e);
+    let sheen_tl = Color32::from_rgba_unmultiplied(0x36, 0x35, 0x3b, 0x1a);
+    let sheen_tr = Color32::from_rgba_unmultiplied(0x23, 0x23, 0x28, 0x0c);
     let sheen_b = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
     let mut sheen = Mesh::default();
     sheen.vertices.push(Vertex {
@@ -1827,11 +1827,12 @@ fn paint_metallic_background(
         egui::pos2(0.0, 0.0),
         egui::pos2(tiles_x, tiles_y),
     );
+    // Tint only (noise texels unchanged) — neutral grey between the two gradient stops.
     painter.image(
         noise.id(),
         rect,
         uv,
-        Color32::from_rgba_unmultiplied(0xd0, 0xd4, 0xdc, 0x24),
+        Color32::from_rgba_unmultiplied(0x2c, 0x2c, 0x32, 0x24),
     );
 }
 
@@ -1839,7 +1840,7 @@ fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
     visuals.window_fill = BG;
-    visuals.extreme_bg_color = Color32::from_rgb(0x08, 0x09, 0x0e);
+    visuals.extreme_bg_color = Color32::from_rgb(0x23, 0x23, 0x28);
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
     visuals.widgets.inactive.bg_fill = PANEL_BG;
     visuals.widgets.inactive.weak_bg_fill = PANEL_BG;

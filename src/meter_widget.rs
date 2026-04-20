@@ -11,14 +11,16 @@ pub use crate::meter::{MAX_DB, MIN_DB};
 pub const CLIP_DB: f32 = 0.0;
 
 pub const COL_BG: Color32 = Color32::from_rgb(0x14, 0x14, 0x18);
+/// dB ruler numerals (left / right of the bar).
+pub const COL_RULER_TEXT: Color32 = Color32::from_rgb(0xca, 0xca, 0xcd);
 pub const COL_TRACK: Color32 = Color32::from_rgb(0x0f, 0x0f, 0x12);
 pub const COL_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x42);
 pub const COL_TICK: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x78);
-pub const COL_TICK_MAJOR: Color32 = Color32::from_rgb(0xa4, 0xa4, 0xb0);
+/// Legacy name — meter ruler ticks use [`COL_RULER_TEXT`] (`#cacacd`).
+pub const COL_TICK_MAJOR: Color32 = COL_RULER_TEXT;
 pub const COL_TEXT: Color32 = Color32::from_rgb(0xe6, 0xe6, 0xee);
 pub const COL_TEXT_DIM: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x94);
-/// OBS Yami theme: `qproperty-majorTickColor: var(--white5)` (#969696).
-pub const COL_OBS_TICK_MAJOR: Color32 = Color32::from_rgb(0x96, 0x96, 0x96);
+pub const COL_OBS_TICK_MAJOR: Color32 = COL_RULER_TEXT;
 // RMS / "pressure" line — drawn inside the filled bar to show the
 // averaged energy level below the peak.  Near-black with high alpha
 // so it reads clearly against bright green / orange / olive fills.
@@ -59,24 +61,8 @@ pub const PT_ORANGE_BG: Color32 = Color32::from_rgb(0x2e, 0x1c, 0x08);
 pub const STD_DIM_GREEN:    Color32 = Color32::from_rgb(0x1b, 0x97, 0x3c);
 pub const STD_DIM_GREEN_BG: Color32 = Color32::from_rgb(0x07, 0x1e, 0x0e);
 
-// OBS **Yami** theme (default dark skin) — `frontend/data/themes/Yami.obt`
-// VolumeMeter block maps qproperty colours to:
-//   foregroundNominalColor  = var(--green2)  #37D247
-//   foregroundWarningColor  = var(--yellow2) #E5AF24
-//   foregroundErrorColor    = var(--red2)    #E33B57
-//   backgroundNominalColor  = var(--green5) #17641E
-//   backgroundWarningColor  = var(--yellow5)#6E520D
-//   backgroundErrorColor    = var(--red5)    #7D1224
-//
-// OBS still ships classic themes (e.g. `Yami_Classic.ovt`) with the older
-// neon RGB literals from `VolumeMeter.cpp`, but the screenshot you sent
-// matches the modern Yami palette above — that's what we mirror here.
-pub const OBS_GREEN_BG:   Color32 = Color32::from_rgb(0x17, 0x64, 0x1e);
-pub const OBS_YELLOW_BG:  Color32 = Color32::from_rgb(0x6e, 0x52, 0x0d);
-pub const OBS_RED_BG:     Color32 = Color32::from_rgb(0x7d, 0x12, 0x24);
-pub const OBS_GREEN:      Color32 = Color32::from_rgb(0x37, 0xd2, 0x47);
-pub const OBS_YELLOW:     Color32 = Color32::from_rgb(0xe5, 0xaf, 0x24);
-pub const OBS_RED:        Color32 = Color32::from_rgb(0xe3, 0x3b, 0x57);
+// OBS mode uses the same meter band fills and dim tracks as [`ColorPalette::Standard`]
+// so green / yellow / red match the other palettes.
 
 #[derive(Clone, Copy)]
 pub struct ZoneStyle {
@@ -91,13 +77,10 @@ pub fn zone_styles(palette: ColorPalette) -> [ZoneStyle; 4] {
         ColorPalette::Obs => [
             // `zone_low_top_db` is MIN_DB in OBS mode, so this first slot
             // collapses to zero height; keep it defined anyway for consistency.
-            ZoneStyle { fill: OBS_GREEN,  bg: OBS_GREEN_BG },
-            // Bottom active band (-60 .. -20 dBFS): bright green.
-            ZoneStyle { fill: OBS_GREEN,  bg: OBS_GREEN_BG },
-            // Mid caution band (-20 .. -9 dBFS): yellow.
-            ZoneStyle { fill: OBS_YELLOW, bg: OBS_YELLOW_BG },
-            // Top hot band (-9 .. 0 dBFS): red.
-            ZoneStyle { fill: OBS_RED,    bg: OBS_RED_BG },
+            ZoneStyle { fill: STD_DIM_GREEN, bg: STD_DIM_GREEN_BG },
+            ZoneStyle { fill: METER_GREEN,   bg: METER_GREEN_BG },
+            ZoneStyle { fill: METER_YELLOW,  bg: METER_YELLOW_BG },
+            ZoneStyle { fill: METER_RED,     bg: METER_RED_BG },
         ],
         ColorPalette::ProTools => [
             ZoneStyle { fill: PT_LOW,      bg: PT_LOW_BG },
@@ -208,7 +191,7 @@ pub fn meter_strip_content_width(channels: usize) -> f32 {
 }
 
 // Typography — sized so readouts and scale labels stay legible.
-pub const FONT_TICK: f32 = 10.5;
+pub const FONT_TICK: f32 = 11.75;
 pub const FONT_MODE: f32 = 10.5;
 pub const FONT_READOUT: f32 = 12.0;
 pub const FONT_CHANNEL: f32 = 12.0;
@@ -376,8 +359,7 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     // what broke tick alignment against the coloured bar.
     let bar_bottom = rect.bottom() - bottom_pad;
 
-    // --- background ----------------------------------------------
-    painter.rect_filled(rect, 0.0, COL_BG);
+    // No full-rect panel fill — meters sit directly on the app backdrop.
 
     // --- clip indicator ------------------------------------------
     let clip_rect = Rect::from_min_size(
@@ -506,11 +488,9 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     );
 
     // --- scale ticks + labels ---------------------------------
-    let tick_major_col = if cfg.palette == ColorPalette::Obs {
-        COL_OBS_TICK_MAJOR
-    } else {
-        COL_TICK_MAJOR
-    };
+    // Tick marks extend outward from the bar (longer than before); same #cacacd as numerals.
+    const RULER_TICK_INSET: f32 = 1.0;
+    const RULER_TICK_OUTER: f32 = 8.0;
     for &disp in scale.tick_display_values() {
         if disp > scale.disp_max || disp < scale.disp_min {
             continue;
@@ -524,12 +504,18 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
             continue;
         }
         painter.line_segment(
-            [pos2(bar_x - 3.0, y), pos2(bar_x - 1.0, y)],
-            Stroke::new(1.0, tick_major_col),
+            [
+                pos2(bar_x - RULER_TICK_OUTER, y),
+                pos2(bar_x - RULER_TICK_INSET, y),
+            ],
+            Stroke::new(1.0, COL_RULER_TEXT),
         );
         painter.line_segment(
-            [pos2(bar_x + bar_w, y), pos2(bar_x + bar_w + 3.0, y)],
-            Stroke::new(1.0, tick_major_col),
+            [
+                pos2(bar_x + bar_w + RULER_TICK_INSET, y),
+                pos2(bar_x + bar_w + RULER_TICK_OUTER, y),
+            ],
+            Stroke::new(1.0, COL_RULER_TEXT),
         );
         let label = scale.tick_label(disp);
         painter.text(
@@ -537,7 +523,7 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
             egui::Align2::RIGHT_CENTER,
             label,
             FontId::proportional(FONT_TICK),
-            COL_TEXT_DIM,
+            COL_RULER_TEXT,
         );
     }
 
@@ -639,6 +625,48 @@ pub fn paint_zone_backgrounds(
     }
 }
 
+/// Vertical blend width (dB) where lit fill lerps between adjacent zone colors.
+const FILL_GRADIENT_BLEND_DB: f32 = 2.5;
+
+#[inline]
+fn lerp_color32(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t).round() as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
+        (a.a() as f32 + (b.a() as f32 - a.a() as f32) * t).round() as u8,
+    )
+}
+
+#[inline]
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Color for the lit bar at `db` (dBFS), with soft transitions at internal zone boundaries.
+fn fill_color_at_dbfs(db: f32, tops_db: &[f32; 4], styles: &[ZoneStyle; 4]) -> Color32 {
+    let half = FILL_GRADIENT_BLEND_DB * 0.5;
+    for k in 0..3 {
+        let c = tops_db[k];
+        let t = (db - (c - half)) / FILL_GRADIENT_BLEND_DB;
+        if t > 0.0 && t < 1.0 {
+            let s = smoothstep01(t);
+            return lerp_color32(styles[k].fill, styles[k + 1].fill, s);
+        }
+    }
+    if db <= tops_db[0] {
+        styles[0].fill
+    } else if db <= tops_db[1] {
+        styles[1].fill
+    } else if db <= tops_db[2] {
+        styles[2].fill
+    } else {
+        styles[3].fill
+    }
+}
+
 /// Paint the lit portion of each zone up to `fill_y` (pixel-y of the
 /// current meter reading — lower y = higher level).
 pub fn paint_zone_fill(
@@ -652,21 +680,23 @@ pub fn paint_zone_fill(
     styles: &[ZoneStyle; 4],
     scale: &MeterScale,
 ) {
-    let mut prev_y = bottom;
-    for (i, &top_db) in tops_db.iter().enumerate() {
-        let zone_top = scale.dbfs_to_y(top_db, top, bottom).min(prev_y);
-        let zone_bottom = prev_y;
-        if zone_top < zone_bottom {
-            let fill_top = fill_y.max(zone_top);
-            if fill_top < zone_bottom {
-                painter.rect_filled(
-                    Rect::from_min_max(pos2(x, fill_top), pos2(x + w, zone_bottom)),
-                    0.0,
-                    styles[i].fill,
-                );
-            }
-        }
-        prev_y = zone_top;
+    let y0 = fill_y.max(top);
+    let y1 = bottom;
+    if y0 >= y1 {
+        return;
+    }
+    let mut y = y0;
+    while y + 1e-4 < y1 {
+        let y_next = (y + 1.0_f32).min(y1);
+        let y_mid = (y + y_next) * 0.5;
+        let db = scale.y_to_dbfs(y_mid, top, bottom);
+        let col = fill_color_at_dbfs(db, tops_db, styles);
+        painter.rect_filled(
+            Rect::from_min_max(pos2(x, y), pos2(x + w, y_next)),
+            0.0,
+            col,
+        );
+        y = y_next;
     }
 }
 

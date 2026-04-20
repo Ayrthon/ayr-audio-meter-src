@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui,
-    pos2,
+    Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind,
+    Ui, pos2,
 };
+use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use parking_lot::RwLock;
 
 use crate::clip_capture::{
@@ -191,23 +192,51 @@ pub fn show_history_graph(
     paint_zone_backgrounds(&painter, left, right - left, top, bottom, &tops, &styles, &scale);
 
     // Faded band above the clip trigger line (louder region): fills the visual gap vs zones below.
+    // Vertical opacity gradient: stronger at the plot top, softer at the threshold line.
+    const ARMED_TRIGGER_OPACITY_TOP: f32 = 0.75;
+    const ARMED_TRIGGER_OPACITY_BOTTOM: f32 = 0.50;
     let clip_thr_db = clip_settings.threshold_db();
     if clip_thr_db.is_finite() {
         let y_thr = scale
             .dbfs_to_y(clip_thr_db, top, bottom)
             .clamp(top, bottom);
-        // ~75% opacity (0xBF / 255) — strong “above threshold” band, still shows grid/trace.
-        let fill = if clip_settings.enabled() {
-            Color32::from_rgba_unmultiplied(0x72, 0x18, 0x22, 0xbf)
-        } else {
-            Color32::from_rgba_unmultiplied(0x38, 0x3a, 0x40, 0xbf)
-        };
         if y_thr > top + 0.5 {
-            painter.rect_filled(
-                Rect::from_min_max(pos2(left, top), pos2(right, y_thr)),
-                0.0,
-                fill,
-            );
+            let a_top = (ARMED_TRIGGER_OPACITY_TOP * 255.0).round().clamp(0.0, 255.0) as u8;
+            let a_bot = (ARMED_TRIGGER_OPACITY_BOTTOM * 255.0).round().clamp(0.0, 255.0) as u8;
+            let (c_top, c_bot) = if clip_settings.enabled() {
+                (
+                    Color32::from_rgba_unmultiplied(0x72, 0x18, 0x22, a_top),
+                    Color32::from_rgba_unmultiplied(0x72, 0x18, 0x22, a_bot),
+                )
+            } else {
+                (
+                    Color32::from_rgba_unmultiplied(0x38, 0x3a, 0x40, a_top),
+                    Color32::from_rgba_unmultiplied(0x38, 0x3a, 0x40, a_bot),
+                )
+            };
+            let mut mesh = Mesh::default();
+            mesh.vertices.push(Vertex {
+                pos: pos2(left, top),
+                uv: WHITE_UV,
+                color: c_top,
+            });
+            mesh.vertices.push(Vertex {
+                pos: pos2(right, top),
+                uv: WHITE_UV,
+                color: c_top,
+            });
+            mesh.vertices.push(Vertex {
+                pos: pos2(right, y_thr),
+                uv: WHITE_UV,
+                color: c_bot,
+            });
+            mesh.vertices.push(Vertex {
+                pos: pos2(left, y_thr),
+                uv: WHITE_UV,
+                color: c_bot,
+            });
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter.add(Shape::mesh(mesh));
         }
     }
 
