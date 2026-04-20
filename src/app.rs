@@ -8,9 +8,10 @@ use std::time::Instant;
 
 use anyhow::Result;
 use eframe::egui;
+use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
     Align, Align2, CollapsingHeader, Color32, CornerRadius, CursorIcon, FontId, Frame, Label,
-    Layout, Margin, OpenUrl, RichText, ScrollArea, Sense, Stroke, StrokeKind, Widget,
+    Layout, Margin, OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, Widget,
 };
 use parking_lot::Mutex;
 
@@ -38,8 +39,9 @@ use crate::spectrum::{SharedSpectrum, SpectrumAnalyzer, make_shared_spectrum};
 use crate::spectrum_view::show_spectrum;
 use crate::weighting::{FreqWeighting, MeterScratch};
 
-const BG: Color32 = Color32::from_rgb(0x0c, 0x0c, 0x10);
-const PANEL_BG: Color32 = Color32::from_rgb(0x15, 0x15, 0x1b);
+/// Darkest corner of the brushed-metal background (matches `paint_metallic_background` RB).
+const BG: Color32 = Color32::from_rgb(0x0a, 0x0b, 0x10);
+const PANEL_BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1e);
 const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
 pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
@@ -538,6 +540,7 @@ impl AudioMeterApp {
 
 impl eframe::App for AudioMeterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        paint_metallic_background(&ui.painter(), ui.max_rect());
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.tick_meters();
@@ -1688,11 +1691,77 @@ fn log_gl_caps(cc: &eframe::CreationContext<'_>) {
     }
 }
 
+/// Brushed-steel backdrop: diagonal bilinear base plus a soft top sheen (replaces flat black).
+fn paint_metallic_background(painter: &egui::Painter, rect: egui::Rect) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    // Simulated light from top-left: cool grey highlight → shadow toward bottom-right.
+    let lt = Color32::from_rgb(0x38, 0x3a, 0x44);
+    let rt = Color32::from_rgb(0x26, 0x28, 0x30);
+    let lb = Color32::from_rgb(0x14, 0x15, 0x1c);
+    let rb = Color32::from_rgb(0x0a, 0x0b, 0x10);
+
+    let mut base = Mesh::default();
+    base.vertices.push(Vertex {
+        pos: rect.left_top(),
+        uv: WHITE_UV,
+        color: lt,
+    });
+    base.vertices.push(Vertex {
+        pos: rect.right_top(),
+        uv: WHITE_UV,
+        color: rt,
+    });
+    base.vertices.push(Vertex {
+        pos: rect.right_bottom(),
+        uv: WHITE_UV,
+        color: rb,
+    });
+    base.vertices.push(Vertex {
+        pos: rect.left_bottom(),
+        uv: WHITE_UV,
+        color: lb,
+    });
+    base.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(Shape::mesh(base));
+
+    // Narrow specular wash (fades out ~upper third) so the top edge reads like rolled metal.
+    let h = rect.height() * 0.36;
+    let y1 = rect.top() + h;
+    let sheen_tl = Color32::from_rgba_unmultiplied(0xc4, 0xc8, 0xd4, 0x22);
+    let sheen_tr = Color32::from_rgba_unmultiplied(0x8c, 0x90, 0x9c, 0x14);
+    let sheen_b = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+    let mut sheen = Mesh::default();
+    sheen.vertices.push(Vertex {
+        pos: egui::pos2(rect.left(), rect.top()),
+        uv: WHITE_UV,
+        color: sheen_tl,
+    });
+    sheen.vertices.push(Vertex {
+        pos: egui::pos2(rect.right(), rect.top()),
+        uv: WHITE_UV,
+        color: sheen_tr,
+    });
+    sheen.vertices.push(Vertex {
+        pos: egui::pos2(rect.right(), y1),
+        uv: WHITE_UV,
+        color: sheen_b,
+    });
+    sheen.vertices.push(Vertex {
+        pos: egui::pos2(rect.left(), y1),
+        uv: WHITE_UV,
+        color: sheen_b,
+    });
+    sheen.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(Shape::mesh(sheen));
+}
+
 fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
     visuals.window_fill = BG;
-    visuals.extreme_bg_color = Color32::from_rgb(0x08, 0x08, 0x0c);
+    visuals.extreme_bg_color = Color32::from_rgb(0x08, 0x09, 0x0e);
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
     visuals.widgets.inactive.bg_fill = PANEL_BG;
     visuals.widgets.inactive.weak_bg_fill = PANEL_BG;
