@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{
     Align, Button, Color32, CornerRadius, Frame, Key, Margin, Modal, PointerButton, RichText,
-    ScrollArea, Sense, Stroke, Ui, Vec2,
+    Sense, Stroke, Ui, Vec2,
 };
 
 use crate::clip_capture::{
@@ -20,15 +20,7 @@ use crate::user_settings::SharedUserSettings;
 
 const PEAK_BUCKETS_MAX: usize = 1200;
 const WAVE_H: f32 = 76.0;
-/// Play row (34 px control) + `6` pt gap before the waveform block (matches `draw_loaded_waveform_preview`).
-const LISTEN_BEFORE_WAVE: f32 = 40.0;
 const LISTEN_AFTER_WAVE_SPACER: f32 = 4.0;
-const LISTEN_TIMELINE_ROW_H: f32 = 20.0;
-/// Total vertical space for the Listen preview (must match `draw_loaded_waveform_preview` + placeholder).
-const LISTEN_PREVIEW_TOTAL_H: f32 = LISTEN_BEFORE_WAVE
-    + WAVE_H
-    + LISTEN_AFTER_WAVE_SPACER
-    + LISTEN_TIMELINE_ROW_H;
 /// Half-width of the trigger highlight on the waveform (seconds each side of the crossing).
 const TRIGGER_HIGHLIGHT_PAD_SEC: f64 = 0.5;
 
@@ -48,7 +40,7 @@ fn split_casual_when(casual: &str) -> Option<(&str, &str)> {
 }
 
 /// Vertical gap between clip rows so rounded strokes do not read as one continuous frame.
-const CLIP_ROW_GAP: f32 = 9.0;
+const CLIP_ROW_GAP: f32 = 12.0;
 
 const CLIP_ROW_H: f32 = 38.0;
 
@@ -723,21 +715,43 @@ impl ClipPlaylistState {
             ctx.request_repaint();
         }
 
-        const CLIPS_HEAD_CHROME: f32 = 58.0;
-        const TOOLBAR_CHROME: f32 = 42.0;
-        const LIST_SURFACE_CHROME: f32 = 24.0;
-        const LISTEN_HEADER_AND_PAD: f32 = 14.0 + 14.0 + 26.0 + 12.0;
-        let listen_block = LISTEN_HEADER_AND_PAD
-            + LISTEN_PREVIEW_TOTAL_H
-            + if self.player_err.is_some() { 30.0 } else { 0.0 };
-        let multi_reserve = 28.0;
-        let list_scroll_h = (ui.available_height()
-            - listen_block
-            - CLIPS_HEAD_CHROME
-            - TOOLBAR_CHROME
-            - LIST_SURFACE_CHROME
-            - multi_reserve)
-            .clamp(96.0, 600.0);
+        ui.label(
+            RichText::new("Listen")
+                .size(15.0)
+                .strong()
+                .color(crate::app::TITLE_COL),
+        );
+        ui.add_space(12.0);
+
+        if let Some(ref e) = self.player_err {
+            ui.label(
+                RichText::new(format!("Could not load clip: {e}"))
+                    .size(9.5)
+                    .color(Color32::from_rgb(220, 120, 120)),
+            );
+            ui.add_space(6.0);
+        }
+
+        let sel_n_listen = self.selected_paths.len();
+        let show_waveform = self.loaded.is_some() && sel_n_listen == 1;
+        if show_waveform {
+            let (dur, ch, sr, samples_len) = {
+                let l = self.loaded.as_ref().unwrap();
+                (
+                    l.duration_sec().max(1e-6),
+                    l.channels,
+                    l.sample_rate,
+                    l.samples.len(),
+                )
+            };
+            self.draw_loaded_waveform_preview(ui, ctx, dur, ch, sr, samples_len);
+        } else {
+            self.draw_preview_placeholder(ui);
+        }
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(14.0);
 
         ui.label(
             RichText::new("Clips")
@@ -812,6 +826,8 @@ impl ClipPlaylistState {
 
         ui.add_space(12.0);
 
+        // Inline list — no inner scroll area; the outer left-column scroll handles overflow
+        // so the card grows with the clip count.
         let mut row_action: Option<(PathBuf, bool)> = None;
         Frame::new()
             .fill(LIST_SURFACE)
@@ -819,40 +835,30 @@ impl ClipPlaylistState {
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::same(8))
             .show(ui, |ui| {
-                ScrollArea::vertical()
-                    .max_height(list_scroll_h)
-                    .auto_shrink([false, false])
-                    .id_salt("clip_playlist_scroll")
-                    .show(ui, |ui| {
-                        if self.entries.is_empty() {
-                            ui.label(
-                                RichText::new(
-                                    "No clips yet — arm capture and let the meter cross the threshold.",
-                                )
-                                .size(9.5)
-                                .color(Color32::from_gray(125)),
-                            );
-                        } else {
-                            for (idx, ent) in self.entries.iter().enumerate() {
-                                let selected = self.selected_paths.contains(&ent.path);
-                                let casual = format_clip_captured_casual(ent.modified);
-                                if idx > 0 {
-                                    ui.add_space(CLIP_ROW_GAP);
-                                }
-                                let r = draw_clip_row(
-                                    ui,
-                                    idx + 1,
-                                    &casual,
-                                    selected,
-                                    idx == 0,
-                                );
-                                if r.clicked() {
-                                    let cmd = r.ctx.input(|i| i.modifiers.command);
-                                    row_action = Some((ent.path.clone(), cmd));
-                                }
-                            }
+                // `left_panel_collapsing` zeros item_spacing on nested uis, so rely on explicit
+                // `add_space` calls to separate the stroked row frames instead of item_spacing.
+                if self.entries.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No clips yet — arm capture and let the meter cross the threshold.",
+                        )
+                        .size(9.5)
+                        .color(Color32::from_gray(125)),
+                    );
+                } else {
+                    for (idx, ent) in self.entries.iter().enumerate() {
+                        if idx > 0 {
+                            ui.add_space(CLIP_ROW_GAP);
                         }
-                    });
+                        let selected = self.selected_paths.contains(&ent.path);
+                        let casual = format_clip_captured_casual(ent.modified);
+                        let r = draw_clip_row(ui, idx + 1, &casual, selected, idx == 0);
+                        if r.clicked() {
+                            let cmd = r.ctx.input(|i| i.modifiers.command);
+                            row_action = Some((ent.path.clone(), cmd));
+                        }
+                    }
+                }
 
                 if let Some((path, cmd_multi)) = row_action {
                     if cmd_multi {
@@ -882,44 +888,6 @@ impl ClipPlaylistState {
                     );
                 }
             });
-
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(14.0);
-
-        ui.label(
-            RichText::new("Listen")
-                .size(15.0)
-                .strong()
-                .color(crate::app::TITLE_COL),
-        );
-        ui.add_space(12.0);
-
-        if let Some(ref e) = self.player_err {
-            ui.label(
-                RichText::new(format!("Could not load clip: {e}"))
-                    .size(9.5)
-                    .color(Color32::from_rgb(220, 120, 120)),
-            );
-            ui.add_space(6.0);
-        }
-
-        let sel_n = self.selected_paths.len();
-        let show_waveform = self.loaded.is_some() && sel_n == 1;
-        if show_waveform {
-            let (dur, ch, sr, samples_len) = {
-                let l = self.loaded.as_ref().unwrap();
-                (
-                    l.duration_sec().max(1e-6),
-                    l.channels,
-                    l.sample_rate,
-                    l.samples.len(),
-                )
-            };
-            self.draw_loaded_waveform_preview(ui, ctx, dur, ch, sr, samples_len);
-        } else {
-            self.draw_preview_placeholder(ui);
-        }
 
         self.draw_delete_prompts(ctx);
     }
