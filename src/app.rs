@@ -4,12 +4,13 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use eframe::egui;
 use egui::{
-    Align, CollapsingHeader, Color32, CornerRadius, CursorIcon, Frame, Label, Layout, Margin,
-    OpenUrl, RichText, ScrollArea, Sense, Stroke,
+    Align, Align2, CollapsingHeader, Color32, CornerRadius, CursorIcon, FontId, Frame, Label,
+    Layout, Margin, OpenUrl, RichText, ScrollArea, Sense, Stroke, StrokeKind, Widget,
 };
 use parking_lot::Mutex;
 
@@ -127,6 +128,8 @@ pub struct AudioMeterApp {
     meter_states: Vec<MeterState>,
     history: SharedHistory,
     engine: Option<AudioEngine>,
+    /// Wall-clock start of the current metering session (`None` when stopped).
+    metering_runtime_start: Option<Instant>,
     channels: usize,
     status: String,
 }
@@ -232,6 +235,7 @@ impl AudioMeterApp {
             meter_states,
             history,
             engine: None,
+            metering_runtime_start: None,
             channels: 2,
             status: "Idle".into(),
         }
@@ -287,6 +291,7 @@ impl AudioMeterApp {
             self.user_settings.clone(),
         )?;
         self.engine = Some(engine);
+        self.metering_runtime_start = Some(Instant::now());
         let kind_label = match dev.kind {
             SourceKind::Input => "input",
             SourceKind::Loopback => "output (loopback)",
@@ -303,6 +308,7 @@ impl AudioMeterApp {
     }
 
     fn stop_stream(&mut self) {
+        self.metering_runtime_start = None;
         if let Some(mut e) = self.engine.take() {
             e.stop();
         }
@@ -1235,76 +1241,441 @@ impl AudioMeterApp {
             egui::Vec2::new(ui.available_width(), row_h),
             Layout::left_to_right(Align::TOP),
             |ui| {
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(
-                    crate::meter_widget::meter_strip_content_width(self.meter_states.len()),
-                    ui.available_height(),
-                ),
-                Layout::left_to_right(Align::TOP),
-                |ui| {
-                    let prev_spacing = ui.spacing().item_spacing;
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, prev_spacing.y);
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(
+                        crate::meter_widget::meter_strip_content_width(self.meter_states.len()),
+                        ui.available_height(),
+                    ),
+                    Layout::left_to_right(Align::TOP),
+                    |ui| {
+                        let prev_spacing = ui.spacing().item_spacing;
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, prev_spacing.y);
 
-                    ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_START);
-                    let n = self.meter_states.len();
-                    for (i, state) in self.meter_states.iter().enumerate() {
-                        let label = channel_label(self.channels, i).to_string();
-                        show_meter(
-                            ui,
-                            MeterPaintArgs {
-                                label: &label,
-                                mode: self.mode,
-                                state,
-                            },
-                            now,
-                        );
-                        if i + 1 < n {
-                            ui.add_space(crate::meter_widget::METER_STRIP_GAP_X);
+                        ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_START);
+                        let n = self.meter_states.len();
+                        for (i, state) in self.meter_states.iter().enumerate() {
+                            let label = channel_label(self.channels, i).to_string();
+                            show_meter(
+                                ui,
+                                MeterPaintArgs {
+                                    label: &label,
+                                    mode: self.mode,
+                                    state,
+                                },
+                                now,
+                            );
+                            if i + 1 < n {
+                                ui.add_space(crate::meter_widget::METER_STRIP_GAP_X);
+                            }
+                        }
+                        ui.add_space(crate::meter_widget::METER_STRIP_GAP_TO_REF);
+                        show_reference_label(ui, self.mode, self.channels);
+                        ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_END);
+
+                        ui.spacing_mut().item_spacing = prev_spacing;
+                    },
+                );
+
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.set_min_height(row_h);
+                    ui.set_min_width(ui.available_width());
+                    self.right_panel_toolbar(ui);
+
+                    let rest_h = ui.available_height().max(1.0);
+                    match self.panel {
+                        GraphView::Off => {}
+                        GraphView::History => {
+                            ScrollArea::horizontal()
+                                .id_salt("graph_scroll")
+                                .max_height(rest_h)
+                                .show(ui, |ui| {
+                                    show_history_graph(
+                                        ui,
+                                        &self.history,
+                                        self.mode,
+                                        now,
+                                        &self.clip_settings,
+                                        &self.clip_status,
+                                    );
+                                });
+                        }
+                        GraphView::Spectrum => {
+                            ScrollArea::horizontal()
+                                .id_salt("spectrum_scroll")
+                                .max_height(rest_h)
+                                .show(ui, |ui| {
+                                    show_spectrum(
+                                        ui,
+                                        &mut self.analyzer,
+                                        &self.spectrum,
+                                        now,
+                                        &mut self.spectrum_pretty_mode,
+                                        &mut self.spectrum_anchors,
+                                    );
+                                });
                         }
                     }
-                    ui.add_space(crate::meter_widget::METER_STRIP_GAP_TO_REF);
-                    show_reference_label(ui, self.mode, self.channels);
-                    ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_END);
+                });
+            },
+        );
+    }
 
-                    ui.spacing_mut().item_spacing = prev_spacing;
-                },
-            );
+    /// Transport, view mode, and runtime clock above the history / spectrum area.
+    fn right_panel_toolbar(&mut self, ui: &mut egui::Ui) {
+        const BAR_H: f32 = 34.0;
+        const ICON_BTN: egui::Vec2 = egui::vec2(30.0, 26.0);
+        // Square: circular record ARM control matches transport row height.
+        const ARM_RECORD: egui::Vec2 = egui::vec2(26.0, 26.0);
 
-            match self.panel {
-                GraphView::Off => {}
-                GraphView::History => {
-                    ui.add_space(4.0);
-                    ScrollArea::horizontal()
-                        .id_salt("graph_scroll")
-                        .show(ui, |ui| {
-                            show_history_graph(
-                                ui,
-                                &self.history,
-                                self.mode,
-                                now,
-                                &self.clip_settings,
-                                &self.clip_status,
-                            );
-                        });
+        let full_w = ui.available_width().max(1.0);
+        ui.set_min_width(full_w);
+
+        Frame::new()
+            .fill(PANEL_BG)
+            .stroke(Stroke::new(1.0, DIVIDER))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.set_width(full_w);
+                ui.set_min_height(BAR_H);
+                // ~30fps while transport/record pulse animations run; clock still smooth enough.
+                if self.engine.is_some() || self.clip_settings.enabled() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(33));
                 }
-                GraphView::Spectrum => {
-                    ui.add_space(4.0);
-                    ScrollArea::horizontal()
-                        .id_salt("spectrum_scroll")
-                        .show(ui, |ui| {
-                            show_spectrum(
-                                ui,
-                                &mut self.analyzer,
-                                &self.spectrum,
-                                now,
-                                &mut self.spectrum_pretty_mode,
-                                &mut self.spectrum_anchors,
-                            );
-                        });
+
+                let ctx = ui.ctx().clone();
+                let hover_fg_w = ctx.global_style().visuals.widgets.hovered.fg_stroke.width;
+                let active_fg_w = ctx.global_style().visuals.widgets.active.fg_stroke.width;
+                ctx.global_style_mut(|s| {
+                    s.visuals.widgets.hovered.fg_stroke.width = 1.0;
+                    s.visuals.widgets.active.fg_stroke.width = 1.0;
+                });
+
+                let full = ui.available_width().max(1.0);
+                let third = (full / 3.0).max(1.0);
+                let row_inner_h = (BAR_H - 8.0).max(18.0);
+
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(third, row_inner_h),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("View")
+                                        .size(8.5)
+                                        .color(Color32::from_gray(130)),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                    if ui
+                                        .selectable_label(
+                                            self.panel == GraphView::History,
+                                            "History",
+                                        )
+                                        .on_hover_text("Level history graph")
+                                        .clicked()
+                                    {
+                                        self.panel = GraphView::History;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            self.panel == GraphView::Spectrum,
+                                            "Spectrum",
+                                        )
+                                        .on_hover_text("Spectrum analyzer")
+                                        .clicked()
+                                    {
+                                        self.panel = GraphView::Spectrum;
+                                    }
+                                });
+                            });
+                        },
+                    );
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(third, row_inner_h),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                                let playing = self.engine.is_some();
+
+                                let play = ui.add_enabled_ui(!playing, |ui| {
+                                    ui.add_sized(ICON_BTN, ToolbarTransportIcon::Play)
+                                        .on_hover_text("Start metering")
+                                });
+                                if play.inner.clicked() {
+                                    if let Err(e) = self.start_stream() {
+                                        self.status = format!("Error: {e}");
+                                    }
+                                }
+
+                                let stop = ui.add_enabled_ui(playing, |ui| {
+                                    ui.add_sized(
+                                        ICON_BTN,
+                                        ToolbarTransportIcon::Stop {
+                                            meter_active: playing,
+                                        },
+                                    )
+                                    .on_hover_text("Stop metering")
+                                });
+                                if stop.inner.clicked() {
+                                    self.stop_stream();
+                                }
+
+                                let rec_on = self.clip_settings.enabled();
+                                let arm = ui
+                                    .add_sized(ARM_RECORD, RecordArmButton { armed: rec_on })
+                                    .on_hover_text("Arm clip recording (toggle)");
+                                if arm.clicked() {
+                                    let new_on = !rec_on;
+                                    self.clip_settings.set_enabled(new_on);
+                                    if new_on {
+                                        self.clip_session_baseline =
+                                            self.clip_status.lock().total_clips_saved;
+                                    }
+                                }
+                            });
+                        },
+                    );
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(third, row_inner_h),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                                    ui.label(
+                                        RichText::new("Current runtime")
+                                            .size(8.5)
+                                            .color(Color32::from_gray(130)),
+                                    );
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                                    ui.label(
+                                        RichText::new(format_runtime_hms(
+                                            self.metering_runtime_start,
+                                        ))
+                                        .size(14.0)
+                                        .family(egui::FontFamily::Monospace)
+                                        .color(TITLE_COL)
+                                        .strong(),
+                                    );
+                                });
+                            });
+                        },
+                    );
+                });
+
+                ctx.global_style_mut(|s| {
+                    s.visuals.widgets.hovered.fg_stroke.width = hover_fg_w;
+                    s.visuals.widgets.active.fg_stroke.width = active_fg_w;
+                });
+            });
+    }
+}
+
+/// Transport play / stop — custom paint so hover never changes stroke width or layout
+/// (unlike [`egui::Button`], which uses interactive widget styles).
+#[derive(Clone, Copy)]
+enum ToolbarTransportIcon {
+    Play,
+    /// When enabled, `meter_active` is true and the stop control “breathes” (meter running).
+    Stop { meter_active: bool },
+}
+
+impl ToolbarTransportIcon {
+    const GLYPH_PX: f32 = 14.0;
+    const RADIUS: CornerRadius = CornerRadius::same(4);
+
+    fn glyph(self) -> &'static str {
+        match self {
+            ToolbarTransportIcon::Play => "▶",
+            ToolbarTransportIcon::Stop { .. } => "■",
+        }
+    }
+
+    /// Original slate — used when play/stop is **disabled** (wrong mode for that control).
+    fn inactive_slate_colors(hovered: bool) -> (Color32, Color32, Color32) {
+        let fill = Color32::from_rgb(0x36, 0x3e, 0x4a);
+        let stroke = if hovered {
+            Color32::from_rgb(0x72, 0x7c, 0x8a)
+        } else {
+            Color32::from_rgb(0x52, 0x5c, 0x6a)
+        };
+        let fg = Color32::from_rgb(0xe8, 0xee, 0xf6);
+        (fill, stroke, fg)
+    }
+
+    /// Enabled play — static green (stop uses breathing green instead; vice versa).
+    fn play_colors(hovered: bool) -> (Color32, Color32, Color32) {
+        let fill = Color32::from_rgb(0x2a, 0x6a, 0x36);
+        let stroke = if hovered {
+            Color32::from_rgb(0x5c, 0xc8, 0x68)
+        } else {
+            Color32::from_rgb(0x4c, 0xaf, 0x50)
+        };
+        let fg = Color32::from_rgb(0xe6, 0xf5, 0xe6);
+        (fill, stroke, fg)
+    }
+
+    /// Enabled stop while metering — pulses **green** (deeper than play).
+    fn stop_colors(hovered: bool, meter_active: bool, breath: f32) -> (Color32, Color32, Color32) {
+        let fill_lo = Color32::from_rgb(0x1f, 0x52, 0x2e);
+        let fill_hi = Color32::from_rgb(0x32, 0x7a, 0x44);
+        let fill = if meter_active {
+            lerp_color32(fill_lo, fill_hi, breath)
+        } else {
+            fill_lo
+        };
+
+        let stroke_lo = Color32::from_rgb(0x38, 0x8e, 0x4c);
+        let stroke_hi = Color32::from_rgb(0x52, 0xc4, 0x6a);
+        let stroke = if hovered {
+            Color32::from_rgb(0x7e, 0xea, 0x90)
+        } else if meter_active {
+            lerp_color32(stroke_lo, stroke_hi, breath)
+        } else {
+            stroke_lo
+        };
+
+        let fg = Color32::from_rgb(0xe6, 0xf5, 0xe6);
+        (fill, stroke, fg)
+    }
+}
+
+impl Widget for ToolbarTransportIcon {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let size = ui.available_size();
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let painter = ui.painter_at(rect);
+        let over = response.hovered();
+        let enabled = ui.is_enabled();
+        let time = ui.ctx().input(|i| i.time) as f32;
+        let (fill, stroke_col, fg) = if !enabled {
+            Self::inactive_slate_colors(over)
+        } else {
+            match self {
+                ToolbarTransportIcon::Play => Self::play_colors(over),
+                ToolbarTransportIcon::Stop { meter_active } => {
+                    let breath = if meter_active {
+                        (time * 2.25_f32).sin() * 0.5 + 0.5
+                    } else {
+                        0.0
+                    };
+                    Self::stop_colors(over, meter_active, breath)
                 }
             }
-        });
+        };
+        painter.rect(
+            rect,
+            Self::RADIUS,
+            fill,
+            Stroke::new(1.0, stroke_col),
+            StrokeKind::Inside,
+        );
+        let font = FontId::proportional(Self::GLYPH_PX);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            self.glyph(),
+            font,
+            fg,
+        );
+        response
     }
+}
+
+/// Conventional record control: outer ring + center dot (clip arm).
+struct RecordArmButton {
+    armed: bool,
+}
+
+impl Widget for RecordArmButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let size = ui.available_size();
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let painter = ui.painter_at(rect);
+        let center = rect.center();
+        // Inscribed circle: leave margin so stroke is not clipped by the widget rect.
+        let side = rect.width().min(rect.height());
+        let r_outer = (side * 0.5 - 2.0).max(1.0);
+        let r_dot = r_outer * 0.42;
+        let hovered = response.hovered() && ui.is_enabled();
+        let time = ui.ctx().input(|i| i.time) as f32;
+        let breath = if self.armed {
+            (time * 2.4_f32).sin() * 0.5 + 0.5
+        } else {
+            0.0
+        };
+
+        if self.armed {
+            let fill_lo = Color32::from_rgb(0x72, 0x14, 0x1c);
+            let fill_hi = Color32::from_rgb(0xe8, 0x22, 0x34);
+            let fill = lerp_color32(fill_lo, fill_hi, breath);
+            let ring_col = lerp_color32(
+                Color32::from_rgb(0xc0, 0x38, 0x48),
+                Color32::from_rgb(0xff, 0x78, 0x88),
+                breath,
+            );
+            let dot_lo = Color32::from_rgb(0x4a, 0x0a, 0x12);
+            let dot_hi = Color32::from_rgb(0xff, 0xa8, 0xb0);
+            let dot = lerp_color32(dot_lo, dot_hi, breath);
+            let ring = Stroke::new(1.0, ring_col);
+            painter.circle_filled(center, r_outer, fill);
+            painter.circle_stroke(center, r_outer, ring);
+            painter.circle_filled(center, r_dot, dot);
+        } else {
+            let fill = Color32::from_rgb(0x22, 0x18, 0x1a);
+            let ring_col = if hovered {
+                Color32::from_rgb(0x78, 0x5a, 0x60)
+            } else {
+                Color32::from_rgb(0x5c, 0x44, 0x4a)
+            };
+            let ring = Stroke::new(1.0, ring_col);
+            let dot = Color32::from_rgb(0x5a, 0x48, 0x4c);
+            painter.circle_filled(center, r_outer, fill);
+            painter.circle_stroke(center, r_outer, ring);
+            painter.circle_filled(center, r_dot, dot);
+        }
+
+        response
+    }
+}
+
+#[inline]
+fn lerp_color32(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t).round() as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
+        (a.a() as f32 + (b.a() as f32 - a.a() as f32) * t).round() as u8,
+    )
+}
+
+#[inline]
+fn format_runtime_hms(start: Option<Instant>) -> String {
+    let Some(t0) = start else {
+        return "00:00:00".to_string();
+    };
+    let elapsed = t0.elapsed();
+    let total_secs = elapsed.as_secs();
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// One-shot GL capability probe. We ask for 8× MSAA in `main.rs`, but the driver is
