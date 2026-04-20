@@ -663,7 +663,8 @@ impl eframe::App for AudioMeterApp {
                 });
             });
             ui.add_space(4.0);
-            ui.separator();
+            inset_horizontal_divider(ui);
+            ui.add_space(4.0);
 
             ui.horizontal_top(|ui| {
                 // Fixed width so Controls / Loudness / Clips never change the column width.
@@ -677,7 +678,7 @@ impl eframe::App for AudioMeterApp {
                     },
                 );
                 ui.add_space(6.0);
-                ui.separator();
+                inset_vertical_divider(ui);
                 ui.add_space(6.0);
                 self.meters_and_graph(ui, now);
             });
@@ -1083,7 +1084,8 @@ impl AudioMeterApp {
                             }
                         }
                     });
-                    ui.separator();
+                    ui.add_space(4.0);
+                    inset_horizontal_divider(ui);
                     ui.add_space(4.0);
 
                     let avail_h = ui.available_height();
@@ -2069,6 +2071,36 @@ fn left_panel_1px_band(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), Sense::hover());
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, color);
+}
+
+/// Two-tone inset horizontal divider: 1 px dark shadow stacked above a 1 px light highlight.
+/// Drawn inside a single 2 px rect so the two bands always sit flush (bypasses `item_spacing`).
+fn inset_horizontal_divider(ui: &mut egui::Ui) {
+    let w = ui.available_width().max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 2.0), Sense::hover());
+    let dark = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 1.0));
+    let light = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x, rect.min.y + 1.0),
+        egui::vec2(rect.width(), 1.0),
+    );
+    let p = ui.painter();
+    p.rect_filled(dark, CornerRadius::ZERO, LEFT_SECTION_DIVIDER_DARK);
+    p.rect_filled(light, CornerRadius::ZERO, LEFT_SECTION_INNER_HIGHLIGHT);
+}
+
+/// Two-tone inset vertical divider: 1 px dark shadow on the left, 1 px light highlight on the right.
+/// Fills the available height of the surrounding horizontal layout.
+fn inset_vertical_divider(ui: &mut egui::Ui) {
+    let h = ui.available_height().max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(2.0, h), Sense::hover());
+    let dark = egui::Rect::from_min_size(rect.min, egui::vec2(1.0, rect.height()));
+    let light = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + 1.0, rect.min.y),
+        egui::vec2(1.0, rect.height()),
+    );
+    let p = ui.painter();
+    p.rect_filled(dark, CornerRadius::ZERO, LEFT_SECTION_DIVIDER_DARK);
+    p.rect_filled(light, CornerRadius::ZERO, LEFT_SECTION_INNER_HIGHLIGHT);
 }
 
 /// Collapsible block: one rounded card (black stroke + fill) with stacked inset highlights.
