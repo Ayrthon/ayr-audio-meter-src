@@ -121,6 +121,11 @@ const DISPLAY_OFFSET_DB: f32 = -16.0;
 pub const MIN_WIDTH: f32 = 360.0;
 pub const MIN_HEIGHT: f32 = 260.0;
 
+/// Vertical plot insets — shared with [`crate::history_graph::show_history_graph`] so both
+/// right-panel views reserve the same top/bottom chrome and the plot area matches in height.
+pub const PLOT_TOP_PAD: f32 = 10.0;
+pub const PLOT_BOTTOM_PAD: f32 = 22.0;
+
 pub fn show_spectrum(
     ui: &mut Ui,
     analyzer: &mut SpectrumAnalyzer,
@@ -159,8 +164,8 @@ pub fn show_spectrum(
     // Inner plot area: compact left (freq labels below), right gutter for dB ticks like Pro-Q.
     let left_pad = 14.0;
     let right_pad = 18.0;
-    let top_pad = 10.0;
-    let bottom_pad = 22.0;
+    let top_pad = PLOT_TOP_PAD;
+    let bottom_pad = PLOT_BOTTOM_PAD;
     let plot = Rect::from_min_max(
         pos2(rect.left() + left_pad, rect.top() + top_pad),
         pos2(rect.right() - right_pad, rect.bottom() - bottom_pad),
@@ -616,14 +621,6 @@ pub fn show_spectrum(
             draw_hover_pill(&painter, line_x, pill_top, &label);
         }
     }
-
-    // Soft outer border tying it in with the rest of the UI.
-    painter.rect_stroke(
-        rect,
-        6.0,
-        Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3a, 0x40)),
-        egui::StrokeKind::Inside,
-    );
 
     // Top-right button stack: "Pretty" (toggle) above "Clear all" (action).
     // Both are plain `Button`s laid out via `scope_builder` so they share

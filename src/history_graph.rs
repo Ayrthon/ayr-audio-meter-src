@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind,
-    Ui, pos2,
+    Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2,
 };
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use parking_lot::RwLock;
@@ -19,9 +18,9 @@ use crate::clip_capture::{
 use crate::dsp::INF_FLOOR_DB;
 use crate::meter::{ColorPalette, MeterMode, MeterScale, MeterScaleKind, MIN_DB, config_for};
 use crate::meter_widget::{
-    BAR_TOP_PAD, COL_REFERENCE, COL_TEXT_DIM, meter_bar_bottom_pad_for_strip, paint_zone_backgrounds,
-    zone_styles, zone_tops_db,
+    COL_REFERENCE, COL_TEXT_DIM, paint_zone_backgrounds, zone_styles, zone_tops_db,
 };
+use crate::spectrum_view::{PLOT_BOTTOM_PAD, PLOT_TOP_PAD};
 
 const SAMPLES: usize = 600; // 30 s @ 20 Hz
 pub const SAMPLE_HZ: f32 = 20.0;
@@ -38,8 +37,10 @@ const HISTORY_TRACE_FILL_OPACITY_TOP: f32 = 0.80;
 
 /// Min scroll width (right-edge gutter is applied in `app.rs` around the whole column).
 const MIN_WIDTH: f32 = 360.0;
-/// `spectrum_view` “soft outer border” — ties the panel to the rest of the chrome.
-const PANEL_OUTER_STROKE: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
+/// Left inset for dB ruler numerals (wider than spectrum’s freq axis — different label geometry).
+const HISTORY_LEFT_PAD: f32 = 28.0;
+/// Match spectrum’s right gutter so plot width discipline is the same between panels.
+const HISTORY_RIGHT_PAD: f32 = 18.0;
 
 const CHANNEL_COLORS: [Color32; 8] = [
     Color32::from_rgb(0x4c, 0xaf, 0x50),
@@ -275,20 +276,18 @@ pub fn show_history_graph(
     let graph = shared.read();
     let mut desired = ui.available_size();
     desired.x = desired.x.max(MIN_WIDTH);
-    desired.y = desired.y.max(crate::meter_widget::METER_MIN_HEIGHT);
+    // Same sizing as `spectrum_view::show_spectrum`: use whatever height the right column
+    // gives (no extra minimum vs the spectrum analyzer).
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
 
     let cfg = config_for(mode);
     let scale = MeterScale::for_mode(mode);
 
-    let left_pad = 34.0;
-    // Right pad leaves room for the "now" label to sit fully inside
-    // the graph area (it's center-aligned on the rightmost time tick).
-    let right_pad = 34.0;
-    let top = rect.top() + BAR_TOP_PAD;
-    let bottom_pad = meter_bar_bottom_pad_for_strip(graph.channels);
-    let bottom = rect.bottom() - bottom_pad;
+    let left_pad = HISTORY_LEFT_PAD;
+    let right_pad = HISTORY_RIGHT_PAD;
+    let top = rect.top() + PLOT_TOP_PAD;
+    let bottom = rect.bottom() - PLOT_BOTTOM_PAD;
     let left = rect.left() + left_pad;
     let right = rect.right() - right_pad;
     let plot = Rect::from_min_max(pos2(left, top), pos2(right, bottom));
@@ -508,14 +507,6 @@ pub fn show_history_graph(
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
-
-    // Soft outer border — same role as `spectrum_view` (single frame, not a nested card).
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(6),
-        Stroke::new(1.0, PANEL_OUTER_STROKE),
-        StrokeKind::Inside,
-    );
 
     response
 }
