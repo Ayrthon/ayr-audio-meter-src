@@ -11,7 +11,8 @@ use eframe::egui;
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
     Align, Align2, CollapsingHeader, Color32, CornerRadius, CursorIcon, FontId, Frame, Label,
-    Layout, Margin, OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, Widget,
+    Layout, Margin, OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextureHandle,
+    TextureOptions, Widget,
 };
 use parking_lot::Mutex;
 
@@ -39,9 +40,9 @@ use crate::spectrum::{SharedSpectrum, SpectrumAnalyzer, make_shared_spectrum};
 use crate::spectrum_view::show_spectrum;
 use crate::weighting::{FreqWeighting, MeterScratch};
 
-/// Darkest corner of the brushed-metal background (matches `paint_metallic_background` RB).
-const BG: Color32 = Color32::from_rgb(0x0a, 0x0b, 0x10);
-const PANEL_BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1e);
+/// Darkest edge of the vignetted metal background (matches perimeter of `paint_metallic_background`).
+const BG: Color32 = Color32::from_rgb(0x08, 0x09, 0x0d);
+const PANEL_BG: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x25);
 const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
 pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
@@ -136,6 +137,8 @@ pub struct AudioMeterApp {
     metering_runtime_start: Option<Instant>,
     channels: usize,
     status: String,
+    /// Tiled fine grain for the main window backdrop (cool charcoal noise).
+    bg_noise: TextureHandle,
 }
 
 /// Target window widths for the two UI modes.  The app snaps to one
@@ -171,6 +174,11 @@ fn window_w_without_graph(channels: usize) -> f32 {
 impl AudioMeterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
+        let bg_noise = cc.egui_ctx.load_texture(
+            "am_metallic_noise",
+            build_metallic_noise_image(),
+            TextureOptions::LINEAR_REPEAT,
+        );
         log_gl_caps(cc);
         let devices = list_devices().unwrap_or_default();
 
@@ -242,6 +250,7 @@ impl AudioMeterApp {
             metering_runtime_start: None,
             channels: 2,
             status: "Idle".into(),
+            bg_noise,
         }
     }
 
@@ -540,7 +549,7 @@ impl AudioMeterApp {
 
 impl eframe::App for AudioMeterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        paint_metallic_background(&ui.painter(), ui.max_rect());
+        paint_metallic_background(&ui.painter(), ui.max_rect(), &self.bg_noise);
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.tick_meters();
@@ -1691,46 +1700,96 @@ fn log_gl_caps(cc: &eframe::CreationContext<'_>) {
     }
 }
 
-/// Brushed-steel backdrop: diagonal bilinear base plus a soft top sheen (replaces flat black).
-fn paint_metallic_background(painter: &egui::Painter, rect: egui::Rect) {
+/// Deterministic hash for procedural noise (no `rand` dependency).
+#[inline]
+fn hash_bg_noise_u8(x: u32, y: u32) -> u8 {
+    let mut h = x
+        .wrapping_mul(374761393)
+        .wrapping_add(y.wrapping_mul(668265263));
+    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
+    ((h ^ (h >> 16)) & 0xFF) as u8
+}
+
+/// Cool charcoal grain — tiled over the window for a sandblasted / anodized-metal feel.
+fn build_metallic_noise_image() -> egui::ColorImage {
+    const W: usize = 128;
+    const H: usize = 128;
+    let mut pixels = Vec::with_capacity(W * H);
+    for y in 0..H {
+        for x in 0..W {
+            let h = hash_bg_noise_u8(x as u32, y as u32);
+            let h2 = hash_bg_noise_u8(x as u32 / 3, y as u32 / 3);
+            let h3 = hash_bg_noise_u8(x as u32 / 11, y as u32 / 11);
+            let mut v = 0x2cu8
+                .saturating_add(h % 20)
+                .saturating_add(h2 % 12)
+                .saturating_add(h3 % 8);
+            v = v.min(0x58);
+            // Slight cool slate bias (pro audio UI reference).
+            let r = v.saturating_sub(5);
+            let g = v.saturating_sub(2);
+            let b = v.saturating_add(6);
+            pixels.push(Color32::from_rgb(r, g, b));
+        }
+    }
+    egui::ColorImage::new([W, H], pixels)
+}
+
+/// Pro-Q / hardware-style backdrop: radial-ish vignette (light pool upper-center), soft sheen,
+/// then tiled fine grain (reference: dark anodized panel + subtle noise).
+fn paint_metallic_background(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    noise: &TextureHandle,
+) {
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
-    // Simulated light from top-left: cool grey highlight → shadow toward bottom-right.
-    let lt = Color32::from_rgb(0x38, 0x3a, 0x44);
-    let rt = Color32::from_rgb(0x26, 0x28, 0x30);
-    let lb = Color32::from_rgb(0x14, 0x15, 0x1c);
-    let rb = Color32::from_rgb(0x0a, 0x0b, 0x10);
 
-    let mut base = Mesh::default();
-    base.vertices.push(Vertex {
-        pos: rect.left_top(),
-        uv: WHITE_UV,
-        color: lt,
-    });
-    base.vertices.push(Vertex {
-        pos: rect.right_top(),
-        uv: WHITE_UV,
-        color: rt,
-    });
-    base.vertices.push(Vertex {
-        pos: rect.right_bottom(),
-        uv: WHITE_UV,
-        color: rb,
-    });
-    base.vertices.push(Vertex {
-        pos: rect.left_bottom(),
-        uv: WHITE_UV,
-        color: lb,
-    });
-    base.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    painter.add(Shape::mesh(base));
+    let cx = rect.center().x;
+    let cy = rect.top() + rect.height() * 0.20;
+    let center = egui::pos2(cx, cy);
+    // Upper-center “key light” — cool slate, not a flat grey.
+    let c_col = Color32::from_rgb(0x32, 0x34, 0x3e);
+    let edge = Color32::from_rgb(0x0b, 0x0c, 0x11);
 
-    // Narrow specular wash (fades out ~upper third) so the top edge reads like rolled metal.
-    let h = rect.height() * 0.36;
+    let tl = rect.left_top();
+    let tm = egui::pos2(cx, rect.top());
+    let tr = rect.right_top();
+    let rm = egui::pos2(rect.right(), cy);
+    let br = rect.right_bottom();
+    let bm = egui::pos2(cx, rect.bottom());
+    let bl = rect.left_bottom();
+    let lm = egui::pos2(rect.left(), cy);
+
+    let ring = [tl, tm, tr, rm, br, bm, bl, lm];
+
+    let mut fan = Mesh::default();
+    fan.vertices.push(Vertex {
+        pos: center,
+        uv: WHITE_UV,
+        color: c_col,
+    });
+    for p in ring {
+        fan.vertices.push(Vertex {
+            pos: p,
+            uv: WHITE_UV,
+            color: edge,
+        });
+    }
+    for i in 0..8 {
+        let i0 = 0_u32;
+        let i1 = 1 + i as u32;
+        let i2 = 1 + ((i + 1) % 8) as u32;
+        fan.indices.extend_from_slice(&[i0, i1, i2]);
+    }
+    painter.add(Shape::mesh(fan));
+
+    // Soft horizontal highlight under the title bar (very subtle).
+    let h = rect.height() * 0.28;
     let y1 = rect.top() + h;
-    let sheen_tl = Color32::from_rgba_unmultiplied(0xc4, 0xc8, 0xd4, 0x22);
-    let sheen_tr = Color32::from_rgba_unmultiplied(0x8c, 0x90, 0x9c, 0x14);
+    let sheen_tl = Color32::from_rgba_unmultiplied(0xb8, 0xbc, 0xc8, 0x18);
+    let sheen_tr = Color32::from_rgba_unmultiplied(0x88, 0x8c, 0x98, 0x0e);
     let sheen_b = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
     let mut sheen = Mesh::default();
     sheen.vertices.push(Vertex {
@@ -1755,6 +1814,23 @@ fn paint_metallic_background(painter: &egui::Painter, rect: egui::Rect) {
     });
     sheen.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(Shape::mesh(sheen));
+
+    // Tiled grain — breaks banding and reads like matte metal.
+    let [tw, th] = noise.size();
+    let tw = tw.max(1) as f32;
+    let th = th.max(1) as f32;
+    let tiles_x = rect.width() / tw * 2.2;
+    let tiles_y = rect.height() / th * 2.2;
+    let uv = egui::Rect::from_min_max(
+        egui::pos2(0.0, 0.0),
+        egui::pos2(tiles_x, tiles_y),
+    );
+    painter.image(
+        noise.id(),
+        rect,
+        uv,
+        Color32::from_rgba_unmultiplied(0xd0, 0xd4, 0xdc, 0x24),
+    );
 }
 
 fn apply_theme(ctx: &egui::Context) {
