@@ -2039,9 +2039,12 @@ fn lufs_box(
 }
 
 /// Thin chevron on the right of each accordion header (open = points up, closed = points down).
-fn left_panel_chevron_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
+/// Paints the accordion chevron without its own click sense; the entire header bar handles the click.
+fn left_panel_chevron_paint(ui: &mut egui::Ui, openness: f32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
     let open = openness > 0.5;
-    let c = response.rect.center();
+    let c = rect.center();
     let s = 3.5;
     let stroke = Stroke::new(1.5, Color32::WHITE);
     let p = ui.painter();
@@ -2126,7 +2129,7 @@ fn left_panel_collapsing_with_default<R>(
                 // Inset highlight along the top of the card (inside the black stroke).
                 left_panel_1px_band(ui, LEFT_SECTION_INNER_HIGHLIGHT);
 
-                Frame::new()
+                let header_frame = Frame::new()
                     .fill(LEFT_SECTION_HEADER_BG)
                     .stroke(Stroke::NONE)
                     .corner_radius(CornerRadius::ZERO)
@@ -2144,10 +2147,23 @@ fn left_panel_collapsing_with_default<R>(
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.add_space(8.0);
-                                state.show_toggle_button(ui, left_panel_chevron_icon);
+                                let o = state.openness(ui.ctx());
+                                left_panel_chevron_paint(ui, o);
                             });
                         });
                     });
+                // Make the full header bar toggle the section (not just the chevron).
+                let header_click = ui.interact(
+                    header_frame.response.rect,
+                    id.with("header_click"),
+                    Sense::click(),
+                );
+                if header_click.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if header_click.clicked() {
+                    state.toggle(ui);
+                }
 
                 if show_divider {
                     // Stacked band: dark line, then light highlight (reference “inset” divider).
