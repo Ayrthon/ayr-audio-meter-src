@@ -190,6 +190,27 @@ pub fn show_history_graph(
     let tops = zone_tops_db(&cfg);
     paint_zone_backgrounds(&painter, left, right - left, top, bottom, &tops, &styles, &scale);
 
+    // Faded band above the clip trigger line (louder region): fills the visual gap vs zones below.
+    let clip_thr_db = clip_settings.threshold_db();
+    if clip_thr_db.is_finite() {
+        let y_thr = scale
+            .dbfs_to_y(clip_thr_db, top, bottom)
+            .clamp(top, bottom);
+        // ~75% opacity (0xBF / 255) — strong “above threshold” band, still shows grid/trace.
+        let fill = if clip_settings.enabled() {
+            Color32::from_rgba_unmultiplied(0x72, 0x18, 0x22, 0xbf)
+        } else {
+            Color32::from_rgba_unmultiplied(0x38, 0x3a, 0x40, 0xbf)
+        };
+        if y_thr > top + 0.5 {
+            painter.rect_filled(
+                Rect::from_min_max(pos2(left, top), pos2(right, y_thr)),
+                0.0,
+                fill,
+            );
+        }
+    }
+
     // Vertical grid (same mapping as the level meters for this mode).
     for &disp in scale.tick_display_values() {
         if disp > scale.disp_max || disp < scale.disp_min {

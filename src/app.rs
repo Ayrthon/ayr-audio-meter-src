@@ -610,7 +610,7 @@ impl eframe::App for AudioMeterApp {
             ui.separator();
 
             ui.horizontal_top(|ui| {
-                self.left_controls(ui, now);
+                self.left_controls(ui);
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -756,7 +756,7 @@ impl AudioMeterApp {
         });
     }
 
-    fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, now: f64, width: f32) {
+    fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, width: f32) {
         left_panel_collapsing(ui, "left_tab_ctrl_audio", "AUDIO SOURCE", |ui| {
             ui.add_space(4.0);
             self.device_dropdown(ui, "device_combo", width);
@@ -785,158 +785,12 @@ impl AudioMeterApp {
 
             ui.add_space(8.0);
 
-            let playing = self.engine.is_some();
-            let btn_size = egui::vec2(width, 36.0);
-            if playing {
-                if breathing_stop_button(ui, now, btn_size).clicked() {
-                    self.stop_stream();
-                }
-            } else if start_meter_button(ui, btn_size).clicked() {
-                self.start_or_restart();
-            }
-
-            ui.add_space(5.0);
             if ui
                 .add_sized([width, 24.0], egui::Button::new("↻  Refresh devices"))
                 .clicked()
             {
                 self.refresh_devices();
             }
-        });
-
-        ui.add_space(6.0);
-
-        let clip_detail_short = format!(
-            "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Use the Clips tab for the list, waveform, and folder.",
-            crate::clip_capture::PRE_ROLL_SECS,
-            crate::clip_capture::POST_ROLL_SECS
-        );
-
-        left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", |ui| {
-            ui.add_space(4.0);
-            Frame::new()
-                .fill(Color32::from_rgb(0x11, 0x12, 0x18))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x34, 0x36, 0x44)))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(width);
-                    let rec_on = self.clip_settings.enabled();
-                    let arm_h = 32.0_f32;
-                    let arm_resp = arm_record_trigger_button(
-                        ui,
-                        now,
-                        rec_on,
-                        egui::vec2(width, arm_h),
-                    );
-                    if arm_resp.clicked() {
-                        let new_on = !rec_on;
-                        self.clip_settings.set_enabled(new_on);
-                        if new_on {
-                            self.clip_session_baseline =
-                                self.clip_status.lock().total_clips_saved;
-                        }
-                    }
-                    arm_resp.on_hover_text(&clip_detail_short);
-
-                    ui.add_space(5.0);
-
-                    let mut thr = self.clip_settings.threshold_db();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("Threshold")
-                                .size(11.5)
-                                .color(TITLE_COL)
-                                .strong(),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{thr:.1} dBFS"))
-                                    .size(12.5)
-                                    .color(ACCENT)
-                                    .strong(),
-                            );
-                        });
-                    });
-                    ui.add_space(3.0);
-
-                    let slider_w = ui.available_width();
-                    let prev_slider_w = ui.style().spacing.slider_width;
-                    ui.style_mut().spacing.slider_width = slider_w;
-                    let rail_h = 18.0_f32;
-                    let slider_resp = ui.add_sized(
-                        egui::vec2(slider_w, rail_h),
-                        egui::Slider::new(
-                            &mut thr,
-                            crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
-                                ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
-                        )
-                            .fixed_decimals(1)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    ui.style_mut().spacing.slider_width = prev_slider_w;
-                    if slider_resp.changed() {
-                        self.clip_settings.set_threshold_db(thr);
-                    }
-
-                    ui.add_space(6.0);
-                    let lib = ui
-                        .add_sized(
-                            egui::vec2(width, 26.0),
-                            egui::Button::new(if self.left_tab == LeftPanelTab::Clips {
-                                "Clips library (open)…"
-                            } else {
-                                "Clips library…"
-                            }),
-                        )
-                        .on_hover_text(
-                            "List, preview, folder, delete — Space plays/pauses the waveform",
-                        );
-                    if lib.clicked() {
-                        self.left_tab = LeftPanelTab::Clips;
-                    }
-
-                    {
-                        let st = self.clip_status.lock();
-                        let armed_now = self.clip_settings.enabled();
-                        if armed_now {
-                            let n = st
-                                .total_clips_saved
-                                .saturating_sub(self.clip_session_baseline);
-                            let (counter_text, counter_color) = if n == 0 {
-                                (
-                                    "Clips saved this arm: 0".into(),
-                                    Color32::from_gray(130),
-                                )
-                            } else {
-                                (format!("Clips saved this arm: {n}"), ACCENT)
-                            };
-                            ui.add_space(5.0);
-                            ui.label(
-                                RichText::new(counter_text)
-                                    .size(10.5)
-                                    .strong()
-                                    .color(counter_color),
-                            );
-                        }
-                        if let Some(ref e) = st.last_error {
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new(format!("Error: {e}"))
-                                    .color(Color32::from_rgb(200, 100, 100))
-                                    .size(9.5),
-                            );
-                        }
-                    }
-                });
-        });
-
-        ui.add_space(6.0);
-
-        left_panel_collapsing(ui, "left_tab_ctrl_right_panel", "RIGHT PANEL", |ui| {
-            ui.add_space(4.0);
-            graph_panel_checkboxes(ui, &mut self.panel);
         });
 
         ui.add_space(6.0);
@@ -1018,9 +872,119 @@ impl AudioMeterApp {
             );
             self.weighting_atomic.store(w as u8, Ordering::Relaxed);
         });
+
+        ui.add_space(6.0);
+
+        let clip_detail_short = format!(
+            "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Use the Clips tab for the list, waveform, and folder.",
+            crate::clip_capture::PRE_ROLL_SECS,
+            crate::clip_capture::POST_ROLL_SECS
+        );
+
+        left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", |ui| {
+            ui.add_space(4.0);
+            Frame::new()
+                .fill(Color32::from_rgb(0x11, 0x12, 0x18))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x34, 0x36, 0x44)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(width);
+
+                    let mut thr = self.clip_settings.threshold_db();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Threshold")
+                                .size(11.5)
+                                .color(TITLE_COL)
+                                .strong(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{thr:.1} dBFS"))
+                                    .size(12.5)
+                                    .color(ACCENT)
+                                    .strong(),
+                            );
+                        });
+                    });
+                    ui.add_space(3.0);
+
+                    let slider_w = ui.available_width();
+                    let prev_slider_w = ui.style().spacing.slider_width;
+                    ui.style_mut().spacing.slider_width = slider_w;
+                    let rail_h = 18.0_f32;
+                    let slider_resp = ui.add_sized(
+                        egui::vec2(slider_w, rail_h),
+                        egui::Slider::new(
+                            &mut thr,
+                            crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
+                                ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
+                        )
+                            .fixed_decimals(1)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    ui.style_mut().spacing.slider_width = prev_slider_w;
+                    if slider_resp.changed() {
+                        self.clip_settings.set_threshold_db(thr);
+                    }
+                    slider_resp.on_hover_text(&clip_detail_short);
+
+                    ui.add_space(6.0);
+                    let lib = ui
+                        .add_sized(
+                            egui::vec2(width, 26.0),
+                            egui::Button::new(if self.left_tab == LeftPanelTab::Clips {
+                                "Clips library (open)…"
+                            } else {
+                                "Clips library…"
+                            }),
+                        )
+                        .on_hover_text(
+                            "List, preview, folder, delete — Space plays/pauses the waveform",
+                        );
+                    if lib.clicked() {
+                        self.left_tab = LeftPanelTab::Clips;
+                    }
+
+                    {
+                        let st = self.clip_status.lock();
+                        let armed_now = self.clip_settings.enabled();
+                        if armed_now {
+                            let n = st
+                                .total_clips_saved
+                                .saturating_sub(self.clip_session_baseline);
+                            let (counter_text, counter_color) = if n == 0 {
+                                (
+                                    "Clips saved this arm: 0".into(),
+                                    Color32::from_gray(130),
+                                )
+                            } else {
+                                (format!("Clips saved this arm: {n}"), ACCENT)
+                            };
+                            ui.add_space(5.0);
+                            ui.label(
+                                RichText::new(counter_text)
+                                    .size(10.5)
+                                    .strong()
+                                    .color(counter_color),
+                            );
+                        }
+                        if let Some(ref e) = st.last_error {
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(format!("Error: {e}"))
+                                    .color(Color32::from_rgb(200, 100, 100))
+                                    .size(9.5),
+                            );
+                        }
+                    }
+                });
+        });
     }
 
-    fn left_controls(&mut self, ui: &mut egui::Ui, now: f64) {
+    fn left_controls(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(PANEL_BG)
             .inner_margin(egui::Margin::symmetric(10, 10))
@@ -1059,7 +1023,7 @@ impl AudioMeterApp {
                                     (ui.available_width() - 20.0).clamp(228.0, 310.0);
                                 match self.left_tab {
                                     LeftPanelTab::Controls => {
-                                        self.left_controls_controls_tab(ui, now, width);
+                                        self.left_controls_controls_tab(ui, width);
                                     }
                                     LeftPanelTab::Loudness => {
                                         left_panel_collapsing(
@@ -1161,15 +1125,6 @@ impl AudioMeterApp {
 
         if metering_active {
             combo_resp.on_hover_text("Stop metering to change the audio source.");
-        }
-    }
-
-    fn start_or_restart(&mut self) {
-        if self.engine.is_some() {
-            self.stop_stream();
-        }
-        if let Err(err) = self.start_stream() {
-            self.status = format!("Error: {err}");
         }
     }
 
@@ -1360,8 +1315,11 @@ impl AudioMeterApp {
             .show(ui, |ui| {
                 ui.set_width(full_w);
                 ui.set_min_height(BAR_H);
-                // ~30fps while transport/record pulse animations run; clock still smooth enough.
-                if self.engine.is_some() || self.clip_settings.enabled() {
+                // Transport/record pulse ~30fps; runtime clock with ms uses ~60fps when metering.
+                if self.metering_runtime_start.is_some() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                } else if self.engine.is_some() || self.clip_settings.enabled() {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(33));
                 }
@@ -1482,7 +1440,7 @@ impl AudioMeterApp {
                                         RichText::new(format_runtime_hms(
                                             self.metering_runtime_start,
                                         ))
-                                        .size(14.0)
+                                        .size(12.5)
                                         .family(egui::FontFamily::Monospace)
                                         .color(TITLE_COL)
                                         .strong(),
@@ -1689,14 +1647,16 @@ fn lerp_color32(a: Color32, b: Color32, t: f32) -> Color32 {
 #[inline]
 fn format_runtime_hms(start: Option<Instant>) -> String {
     let Some(t0) = start else {
-        return "00:00:00".to_string();
+        return "00:00:00.00".to_string();
     };
     let elapsed = t0.elapsed();
     let total_secs = elapsed.as_secs();
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+    // Two-digit centiseconds (0–99), not three-digit milliseconds.
+    let cs = (elapsed.subsec_millis() / 10).min(99);
+    format!("{h:02}:{m:02}:{s:02}.{cs:02}")
 }
 
 /// One-shot GL capability probe. We ask for 8× MSAA in `main.rs`, but the driver is
@@ -1851,127 +1811,6 @@ fn left_panel_collapsing<R>(
     .show(ui, add_contents)
 }
 
-/// Right-hand graph / spectrum panel — one of three mutually exclusive views.
-fn graph_panel_checkboxes(ui: &mut egui::Ui, panel: &mut GraphView) {
-    let mut hidden = *panel == GraphView::Off;
-    if ui.checkbox(&mut hidden, "Hidden").changed() {
-        if hidden {
-            *panel = GraphView::Off;
-        } else if *panel == GraphView::Off {
-            *panel = GraphView::History;
-        }
-    }
-
-    let mut hist = *panel == GraphView::History;
-    if ui.checkbox(&mut hist, "Level history").changed() {
-        if hist {
-            *panel = GraphView::History;
-        } else if *panel == GraphView::History {
-            *panel = GraphView::Off;
-        }
-    }
-
-    let mut spec = *panel == GraphView::Spectrum;
-    if ui.checkbox(&mut spec, "Spectrum analyzer").changed() {
-        if spec {
-            *panel = GraphView::Spectrum;
-        } else if *panel == GraphView::Spectrum {
-            *panel = GraphView::Off;
-        }
-    }
-}
-
-fn start_meter_button(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
-    let text = RichText::new("▶  Start meter")
-        .size(14.0)
-        .color(Color32::from_rgb(0xe6, 0xf5, 0xe6))
-        .strong();
-    let btn = egui::Button::new(text)
-        .fill(Color32::from_rgb(0x2a, 0x6a, 0x36))
-        .stroke(egui::Stroke::new(
-            1.0,
-            Color32::from_rgb(0x4c, 0xaf, 0x50),
-        ))
-        .min_size(size);
-    ui.add(btn)
-}
-
-/// Toggle for clip capture: muted red when disarmed, breathing red glow when armed
-/// (same pulse feel as the stop meter button).
-fn arm_record_trigger_button(
-    ui: &mut egui::Ui,
-    now: f64,
-    armed: bool,
-    size: egui::Vec2,
-) -> egui::Response {
-    if armed {
-        let t = now as f32;
-        let s = 0.5 + 0.5 * (t * std::f32::consts::TAU * 0.9).sin();
-
-        let base = Color32::from_rgb(0x5a, 0x1c, 0x20);
-        let peak = Color32::from_rgb(0xd0, 0x38, 0x40);
-        let fill = lerp_color(base, peak, s);
-
-        let stroke_base = Color32::from_rgb(0xe0, 0x58, 0x60);
-        let stroke_peak = Color32::from_rgb(0xff, 0x98, 0xa0);
-        let stroke_col = lerp_color(stroke_base, stroke_peak, s);
-
-        let text = RichText::new("●  Arm Record Trigger")
-            .size(13.0)
-            .color(Color32::from_rgb(0xff, 0xf4, 0xf4))
-            .strong();
-        let btn = egui::Button::new(text)
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.5, stroke_col))
-            .min_size(size);
-
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(16));
-        ui.add(btn)
-    } else {
-        let text = RichText::new("○  Arm Record Trigger")
-            .size(13.0)
-            .color(Color32::from_rgb(0xee, 0xcc, 0xd0))
-            .strong();
-        let btn = egui::Button::new(text)
-            .fill(Color32::from_rgb(0x34, 0x1a, 0x1e))
-            .stroke(egui::Stroke::new(
-                1.0,
-                Color32::from_rgb(0x72, 0x3c, 0x42),
-            ))
-            .min_size(size);
-        ui.add(btn)
-    }
-}
-
-fn breathing_stop_button(ui: &mut egui::Ui, now: f64, size: egui::Vec2) -> egui::Response {
-    // Gentle ~0.9 Hz sine pulse — similar feel to a recording / live light.
-    let t = now as f32;
-    let s = 0.5 + 0.5 * (t * std::f32::consts::TAU * 0.9).sin();
-
-    let base = Color32::from_rgb(0x58, 0x18, 0x18);
-    let peak = Color32::from_rgb(0xc0, 0x2f, 0x2f);
-    let fill = lerp_color(base, peak, s);
-
-    let stroke_base = Color32::from_rgb(0xd8, 0x58, 0x58);
-    let stroke_peak = Color32::from_rgb(0xff, 0x8a, 0x8a);
-    let stroke_col = lerp_color(stroke_base, stroke_peak, s);
-
-    let text = RichText::new("■  Stop meter")
-        .size(14.0)
-        .color(Color32::from_rgb(0xff, 0xee, 0xee))
-        .strong();
-    let btn = egui::Button::new(text)
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.5, stroke_col))
-        .min_size(size);
-
-    // Keep the animation smooth while the meter is running.
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(16));
-    ui.add(btn)
-}
-
 fn draw_badge(ui: &mut egui::Ui, label: &str, bg: Color32) {
     let text = RichText::new(label)
         .size(9.5)
@@ -1985,12 +1824,3 @@ fn draw_badge(ui: &mut egui::Ui, label: &str, bg: Color32) {
     ui.add(btn);
 }
 
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |x: u8, y: u8| -> u8 {
-        (x as f32 + (y as f32 - x as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
-}
