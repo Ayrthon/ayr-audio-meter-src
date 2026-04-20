@@ -8,8 +8,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use eframe::egui;
 use egui::{
-    Align, CollapsingHeader, Color32, CornerRadius, CursorIcon, Frame, Label, Layout, Margin,
-    OpenUrl, RichText, ScrollArea, Sense, Stroke, ViewportBuilder, ViewportId,
+    Align, CollapsingHeader, Color32, CornerRadius, CursorIcon, Frame, Galley, Layout, Margin,
+    OpenUrl, RichText, ScrollArea, Sense, Stroke, TextStyle, TextWrapMode, ViewportBuilder,
+    ViewportId, WidgetText, pos2,
 };
 use parking_lot::Mutex;
 
@@ -41,6 +42,7 @@ const BG: Color32 = Color32::from_rgb(0x0c, 0x0c, 0x10);
 const PANEL_BG: Color32 = Color32::from_rgb(0x15, 0x15, 0x1b);
 const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
 pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
+pub(crate) const TEXT_MUTED: Color32 = Color32::from_rgb(0xb0, 0xbe, 0xc5);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
 const AYRTHON_URL: &str = "https://ayrthon.com";
 
@@ -48,6 +50,13 @@ const AYRTHON_URL: &str = "https://ayrthon.com";
 #[inline]
 fn audio_meter_build_label() -> &'static str {
     option_env!("AUDIO_METER_BUILD").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// Y of the first glyph baseline in galley coordinates (align mixed font sizes on one line).
+fn galley_first_baseline_y(galley: &Galley) -> Option<f32> {
+    let placed = galley.rows.first()?;
+    let g = placed.row.glyphs.first()?;
+    Some(placed.pos.y + g.pos.y)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,70 +547,124 @@ impl eframe::App for AudioMeterApp {
         self.maybe_resize_for_graph(&ctx);
 
         ui.vertical(|ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                // Do not nest `ui.horizontal` for the title: each `horizontal()` allocates the
-                // full row width, so an inner horizontal would eat all space and the credits
-                // `with_layout` below would get zero width (invisible in release builds).
-                ui.add_space(14.0);
-                ui.label(
-                    RichText::new("Audio Meter")
-                        .color(TITLE_COL)
-                        .size(18.0)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "real-time dBFS metering{}",
-                        FreqWeighting::from_u8(self.weighting_atomic.load(Ordering::Relaxed))
-                            .short_suffix()
-                    ))
-                    .color(Color32::from_gray(120))
-                    .size(11.0),
-                );
+            ui.add_space(10.0);
+            // `Label` paints at the top of the row rect; mixed font sizes need manual galleys and
+            // baseline alignment.
+            const TOP_TITLE_BAR_H: f32 = 68.0;
+            let title_bar_w = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(title_bar_w, TOP_TITLE_BAR_H),
+                Layout::left_to_right(Align::Min),
+                |ui| {
+                    let rect = ui.max_rect();
+                    let painter = ui.painter_at(rect);
+                    let left_pad = 18.0;
+                    let mid_gap = 18.0;
+                    let right_pad = 18.0;
 
-                // Right-align credits. In `right_to_left`, the first child is at the far right, so
-                // add chunks as: margin, ` - Build (…)`, `Ayrthon`, `Created by ` → reads LTR as
-                // `Created by Ayrthon - Build (…)`.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(14.0);
-                    ui.label(
-                        RichText::new(format!(
-                            " - Build ({})",
-                            audio_meter_build_label()
-                        ))
-                        .color(Color32::from_gray(130))
-                        .size(11.0),
+                    let title_rt = RichText::new("AYR Audio Meter")
+                        .color(TITLE_COL)
+                        .size(19.0)
+                        .strong()
+                        .extra_letter_spacing(0.8);
+                    let title_galley = WidgetText::from(title_rt).into_galley(
+                        ui,
+                        Some(TextWrapMode::Extend),
+                        f32::INFINITY,
+                        TextStyle::Body,
                     );
-                    let ayrthon = ui.add(
-                        Label::new(
-                            RichText::new("Ayrthon")
-                                .color(Color32::WHITE)
-                                .size(11.0),
-                        )
-                        .sense(Sense::click()),
+                    let mut x = rect.left() + left_pad;
+                    let title_w = title_galley.size().x;
+                    let title_y = rect.center().y
+                        - galley_first_baseline_y(title_galley.as_ref())
+                            .unwrap_or(title_galley.rect.center().y);
+                    painter.galley(pos2(x, title_y), title_galley, TITLE_COL);
+                    x += title_w + mid_gap;
+
+                    let sub_rt = RichText::new("Real-Time DBFS metering")
+                        .color(TEXT_MUTED)
+                        .size(11.0);
+                    let sub_galley = WidgetText::from(sub_rt).into_galley(
+                        ui,
+                        Some(TextWrapMode::Extend),
+                        f32::INFINITY,
+                        TextStyle::Body,
                     );
-                    if ayrthon.hovered() {
+                    let sub_y = rect.center().y
+                        - galley_first_baseline_y(sub_galley.as_ref())
+                            .unwrap_or(sub_galley.rect.center().y);
+                    painter.galley(pos2(x, sub_y), sub_galley, TEXT_MUTED);
+
+                    let created_rt = RichText::new("Created by ").color(TEXT_MUTED).size(11.0);
+                    let ayr_rt = RichText::new("Ayrthon").color(TITLE_COL).size(11.0);
+                    let build_rt =
+                        RichText::new(format!(" - Build ({})", audio_meter_build_label()))
+                            .color(TEXT_MUTED)
+                            .size(11.0);
+
+                    let created_g = WidgetText::from(created_rt).into_galley(
+                        ui,
+                        Some(TextWrapMode::Extend),
+                        f32::INFINITY,
+                        TextStyle::Body,
+                    );
+                    let ayr_g = WidgetText::from(ayr_rt).into_galley(
+                        ui,
+                        Some(TextWrapMode::Extend),
+                        f32::INFINITY,
+                        TextStyle::Body,
+                    );
+                    let build_g = WidgetText::from(build_rt).into_galley(
+                        ui,
+                        Some(TextWrapMode::Extend),
+                        f32::INFINITY,
+                        TextStyle::Body,
+                    );
+
+                    let created_w = created_g.size().x;
+                    let ayr_w = ayr_g.size().x;
+                    let build_w = build_g.size().x;
+                    let credits_total_w = created_w + ayr_w + build_w;
+                    let mut cx = rect.right() - right_pad - credits_total_w;
+
+                    let c_y = rect.center().y
+                        - galley_first_baseline_y(created_g.as_ref())
+                            .unwrap_or(created_g.rect.center().y);
+                    painter.galley(pos2(cx, c_y), created_g, TEXT_MUTED);
+                    cx += created_w;
+
+                    let ayr_y = rect.center().y
+                        - galley_first_baseline_y(ayr_g.as_ref()).unwrap_or(ayr_g.rect.center().y);
+                    let ayr_pos = pos2(cx, ayr_y);
+                    painter.galley(ayr_pos, ayr_g.clone(), TITLE_COL);
+                    let ayr_rect = ayr_g.rect.translate(ayr_pos.to_vec2());
+                    let ayr_resp = ui.interact(
+                        ayr_rect,
+                        ui.make_persistent_id("topbar_ayrthon_link"),
+                        Sense::click(),
+                    );
+                    if ayr_resp.hovered() {
                         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                     }
-                    if ayrthon.clicked() {
+                    if ayr_resp.clicked() {
                         ui.ctx().open_url(OpenUrl::new_tab(AYRTHON_URL));
                     }
-                    ui.label(
-                        RichText::new("Created by ")
-                            .color(Color32::from_gray(130))
-                            .size(11.0),
-                    );
-                });
-            });
-            ui.add_space(4.0);
+                    cx += ayr_w;
+
+                    let b_y = rect.center().y
+                        - galley_first_baseline_y(build_g.as_ref())
+                            .unwrap_or(build_g.rect.center().y);
+                    painter.galley(pos2(cx, b_y), build_g, TEXT_MUTED);
+                },
+            );
+            ui.add_space(8.0);
             ui.separator();
 
             ui.horizontal_top(|ui| {
                 self.left_controls(ui, now);
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 self.meters_and_graph(ui, now);
             });
 

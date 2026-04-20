@@ -52,7 +52,7 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1140.0, 640.0])
         .with_min_inner_size(min_inner)
-        .with_title("Audio Meter")
+        .with_title("AYR Audio Meter")
         .with_decorations(true)
         .with_resizable(true);
     if let Some(icon) = app_icon() {
@@ -84,7 +84,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Audio Meter",
+        "AYR Audio Meter",
         native_options,
         Box::new(|cc| Ok(Box::new(app::AudioMeterApp::new(cc)))),
     )
