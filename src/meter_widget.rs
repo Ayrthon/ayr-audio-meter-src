@@ -12,11 +12,11 @@ pub const CLIP_DB: f32 = 0.0;
 
 pub const COL_BG: Color32 = Color32::from_rgb(0x14, 0x14, 0x18);
 /// dB ruler numerals (left / right of the bar).
-pub const COL_RULER_TEXT: Color32 = Color32::from_rgb(0xca, 0xca, 0xcd);
+pub const COL_RULER_TEXT: Color32 = Color32::from_rgb(0xa3, 0xa3, 0xa7);
 pub const COL_TRACK: Color32 = Color32::from_rgb(0x0f, 0x0f, 0x12);
 pub const COL_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x42);
 pub const COL_TICK: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x78);
-/// Legacy name — meter ruler ticks use [`COL_RULER_TEXT`] (`#cacacd`).
+/// Legacy name — meter ruler ticks use [`COL_RULER_TEXT`] (`#a3a3a7`).
 pub const COL_TICK_MAJOR: Color32 = COL_RULER_TEXT;
 pub const COL_TEXT: Color32 = Color32::from_rgb(0xe6, 0xe6, 0xee);
 pub const COL_TEXT_DIM: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x94);
@@ -488,7 +488,7 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     );
 
     // --- scale ticks + labels ---------------------------------
-    // Tick marks extend outward from the bar (longer than before); same #cacacd as numerals.
+    // Tick marks extend outward from the bar (longer than before); same #a3a3a7 as numerals.
     const RULER_TICK_INSET: f32 = 1.0;
     const RULER_TICK_OUTER: f32 = 8.0;
     for &disp in scale.tick_display_values() {

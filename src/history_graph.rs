@@ -18,7 +18,7 @@ use crate::clip_capture::{
 use crate::dsp::INF_FLOOR_DB;
 use crate::meter::{ColorPalette, MeterMode, MeterScale, MeterScaleKind, MIN_DB, config_for};
 use crate::meter_widget::{
-    COL_REFERENCE, COL_TEXT_DIM, paint_zone_backgrounds, zone_styles, zone_tops_db,
+    COL_REFERENCE, COL_RULER_TEXT, FONT_TICK, paint_zone_backgrounds, zone_styles, zone_tops_db,
 };
 use crate::spectrum_view::{PLOT_BOTTOM_PAD, PLOT_TOP_PAD};
 
@@ -395,8 +395,8 @@ pub fn show_history_graph(
             pos2(left - 4.0, y),
             egui::Align2::RIGHT_CENTER,
             txt,
-            FontId::proportional(10.5),
-            COL_TEXT_DIM,
+            FontId::proportional(FONT_TICK),
+            COL_RULER_TEXT,
         );
     }
 
@@ -413,8 +413,8 @@ pub fn show_history_graph(
             pos2(x, bottom + 2.0),
             egui::Align2::CENTER_TOP,
             label,
-            FontId::proportional(10.5),
-            COL_TEXT_DIM,
+            FontId::proportional(FONT_TICK),
+            COL_RULER_TEXT,
         );
     }
 
