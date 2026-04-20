@@ -32,6 +32,10 @@ const WINDOW_SECS: f32 = SAMPLES as f32 / SAMPLE_HZ;
 /// Red overlay on the history plot when clip capture triggers.
 const TRIGGER_FLASH_DURATION: Duration = Duration::from_millis(520);
 
+/// Vertical opacity of the fill under each history trace (plot bottom → top).
+const HISTORY_TRACE_FILL_OPACITY_BOTTOM: f32 = 0.20;
+const HISTORY_TRACE_FILL_OPACITY_TOP: f32 = 0.80;
+
 /// Min scroll width (right-edge gutter is applied in `app.rs` around the whole column).
 const MIN_WIDTH: f32 = 360.0;
 /// `spectrum_view` “soft outer border” — ties the panel to the rest of the chrome.
@@ -157,6 +161,109 @@ fn draw_dotted_h(
     }
 }
 
+#[inline]
+fn history_trace_fill_color_at_y(base: Color32, y: f32, top: f32, bottom: f32) -> Color32 {
+    let y = y.clamp(top, bottom);
+    let h = bottom - top;
+    let t = if h.abs() < 1e-6 {
+        0.0
+    } else {
+        ((y - bottom) / (top - bottom)).clamp(0.0, 1.0)
+    };
+    let a = HISTORY_TRACE_FILL_OPACITY_BOTTOM
+        + (HISTORY_TRACE_FILL_OPACITY_TOP - HISTORY_TRACE_FILL_OPACITY_BOTTOM) * t;
+    let alpha = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha)
+}
+
+/// Fills the region from each trace segment down to `bottom` with a vertical opacity gradient.
+fn paint_history_trace_fill_under(
+    painter: &egui::Painter,
+    pts: &[Pos2],
+    base_color: Color32,
+    top: f32,
+    bottom: f32,
+) {
+    if pts.len() < 2 {
+        return;
+    }
+    let mut mesh = Mesh::default();
+    for i in 0..pts.len() - 1 {
+        let p0 = pts[i];
+        let p1 = pts[i + 1];
+        let b0 = pos2(p0.x, bottom);
+        let b1 = pos2(p1.x, bottom);
+        let v0 = mesh.vertices.len() as u32;
+        mesh.vertices.push(Vertex {
+            pos: p0,
+            uv: WHITE_UV,
+            color: history_trace_fill_color_at_y(base_color, p0.y, top, bottom),
+        });
+        mesh.vertices.push(Vertex {
+            pos: p1,
+            uv: WHITE_UV,
+            color: history_trace_fill_color_at_y(base_color, p1.y, top, bottom),
+        });
+        mesh.vertices.push(Vertex {
+            pos: b1,
+            uv: WHITE_UV,
+            color: history_trace_fill_color_at_y(base_color, bottom, top, bottom),
+        });
+        mesh.vertices.push(Vertex {
+            pos: b0,
+            uv: WHITE_UV,
+            color: history_trace_fill_color_at_y(base_color, bottom, top, bottom),
+        });
+        mesh.indices.extend_from_slice(&[v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3]);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+fn trace_points_for_channel(
+    ordered: &[[f32; crate::audio::MAX_CHANNELS]],
+    ch: usize,
+    graph_channels: usize,
+    scale: &MeterScale,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+) -> Option<(Vec<Pos2>, Color32)> {
+    if ch >= graph_channels {
+        return None;
+    }
+    let samples = ordered.len();
+    let color = CHANNEL_COLORS[ch % CHANNEL_COLORS.len()];
+    let dx = (right - left) / (SAMPLES - 1) as f32;
+    let mut raw = Vec::with_capacity(samples);
+    for row in ordered {
+        raw.push(row[ch]);
+    }
+    let first_valid = raw
+        .iter()
+        .position(|&v| v > INF_FLOOR_DB + 0.5)
+        .unwrap_or(samples);
+    if first_valid >= samples {
+        return None;
+    }
+    let smoothed = smooth_with_edge_pad(&raw[first_valid..], SMOOTH_WIN);
+    let mut pts: Vec<Pos2> = Vec::with_capacity(smoothed.len());
+    for (k, v) in smoothed.iter().enumerate() {
+        let ordered_idx = first_valid + k;
+        let age = (samples - 1).saturating_sub(ordered_idx) as f32;
+        let x = right - age * dx;
+        if x < left - 0.5 {
+            continue;
+        }
+        let y = scale.dbfs_to_y(*v, top, bottom);
+        pts.push(pos2(x, y));
+    }
+    if pts.len() < 2 {
+        return None;
+    }
+    Some((pts, color))
+}
+
 pub fn show_history_graph(
     ui: &mut Ui,
     shared: &SharedHistory,
@@ -186,6 +293,27 @@ pub fn show_history_graph(
     let left = rect.left() + left_pad;
     let right = rect.right() - right_pad;
     let plot = Rect::from_min_max(pos2(left, top), pos2(right, bottom));
+
+    let traces: Vec<Option<(Vec<Pos2>, Color32)>> = if graph.channels > 0 && graph.filled > 1 {
+        let ordered = graph.ordered();
+        let mut traces: Vec<Option<(Vec<Pos2>, Color32)>> =
+            (0..graph.channels).map(|_| None).collect();
+        for ch in 0..graph.channels {
+            traces[ch] = trace_points_for_channel(
+                &ordered,
+                ch,
+                graph.channels,
+                &scale,
+                left,
+                right,
+                top,
+                bottom,
+            );
+        }
+        traces
+    } else {
+        Vec::new()
+    };
 
     let styles = zone_styles(cfg.palette);
     let tops = zone_tops_db(&cfg);
@@ -240,6 +368,13 @@ pub fn show_history_graph(
         }
     }
 
+    // Area under each history trace — before grids so dB/time ticks stay legible.
+    for ch in 0..traces.len() {
+        if let Some((pts, color)) = &traces[ch] {
+            paint_history_trace_fill_under(&painter, pts, *color, top, bottom);
+        }
+    }
+
     // Vertical grid (same mapping as the level meters for this mode).
     for &disp in scale.tick_display_values() {
         if disp > scale.disp_max || disp < scale.disp_min {
@@ -291,42 +426,10 @@ pub fn show_history_graph(
         draw_dashed_h(&painter, left, right, y, COL_REFERENCE, 4.0, 3.0, 1.1);
     }
 
-    // Per-channel line — "now" is anchored to the right edge and
-    // older samples stream leftward.  When the ring is not yet full, the
-    // left side of the plot is simply empty instead of pinning the newest
-    // sample somewhere in the middle.
-    if graph.channels > 0 && graph.filled > 1 {
-        let ordered = graph.ordered();
-        let samples = ordered.len();
-        let dx = (right - left) / (SAMPLES - 1) as f32;
-        for ch in 0..graph.channels {
-            let color = CHANNEL_COLORS[ch % CHANNEL_COLORS.len()];
-            let mut raw = Vec::with_capacity(samples);
-            for row in &ordered {
-                raw.push(row[ch]);
-            }
-            let first_valid = raw
-                .iter()
-                .position(|&v| v > INF_FLOOR_DB + 0.5)
-                .unwrap_or(samples);
-            if first_valid >= samples {
-                continue;
-            }
-            let smoothed = smooth_with_edge_pad(&raw[first_valid..], SMOOTH_WIN);
-            let mut pts: Vec<Pos2> = Vec::with_capacity(smoothed.len());
-            for (k, v) in smoothed.iter().enumerate() {
-                let ordered_idx = first_valid + k;
-                let age = (samples - 1).saturating_sub(ordered_idx) as f32;
-                let x = right - age * dx;
-                if x < left - 0.5 {
-                    continue;
-                }
-                let y = scale.dbfs_to_y(*v, top, bottom);
-                pts.push(pos2(x, y));
-            }
-            if pts.len() >= 2 {
-                painter.add(egui::Shape::line(pts, Stroke::new(1.6, color)));
-            }
+    // Per-channel line — same geometry as the fill above; `traces` was built once.
+    for ch in 0..traces.len() {
+        if let Some((pts, color)) = &traces[ch] {
+            painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.6, *color)));
         }
     }
 
