@@ -31,8 +31,7 @@ const WINDOW_SECS: f32 = SAMPLES as f32 / SAMPLE_HZ;
 /// Red overlay on the history plot when clip capture triggers.
 const TRIGGER_FLASH_DURATION: Duration = Duration::from_millis(520);
 
-/// Same values as `spectrum_view::show_spectrum`: breathing room from the window edge + min width.
-const RIGHT_MARGIN: f32 = 16.0;
+/// Min scroll width (right-edge gutter is applied in `app.rs` around the whole column).
 const MIN_WIDTH: f32 = 360.0;
 /// `spectrum_view` “soft outer border” — ties the panel to the rest of the chrome.
 const PANEL_OUTER_STROKE: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
@@ -167,7 +166,7 @@ pub fn show_history_graph(
 ) -> Response {
     let graph = shared.read();
     let mut desired = ui.available_size();
-    desired.x = (desired.x - RIGHT_MARGIN).max(MIN_WIDTH);
+    desired.x = desired.x.max(MIN_WIDTH);
     desired.y = desired.y.max(crate::meter_widget::METER_MIN_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -179,7 +178,7 @@ pub fn show_history_graph(
     let left_pad = 34.0;
     // Right pad leaves room for the "now" label to sit fully inside
     // the graph area (it's center-aligned on the rightmost time tick).
-    let right_pad = 22.0;
+    let right_pad = 34.0;
     let top = rect.top() + BAR_TOP_PAD;
     let bottom_pad = meter_bar_bottom_pad_for_strip(graph.channels);
     let bottom = rect.bottom() - bottom_pad;

@@ -44,6 +44,8 @@ const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x35);
 pub(crate) const TITLE_COL: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf6);
 const ACCENT: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
 const AYRTHON_URL: &str = "https://ayrthon.com";
+/// Inset from the main window’s right edge (toolbar, graphs, title credits — same visual weight).
+const RIGHT_PANEL_GUTTER: f32 = 32.0;
 
 /// Optional CI/build stamp: `AUDIO_METER_BUILD=123 cargo build` — otherwise crate version.
 #[inline]
@@ -574,7 +576,7 @@ impl eframe::App for AudioMeterApp {
                 // add chunks as: margin, ` - Build (…)`, `Ayrthon`, `Created by ` → reads LTR as
                 // `Created by Ayrthon - Build (…)`.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(14.0);
+                    ui.add_space(RIGHT_PANEL_GUTTER);
                     ui.label(
                         RichText::new(format!(
                             " - Build ({})",
@@ -1235,6 +1237,8 @@ impl AudioMeterApp {
         // the window / status bar so the readouts don't feel crammed
         // against the edge.
         const METERS_BOTTOM_PAD: f32 = 18.0;
+        // Gap between meter strip and right-hand graph column.
+        const RIGHT_COL_GAP_FROM_METERS: f32 = 8.0;
         let row_h = (ui.available_height() - METERS_BOTTOM_PAD)
             .max(crate::meter_widget::METER_MIN_HEIGHT);
         ui.allocate_ui_with_layout(
@@ -1276,47 +1280,64 @@ impl AudioMeterApp {
                     },
                 );
 
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.set_min_height(row_h);
-                    ui.set_min_width(ui.available_width());
-                    self.right_panel_toolbar(ui);
+                ui.add_space(RIGHT_COL_GAP_FROM_METERS);
+                let right_col_w = ui.available_width().max(1.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_col_w, row_h),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        // Same right/bottom inset for transport toolbar (play / stop / arm / runtime)
+                        // and for the history or spectrum area below — not skipped.
+                        Frame::new()
+                            .inner_margin(Margin {
+                                left: 0,
+                                right: RIGHT_PANEL_GUTTER as i8,
+                                top: 0,
+                                bottom: RIGHT_PANEL_GUTTER as i8,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_min_height(row_h);
+                                ui.set_min_width(ui.available_width());
+                                self.right_panel_toolbar(ui);
+                                ui.add_space(RIGHT_PANEL_GUTTER);
 
-                    let rest_h = ui.available_height().max(1.0);
-                    match self.panel {
-                        GraphView::Off => {}
-                        GraphView::History => {
-                            ScrollArea::horizontal()
-                                .id_salt("graph_scroll")
-                                .max_height(rest_h)
-                                .show(ui, |ui| {
-                                    show_history_graph(
-                                        ui,
-                                        &self.history,
-                                        self.mode,
-                                        now,
-                                        &self.clip_settings,
-                                        &self.clip_status,
-                                    );
-                                });
-                        }
-                        GraphView::Spectrum => {
-                            ScrollArea::horizontal()
-                                .id_salt("spectrum_scroll")
-                                .max_height(rest_h)
-                                .show(ui, |ui| {
-                                    show_spectrum(
-                                        ui,
-                                        &mut self.analyzer,
-                                        &self.spectrum,
-                                        now,
-                                        &mut self.spectrum_pretty_mode,
-                                        &mut self.spectrum_anchors,
-                                    );
-                                });
-                        }
-                    }
-                });
+                                let rest_h = ui.available_height().max(1.0);
+                                match self.panel {
+                                    GraphView::Off => {}
+                                    GraphView::History => {
+                                        ScrollArea::horizontal()
+                                            .id_salt("graph_scroll")
+                                            .max_height(rest_h)
+                                            .show(ui, |ui| {
+                                                show_history_graph(
+                                                    ui,
+                                                    &self.history,
+                                                    self.mode,
+                                                    now,
+                                                    &self.clip_settings,
+                                                    &self.clip_status,
+                                                );
+                                            });
+                                    }
+                                    GraphView::Spectrum => {
+                                        ScrollArea::horizontal()
+                                            .id_salt("spectrum_scroll")
+                                            .max_height(rest_h)
+                                            .show(ui, |ui| {
+                                                show_spectrum(
+                                                    ui,
+                                                    &mut self.analyzer,
+                                                    &self.spectrum,
+                                                    now,
+                                                    &mut self.spectrum_pretty_mode,
+                                                    &mut self.spectrum_anchors,
+                                                );
+                                            });
+                                    }
+                                }
+                            });
+                    },
+                );
             },
         );
     }

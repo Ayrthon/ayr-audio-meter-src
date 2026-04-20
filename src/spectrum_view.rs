@@ -132,11 +132,9 @@ pub fn show_spectrum(
     // `analyzer` is ticked in `AudioMeterApp::ui` so the spectrum decays when audio stops even
     // if the History tab is visible.
 
-    // Leave a gap between the analyzer's right edge and the window/content edge so the panel
-    // doesn't butt up against whatever's next to it.
-    const RIGHT_MARGIN: f32 = 16.0;
+    // Right-edge gutter is applied in `app.rs` around the toolbar + graph column.
     let mut desired = ui.available_size();
-    desired.x = (desired.x - RIGHT_MARGIN).max(MIN_WIDTH);
+    desired.x = desired.x.max(MIN_WIDTH);
     // `Sense::click()` so we get both hover-position reporting AND click events.
     // The hover cursor line, anchor pins, and delete-× hit-testing all ride on
     // this single response; egui resolves overlaps with the Pretty-mode checkbox
@@ -160,7 +158,7 @@ pub fn show_spectrum(
 
     // Inner plot area: compact left (freq labels below), right gutter for dB ticks like Pro-Q.
     let left_pad = 14.0;
-    let right_pad = 10.0;
+    let right_pad = 18.0;
     let top_pad = 10.0;
     let bottom_pad = 22.0;
     let plot = Rect::from_min_max(
