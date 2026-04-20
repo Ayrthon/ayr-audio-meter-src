@@ -718,13 +718,10 @@ impl AudioMeterApp {
         );
         let total_clips = self.clip_status.lock().total_clips_saved;
 
-        left_panel_collapsing(ui, "clips_tab_how_capture", "HOW CAPTURE WORKS", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
+        left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
-            ui.label(
-                RichText::new(clip_detail.as_str())
-                    .size(9.5)
-                    .color(LEFT_LABEL_SECONDARY),
-            );
+            let ctx_clips = ui.ctx().clone();
+            self.clip_playlist.show(ui, &ctx_clips, total_clips);
         });
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
@@ -814,11 +811,22 @@ impl AudioMeterApp {
         });
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
-        left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
-            ui.add_space(4.0);
-            let ctx_clips = ui.ctx().clone();
-            self.clip_playlist.show(ui, &ctx_clips, total_clips);
-        });
+        left_panel_collapsing_with_default(
+            ui,
+            "clips_tab_how_capture",
+            "HOW CAPTURE WORKS",
+            width,
+            LEFT_SECTION_CARD_BODY_PAD_X,
+            false,
+            |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(clip_detail.as_str())
+                        .size(9.5)
+                        .color(LEFT_LABEL_SECONDARY),
+                );
+            },
+        );
     }
 
     fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -2070,8 +2078,28 @@ fn left_panel_collapsing<R>(
     body_pad_x: i8,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) {
+    left_panel_collapsing_with_default(
+        ui,
+        id_salt,
+        title,
+        section_w,
+        body_pad_x,
+        true,
+        add_contents,
+    );
+}
+
+fn left_panel_collapsing_with_default<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    title: &str,
+    section_w: f32,
+    body_pad_x: i8,
+    default_open: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) {
     let id = ui.make_persistent_id(id_salt);
-    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
 
     // Fixed width matches `LEFT_COLUMN_CONTROL_W` from the scroll body — do not use
     // `available_width()` alone or collapsed headers shrink-wrap via egui's horizontal layout.
