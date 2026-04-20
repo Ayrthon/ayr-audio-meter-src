@@ -19,8 +19,8 @@ use crate::clip_capture::{
 use crate::dsp::INF_FLOOR_DB;
 use crate::meter::{ColorPalette, MeterMode, MeterScale, MeterScaleKind, MIN_DB, config_for};
 use crate::meter_widget::{
-    BAR_TOP_PAD, COL_BG, COL_REFERENCE, COL_TEXT_DIM, meter_bar_bottom_pad_for_strip,
-    paint_zone_backgrounds, zone_styles, zone_tops_db,
+    BAR_TOP_PAD, COL_REFERENCE, COL_TEXT_DIM, meter_bar_bottom_pad_for_strip, paint_zone_backgrounds,
+    zone_styles, zone_tops_db,
 };
 
 const SAMPLES: usize = 600; // 30 s @ 20 Hz
@@ -33,7 +33,7 @@ const WINDOW_SECS: f32 = SAMPLES as f32 / SAMPLE_HZ;
 const TRIGGER_FLASH_DURATION: Duration = Duration::from_millis(520);
 
 /// Vertical opacity of the fill under each history trace (plot bottom → top).
-const HISTORY_TRACE_FILL_OPACITY_BOTTOM: f32 = 0.20;
+const HISTORY_TRACE_FILL_OPACITY_BOTTOM: f32 = 0.15;
 const HISTORY_TRACE_FILL_OPACITY_TOP: f32 = 0.80;
 
 /// Min scroll width (right-edge gutter is applied in `app.rs` around the whole column).
@@ -281,7 +281,6 @@ pub fn show_history_graph(
 
     let cfg = config_for(mode);
     let scale = MeterScale::for_mode(mode);
-    painter.rect_filled(rect, 0.0, COL_BG);
 
     let left_pad = 34.0;
     // Right pad leaves room for the "now" label to sit fully inside
@@ -321,8 +320,8 @@ pub fn show_history_graph(
 
     // Faded band above the clip trigger line (louder region): fills the visual gap vs zones below.
     // Vertical opacity gradient: stronger at the plot top, softer at the threshold line.
-    const ARMED_TRIGGER_OPACITY_TOP: f32 = 0.75;
-    const ARMED_TRIGGER_OPACITY_BOTTOM: f32 = 0.50;
+    const ARMED_TRIGGER_OPACITY_TOP: f32 = 0.80;
+    const ARMED_TRIGGER_OPACITY_BOTTOM: f32 = 0.35;
     let clip_thr_db = clip_settings.threshold_db();
     if clip_thr_db.is_finite() {
         let y_thr = scale
