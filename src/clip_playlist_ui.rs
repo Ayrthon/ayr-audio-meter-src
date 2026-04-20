@@ -55,6 +55,7 @@ fn draw_clip_row(
 ) -> egui::Response {
     let full_w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(full_w, CLIP_ROW_H), Sense::hover());
+    let hovered = ui.rect_contains_pointer(rect);
     let (fill, stroke) = if selected {
         (
             Color32::from_rgba_unmultiplied(38, 72, 120, 140),
@@ -68,6 +69,14 @@ fn draw_clip_row(
     };
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, fill);
+    if hovered && !selected {
+        // Translucent white overlay on hover; keeps selected style dominant.
+        painter.rect_filled(
+            rect,
+            6.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+        );
+    }
     painter.rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
 
     let inner = rect.shrink2(Vec2::new(10.0, 8.0));
@@ -116,7 +125,11 @@ fn draw_clip_row(
         });
     });
 
-    ui.interact(rect, ui.id().with("clip_row").with(slot), Sense::click())
+    let resp = ui.interact(rect, ui.id().with("clip_row").with(slot), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }
 
 #[derive(Clone)]
