@@ -188,6 +188,13 @@ const LEFT_COLUMN_INNER_W: f32 = LEFT_COLUMN_OUTER_W - 20.0;
 const LEFT_COLUMN_SCROLL_GUTTER: f32 = 20.0;
 /// Fixed width for Controls / Loudness / Clips content (must not use `available_width()` — it changes per tab).
 const LEFT_COLUMN_CONTROL_W: f32 = (LEFT_COLUMN_INNER_W - LEFT_COLUMN_SCROLL_GUTTER).clamp(228.0, 310.0);
+/// Horizontal padding inside `left_panel_collapsing` section body (must match `Frame::inner_margin` X there).
+const LEFT_SECTION_CARD_BODY_PAD_X: i8 = 14;
+
+#[inline]
+fn left_panel_section_content_w(column_w: f32) -> f32 {
+    (column_w - 2.0 * LEFT_SECTION_CARD_BODY_PAD_X as f32).max(1.0)
+}
 
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
@@ -699,7 +706,6 @@ impl AudioMeterApp {
 
     /// Full clips library: folder chooser, “How capture works”, waveform list.
     fn clips_library_panel(&mut self, ui: &mut egui::Ui, width: f32) {
-        ui.set_max_width(width);
         let clip_detail = format!(
             "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
              Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
@@ -709,7 +715,7 @@ impl AudioMeterApp {
         );
         let total_clips = self.clip_status.lock().total_clips_saved;
 
-        left_panel_collapsing(ui, "clips_tab_how_capture", "HOW CAPTURE WORKS", |ui| {
+        left_panel_collapsing(ui, "clips_tab_how_capture", "HOW CAPTURE WORKS", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(clip_detail.as_str())
@@ -719,7 +725,7 @@ impl AudioMeterApp {
         });
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
-        left_panel_collapsing(ui, "clips_tab_save_folder", "SAVE FOLDER", |ui| {
+        left_panel_collapsing(ui, "clips_tab_save_folder", "SAVE FOLDER", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             ui.label(
                 RichText::new("Current location:")
@@ -805,7 +811,7 @@ impl AudioMeterApp {
         });
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
-        left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", |ui| {
+        left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             let ctx_clips = ui.ctx().clone();
             self.clip_playlist.show(ui, &ctx_clips, total_clips);
@@ -813,9 +819,10 @@ impl AudioMeterApp {
     }
 
     fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, width: f32) {
-        left_panel_collapsing(ui, "left_tab_ctrl_audio", "AUDIO SOURCE", |ui| {
+        let cw = left_panel_section_content_w(width);
+        left_panel_collapsing(ui, "left_tab_ctrl_audio", "AUDIO SOURCE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
-            self.device_dropdown(ui, "device_combo", width);
+            self.device_dropdown(ui, "device_combo", cw);
 
             ui.add_space(3.0);
             ui.horizontal(|ui| {
@@ -842,7 +849,7 @@ impl AudioMeterApp {
             ui.add_space(8.0);
 
             if ui
-                .add_sized([width, 24.0], egui::Button::new("↻  Refresh devices"))
+                .add_sized([cw, 24.0], egui::Button::new("↻  Refresh devices"))
                 .clicked()
             {
                 self.refresh_devices();
@@ -851,7 +858,7 @@ impl AudioMeterApp {
 
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
-        left_panel_collapsing(ui, "left_tab_ctrl_meter_mode", "METER MODE", |ui| {
+        left_panel_collapsing(ui, "left_tab_ctrl_meter_mode", "METER MODE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             let cfg = config_for(self.mode);
             let (mid_name, high_name) = match cfg.palette {
@@ -875,7 +882,7 @@ impl AudioMeterApp {
             );
             let mode_combo = with_left_panel_combo_style(ui, |ui| {
                 egui::ComboBox::from_id_salt("mode_combo")
-                    .width(width)
+                    .width(cw)
                     .selected_text(self.mode.name_outside_paren())
                     .popup_style(left_panel_combo_popup_style())
                     .show_ui(ui, |ui| {
@@ -908,13 +915,13 @@ impl AudioMeterApp {
 
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
-        left_panel_collapsing(ui, "left_tab_ctrl_weight", "FREQUENCY WEIGHTING", |ui| {
+        left_panel_collapsing(ui, "left_tab_ctrl_weight", "FREQUENCY WEIGHTING", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             let mut w =
                 FreqWeighting::from_u8(self.weighting_atomic.load(Ordering::Relaxed));
             let w_combo = with_left_panel_combo_style(ui, |ui| {
                 egui::ComboBox::from_id_salt("freq_weight_combo")
-                    .width(width)
+                    .width(cw)
                     .selected_text(w.label())
                     .popup_style(left_panel_combo_popup_style())
                     .show_ui(ui, |ui| {
@@ -943,7 +950,7 @@ impl AudioMeterApp {
             crate::clip_capture::POST_ROLL_SECS
         );
 
-        left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", |ui| {
+        left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             let content_w = ui.available_width();
             ui.set_width(content_w);
@@ -1076,8 +1083,11 @@ impl AudioMeterApp {
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-                                // Fixed width — do not derive from `available_width()` (differs by tab / scrollbar).
+                                // Fixed width — same as `clips_library_panel` (differs by tab / scrollbar if
+                                // derived from `available_width()` only).
                                 let width = LEFT_COLUMN_CONTROL_W;
+                                ui.set_min_width(width);
+                                ui.set_max_width(width);
                                 match self.left_tab {
                                     LeftPanelTab::Controls => {
                                         self.left_controls_controls_tab(ui, width);
@@ -1087,9 +1097,11 @@ impl AudioMeterApp {
                                             ui,
                                             "left_tab_loudness_r128",
                                             "LOUDNESS  (EBU R128)",
+                                            width,
+                                            LEFT_SECTION_CARD_BODY_PAD_X,
                                             |ui| {
                                                 ui.add_space(4.0);
-                                                self.loudness_panel(ui, width);
+                                                self.loudness_panel(ui);
                                             },
                                         );
                                     }
@@ -1188,62 +1200,84 @@ impl AudioMeterApp {
         }
     }
 
-    fn loudness_panel(&mut self, ui: &mut egui::Ui, width: f32) {
+    fn loudness_panel(&mut self, ui: &mut egui::Ui) {
         let state = *self.loudness.read();
-        // Each box's Frame adds 8 px inner_margin on left + right (16 px
-        // total).  Two boxes share a 6 px gap.  The *content* width we
+        let row_w = ui.available_width().max(1.0);
+        // Each box's Frame adds 4 px inner_margin on left + right (8 px
+        // total per box).  Two boxes share a 4 px gap.  The *content* width we
         // ask the inner ui to lock to must leave room for both, or the
         // right box overflows the panel's clip rect and gets its rounded
         // corner sliced by the clip — which reads as a phantom shadow.
-        let cell_w = (((width - 6.0) * 0.5) - 16.0).floor().max(60.0);
+        const LUFS_PAIR_GAP: f32 = 4.0;
+        const LUFS_FRAME_PAD_X: f32 = 4.0;
+        let outer_h = 2.0 * LUFS_FRAME_PAD_X;
+        let cell_w = (((row_w - LUFS_PAIR_GAP) * 0.5) - outer_h).floor().max(52.0);
+        let pair_outer_w = 2.0 * (cell_w + outer_h) + LUFS_PAIR_GAP;
 
-        ui.horizontal(|ui| {
-            lufs_box(
-                ui,
-                "Integrated (LONG)",
-                state.integrated_lufs,
-                "LUFS",
-                cell_w,
-                true,
-            );
-            ui.add_space(6.0);
-            lufs_box(
-                ui,
-                "Short-term (S)",
-                state.short_lufs,
-                "LUFS",
-                cell_w,
-                false,
-            );
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            lufs_box(
-                ui,
-                "Momentary (M)",
-                state.momentary_lufs,
-                "LUFS",
-                cell_w,
-                false,
-            );
-            ui.add_space(6.0);
-            lufs_box(
-                ui,
-                "True Peak",
-                state.true_peak_dbtp,
-                "dBTP",
-                cell_w,
-                state.true_peak_dbtp > -1.0,
-            );
-        });
-        ui.add_space(6.0);
+        let draw_meters = |ui: &mut egui::Ui| {
+            ui.set_min_width(pair_outer_w);
+            ui.set_max_width(pair_outer_w);
+            ui.horizontal(|ui| {
+                lufs_box(
+                    ui,
+                    "Integrated (LONG)",
+                    state.integrated_lufs,
+                    "LUFS",
+                    cell_w,
+                    true,
+                );
+                ui.add_space(LUFS_PAIR_GAP);
+                lufs_box(
+                    ui,
+                    "Short-term (S)",
+                    state.short_lufs,
+                    "LUFS",
+                    cell_w,
+                    false,
+                );
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                lufs_box(
+                    ui,
+                    "Momentary (M)",
+                    state.momentary_lufs,
+                    "LUFS",
+                    cell_w,
+                    false,
+                );
+                ui.add_space(LUFS_PAIR_GAP);
+                lufs_box(
+                    ui,
+                    "True Peak",
+                    state.true_peak_dbtp,
+                    "dBTP",
+                    cell_w,
+                    state.true_peak_dbtp > -1.0,
+                );
+            });
+        };
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(pair_outer_w, 0.0),
+            Layout::top_down(Align::Min),
+            draw_meters,
+        );
+
+        ui.add_space(4.0);
+
         ui.vertical_centered(|ui| {
+            let prev_pad = ui.style().spacing.button_padding;
+            ui.style_mut().spacing.button_padding = egui::vec2(15.0, 4.0);
             if ui
-                .add_sized([width, 22.0], egui::Button::new("↺  Reset integrated / peak"))
+                .add(egui::Button::new(
+                    RichText::new("↺  Reset integrated / peak").size(11.5),
+                ))
                 .clicked()
             {
                 self.loudness.write().reset_request = true;
             }
+            ui.style_mut().spacing.button_padding = prev_pad;
         });
     }
 
@@ -1937,26 +1971,32 @@ fn lufs_box(
     width: f32,
     accent: bool,
 ) {
+    const LABEL_PT: f32 = 10.75;
+    const VALUE_PT: f32 = 19.0;
+    const UNIT_PT: f32 = 9.0;
+
     let fill = Color32::from_rgb(0x12, 0x14, 0x1c);
-    let stroke_col = if accent {
-        Color32::from_rgb(0xd4, 0x76, 0x2a)
+    let stroke = if accent {
+        Stroke::new(1.0, Color32::from_rgb(0xd4, 0x76, 0x2a))
     } else {
-        DIVIDER
+        Stroke::new(1.0, DIVIDER)
     };
     Frame::new()
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke_col))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(8, 6))
+        .stroke(stroke)
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(4, 2))
         .show(ui, |ui| {
             ui.set_min_width(width);
             ui.set_max_width(width);
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
                 ui.label(
                     RichText::new(label)
-                        .color(Color32::from_gray(140))
-                        .size(9.5)
-                        .strong(),
+                        .color(Color32::from_gray(150))
+                        .size(LABEL_PT)
+                        .strong()
+                        .line_height(Some(13.5)),
                 );
                 let shown = if value <= NEG_INF_LUFS + 1.0 || !value.is_finite() {
                     "—".to_string()
@@ -1971,13 +2011,13 @@ fn lufs_box(
                 ui.label(
                     RichText::new(shown)
                         .color(num_color)
-                        .size(16.0)
+                        .size(VALUE_PT)
                         .strong(),
                 );
                 ui.label(
                     RichText::new(unit)
                         .color(Color32::from_gray(115))
-                        .size(9.5),
+                        .size(UNIT_PT),
                 );
             });
         });
@@ -2014,20 +2054,27 @@ fn left_panel_1px_band(ui: &mut egui::Ui, color: Color32) {
 }
 
 /// Collapsible block: one rounded card (black stroke + fill) with stacked inset highlights.
+/// `body_pad_x` is horizontal inner padding for the section body (use `0` for full-bleed edge-to-edge content).
 fn left_panel_collapsing<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
     title: &str,
+    section_w: f32,
+    body_pad_x: i8,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) {
     let id = ui.make_persistent_id(id_salt);
     let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
 
-    let card_w = ui.available_width().max(1.0);
+    // Fixed width matches `LEFT_COLUMN_CONTROL_W` from the scroll body — do not use
+    // `available_width()` alone or collapsed headers shrink-wrap via egui's horizontal layout.
+    let card_w = section_w.max(1.0);
     let o = state.openness(ui.ctx());
     let show_divider = o > 0.05;
     let card_radius = CornerRadius::same(LEFT_SECTION_CARD_RADIUS);
 
+    ui.set_min_width(card_w);
+    ui.set_max_width(card_w);
     ui.set_width(card_w);
     Frame::new()
         .fill(LEFT_SECTION_CARD_BG)
@@ -2035,7 +2082,9 @@ fn left_panel_collapsing<R>(
         .corner_radius(card_radius)
         .inner_margin(Margin::ZERO)
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_min_width(card_w);
+            ui.set_max_width(card_w);
+            ui.set_width(card_w);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
@@ -2044,9 +2093,11 @@ fn left_panel_collapsing<R>(
 
                 Frame::new()
                     .fill(LEFT_SECTION_HEADER_BG)
+                    .stroke(Stroke::NONE)
                     .corner_radius(CornerRadius::ZERO)
-                    .inner_margin(Margin::symmetric(14, 10))
+                    .inner_margin(Margin::symmetric(LEFT_SECTION_CARD_BODY_PAD_X, 10))
                     .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
@@ -2073,6 +2124,7 @@ fn left_panel_collapsing<R>(
                     ui.set_width(ui.available_width());
                     Frame::new()
                         .fill(LEFT_SECTION_BODY_BG)
+                        .stroke(Stroke::NONE)
                         .corner_radius(CornerRadius::ZERO)
                         .inner_margin(Margin::ZERO)
                         .show(ui, |ui| {
@@ -2080,12 +2132,16 @@ fn left_panel_collapsing<R>(
                             // Same top treatment as the title band: light edge on the content block.
                             left_panel_1px_band(ui, LEFT_SECTION_INNER_HIGHLIGHT);
                             Frame::new()
-                                .inner_margin(Margin::symmetric(14, 12))
+                                .inner_margin(Margin::symmetric(body_pad_x, 12))
                                 .show(ui, |ui| add_contents(ui))
                                 .inner
                         })
                         .inner
                 });
+
+                // Guarantees the card's min_rect stays `card_w` wide when the body is hidden
+                // (horizontal layouts otherwise shrink-wrap to the header row).
+                ui.allocate_space(egui::vec2(card_w, 0.0));
             });
         });
 }
