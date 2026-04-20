@@ -1344,99 +1344,101 @@ impl AudioMeterApp {
                     s.visuals.widgets.active.fg_stroke.width = 1.0;
                 });
 
-                let full = ui.available_width().max(1.0);
-                let third = (full / 3.0).max(1.0);
                 let row_inner_h = (BAR_H - 8.0).max(18.0);
+                // Play + gap + stop + gap + arm (matches `ICON_BTN` / `ARM_RECORD` + 6 px gaps).
+                const TRANSPORT_CLUSTER_W: f32 =
+                    ICON_BTN.x + 6.0 + ICON_BTN.x + 6.0 + ARM_RECORD.x;
+                const RUNTIME_COL_W: f32 = 140.0;
+                const VIEW_TO_CENTER_GAP: f32 = 8.0;
 
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
+                    let total_bar = ui.available_width().max(1.0);
+
+                    // Left: view mode (width measured so transport can be centered on the full bar).
+                    let view_lr = ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("View")
+                                .size(8.5)
+                                .color(Color32::from_gray(130)),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            if ui
+                                .selectable_label(self.panel == GraphView::History, "History")
+                                .on_hover_text("Level history graph")
+                                .clicked()
+                            {
+                                self.panel = GraphView::History;
+                            }
+                            if ui
+                                .selectable_label(self.panel == GraphView::Spectrum, "Spectrum")
+                                .on_hover_text("Spectrum analyzer")
+                                .clicked()
+                            {
+                                self.panel = GraphView::Spectrum;
+                            }
+                        });
+                    });
+                    let view_w = view_lr.response.rect.width();
+
+                    ui.add_space(VIEW_TO_CENTER_GAP);
+
+                    // Symmetric spacers so play/stop/arm sit at horizontal center of the toolbar.
+                    let gap_left = (total_bar / 2.0 - TRANSPORT_CLUSTER_W / 2.0)
+                        - view_w
+                        - VIEW_TO_CENTER_GAP;
+                    ui.add_space(gap_left.max(0.0));
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                        let playing = self.engine.is_some();
+
+                        let play = ui.add_enabled_ui(!playing, |ui| {
+                            ui.add_sized(ICON_BTN, ToolbarTransportIcon::Play)
+                                .on_hover_text("Start metering")
+                        });
+                        if play.inner.clicked() {
+                            if let Err(e) = self.start_stream() {
+                                self.status = format!("Error: {e}");
+                            }
+                        }
+
+                        let stop = ui.add_enabled_ui(playing, |ui| {
+                            ui.add_sized(
+                                ICON_BTN,
+                                ToolbarTransportIcon::Stop {
+                                    meter_active: playing,
+                                },
+                            )
+                            .on_hover_text("Stop metering")
+                        });
+                        if stop.inner.clicked() {
+                            self.stop_stream();
+                        }
+
+                        let rec_on = self.clip_settings.enabled();
+                        let arm = ui
+                            .add_sized(ARM_RECORD, RecordArmButton { armed: rec_on })
+                            .on_hover_text("Arm clip recording (toggle)");
+                        if arm.clicked() {
+                            let new_on = !rec_on;
+                            self.clip_settings.set_enabled(new_on);
+                            if new_on {
+                                self.clip_session_baseline =
+                                    self.clip_status.lock().total_clips_saved;
+                            }
+                        }
+                    });
+
+                    let gap_right = (total_bar - RUNTIME_COL_W)
+                        - (total_bar / 2.0 + TRANSPORT_CLUSTER_W / 2.0);
+                    ui.add_space(gap_right.max(0.0));
+
+                    // Right: runtime — fixed column, text right-aligned to the panel edge.
                     ui.allocate_ui_with_layout(
-                        egui::vec2(third, row_inner_h),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("View")
-                                        .size(8.5)
-                                        .color(Color32::from_gray(130)),
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                    if ui
-                                        .selectable_label(
-                                            self.panel == GraphView::History,
-                                            "History",
-                                        )
-                                        .on_hover_text("Level history graph")
-                                        .clicked()
-                                    {
-                                        self.panel = GraphView::History;
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            self.panel == GraphView::Spectrum,
-                                            "Spectrum",
-                                        )
-                                        .on_hover_text("Spectrum analyzer")
-                                        .clicked()
-                                    {
-                                        self.panel = GraphView::Spectrum;
-                                    }
-                                });
-                            });
-                        },
-                    );
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(third, row_inner_h),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-                                let playing = self.engine.is_some();
-
-                                let play = ui.add_enabled_ui(!playing, |ui| {
-                                    ui.add_sized(ICON_BTN, ToolbarTransportIcon::Play)
-                                        .on_hover_text("Start metering")
-                                });
-                                if play.inner.clicked() {
-                                    if let Err(e) = self.start_stream() {
-                                        self.status = format!("Error: {e}");
-                                    }
-                                }
-
-                                let stop = ui.add_enabled_ui(playing, |ui| {
-                                    ui.add_sized(
-                                        ICON_BTN,
-                                        ToolbarTransportIcon::Stop {
-                                            meter_active: playing,
-                                        },
-                                    )
-                                    .on_hover_text("Stop metering")
-                                });
-                                if stop.inner.clicked() {
-                                    self.stop_stream();
-                                }
-
-                                let rec_on = self.clip_settings.enabled();
-                                let arm = ui
-                                    .add_sized(ARM_RECORD, RecordArmButton { armed: rec_on })
-                                    .on_hover_text("Arm clip recording (toggle)");
-                                if arm.clicked() {
-                                    let new_on = !rec_on;
-                                    self.clip_settings.set_enabled(new_on);
-                                    if new_on {
-                                        self.clip_session_baseline =
-                                            self.clip_status.lock().total_clips_saved;
-                                    }
-                                }
-                            });
-                        },
-                    );
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(third, row_inner_h),
+                        egui::vec2(RUNTIME_COL_W, row_inner_h),
                         Layout::right_to_left(Align::Center),
                         |ui| {
                             ui.vertical(|ui| {
