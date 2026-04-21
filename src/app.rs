@@ -24,6 +24,7 @@ use crate::audio::{
     default_input_name, default_output_name, list_devices, make_shared_clip_trigger_states,
     make_shared_history_trace, make_shared_levels,
 };
+use crate::comp_view::{SharedComp, make_shared_comp, show_comp};
 use crate::history_graph::{SharedHistory, make_shared_history, show_history_graph};
 use crate::loudness::{NEG_INF_LUFS, SharedLoudness, make_shared_loudness};
 use crate::meter::{FillSource, MeterMode, config_for, wall_clock_secs};
@@ -89,6 +90,7 @@ pub enum GraphView {
     Off,
     History,
     Spectrum,
+    Comp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -145,6 +147,8 @@ pub struct AudioMeterApp {
     levels: SharedLevels,
     loudness: SharedLoudness,
     spectrum: SharedSpectrum,
+    /// Mono-summed envelope + RMS ring feeding the Comp (compression analyzer) view.
+    comp: SharedComp,
     analyzer: SpectrumAnalyzer,
     /// "Pretty mode" paints the spectrum trace with a warm→cool palette across
     /// the five frequency bands (low / low-mid / mid / high-mid / high) instead
@@ -316,6 +320,7 @@ impl AudioMeterApp {
             levels: make_shared_levels(),
             loudness: make_shared_loudness(),
             spectrum: make_shared_spectrum(),
+            comp: make_shared_comp(),
             analyzer: SpectrumAnalyzer::new(),
             spectrum_pretty_mode: false,
             spectrum_anchors: Vec::new(),
@@ -374,6 +379,7 @@ impl AudioMeterApp {
             self.levels.clone(),
             self.loudness.clone(),
             self.spectrum.clone(),
+            self.comp.clone(),
             self.history.clone(),
             self.history_trace.clone(),
             self.weighting_atomic.clone(),
@@ -464,7 +470,9 @@ impl AudioMeterApp {
         {
             let min_w = match self.panel {
                 GraphView::Off => window_w_without_graph(self.meter_states.len()),
-                GraphView::History | GraphView::Spectrum => WINDOW_W_MIN_WITH_GRAPH,
+                GraphView::History | GraphView::Spectrum | GraphView::Comp => {
+                    WINDOW_W_MIN_WITH_GRAPH
+                }
             };
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                 min_w, 520.0,
@@ -490,7 +498,9 @@ impl AudioMeterApp {
         // once we're sure the platform layer is idle.
         let min_w = match self.panel {
             GraphView::Off => window_w_without_graph(self.meter_states.len()),
-            GraphView::History | GraphView::Spectrum => WINDOW_W_MIN_WITH_GRAPH,
+            GraphView::History | GraphView::Spectrum | GraphView::Comp => {
+                WINDOW_W_MIN_WITH_GRAPH
+            }
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
             min_w, 520.0,
@@ -531,7 +541,9 @@ impl AudioMeterApp {
 
         let target_w = match self.panel {
             GraphView::Off => window_w_without_graph(self.meter_states.len()),
-            GraphView::History | GraphView::Spectrum => WINDOW_W_WITH_GRAPH,
+            GraphView::History | GraphView::Spectrum | GraphView::Comp => {
+                WINDOW_W_WITH_GRAPH
+            }
         };
 
         if let Some(rect) = inner_rect {
@@ -550,7 +562,7 @@ impl AudioMeterApp {
             let opening_right_panel = self.last_panel == GraphView::Off
                 && matches!(
                     self.panel,
-                    GraphView::History | GraphView::Spectrum
+                    GraphView::History | GraphView::Spectrum | GraphView::Comp
                 );
             let snap_to_target = hide_panel || opening_right_panel || !user_resized;
             if snap_to_target {
@@ -1477,6 +1489,14 @@ impl AudioMeterApp {
                                                 );
                                             });
                                     }
+                                    GraphView::Comp => {
+                                        ScrollArea::horizontal()
+                                            .id_salt("comp_scroll")
+                                            .max_height(rest_h)
+                                            .show(ui, |ui| {
+                                                show_comp(ui, &self.comp, now);
+                                            });
+                                    }
                                 }
                             });
                     },
@@ -1552,6 +1572,12 @@ impl AudioMeterApp {
                                 .clicked()
                             {
                                 self.panel = GraphView::Spectrum;
+                            }
+                            if ui
+                                .selectable_label(self.panel == GraphView::Comp, "Comp")
+                                .clicked()
+                            {
+                                self.panel = GraphView::Comp;
                             }
                         });
                     });

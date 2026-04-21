@@ -14,6 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::{Mutex, RwLock};
 
 use crate::clip_capture::{ClipSettings, SharedClipCapture, SharedClipSettings, SharedClipStatus};
+use crate::comp_view::SharedComp;
 use crate::user_settings::SharedUserSettings;
 use crate::dsp::{INF_FLOOR_DB, block_peak_rms};
 use crate::history_graph::SharedHistory;
@@ -152,6 +153,7 @@ impl AudioEngine {
         levels: SharedLevels,
         loudness: SharedLoudness,
         spectrum: SharedSpectrum,
+        comp: SharedComp,
         history: SharedHistory,
         history_trace: SharedHistoryTrace,
         weighting: Arc<AtomicU8>,
@@ -168,6 +170,7 @@ impl AudioEngine {
         let levels_for_thread = levels.clone();
         let loudness_for_thread = loudness.clone();
         let spectrum_for_thread = spectrum.clone();
+        let comp_for_thread = comp.clone();
         let history_for_thread = history.clone();
         let history_trace_for_thread = history_trace.clone();
         let weighting_for_thread = weighting.clone();
@@ -191,6 +194,7 @@ impl AudioEngine {
                         &levels_for_thread,
                         &loudness_for_thread,
                         &spectrum_for_thread,
+                        &comp_for_thread,
                         &history_for_thread,
                         &history_trace_for_thread,
                         &weighting_for_thread,
@@ -210,6 +214,7 @@ impl AudioEngine {
                         &levels_for_thread,
                         &loudness_for_thread,
                         &spectrum_for_thread,
+                        &comp_for_thread,
                         &history_for_thread,
                         &history_trace_for_thread,
                         &weighting_for_thread,
@@ -272,6 +277,7 @@ fn run_cpal_input(
     levels: &SharedLevels,
     loudness: &SharedLoudness,
     spectrum: &SharedSpectrum,
+    comp: &SharedComp,
     history: &SharedHistory,
     history_trace: &SharedHistoryTrace,
     weighting: &Arc<AtomicU8>,
@@ -322,11 +328,17 @@ fn run_cpal_input(
         }
     };
     spectrum::configure(spectrum, sample_rate, true);
+    {
+        let mut c = comp.write();
+        c.clear();
+        c.configure(sample_rate);
+    }
 
     let stream_config: cpal::StreamConfig = config.clone().into();
     let levels_clone = levels.clone();
     let loudness_clone = loudness.clone();
     let spectrum_clone = spectrum.clone();
+    let comp_clone = comp.clone();
     let weight_clone = weighting.clone();
     let scratch_clone = meter_scratch.clone();
     let clip_settings_cb = clip_settings.clone();
@@ -375,6 +387,9 @@ fn run_cpal_input(
                     a.process(data, &loudness_clone);
                 }
                 spectrum::push_samples(&spectrum_clone, data, channels);
+                comp_clone
+                    .write()
+                    .push_samples_mono_sum(data, channels, sample_rate);
             },
             err_fn,
             None,
@@ -417,6 +432,9 @@ fn run_cpal_input(
                     a.process(&buf, &loudness_clone);
                 }
                 spectrum::push_samples(&spectrum_clone, &buf, channels);
+                comp_clone
+                    .write()
+                    .push_samples_mono_sum(&buf, channels, sample_rate);
             },
             err_fn,
             None,
@@ -459,6 +477,9 @@ fn run_cpal_input(
                     a.process(&buf, &loudness_clone);
                 }
                 spectrum::push_samples(&spectrum_clone, &buf, channels);
+                comp_clone
+                    .write()
+                    .push_samples_mono_sum(&buf, channels, sample_rate);
             },
             err_fn,
             None,
@@ -476,6 +497,7 @@ fn run_cpal_input(
     }
     drop(stream);
     spectrum::configure(spectrum, sample_rate, false);
+    comp.write().clear();
     Ok(())
 }
 
@@ -639,6 +661,7 @@ mod windows_loopback {
         levels: &SharedLevels,
         loudness: &SharedLoudness,
         spectrum: &SharedSpectrum,
+        comp: &SharedComp,
         history: &SharedHistory,
         history_trace: &SharedHistoryTrace,
         weighting: &Arc<AtomicU8>,
@@ -746,6 +769,11 @@ mod windows_loopback {
             }
         };
         spectrum::configure(spectrum, sample_rate, true);
+        {
+            let mut c = comp.write();
+            c.clear();
+            c.configure(sample_rate);
+        }
 
         let bytes_per_sample = bits / 8;
         let is_float = bits == 32 && valid_bits == 32;
@@ -795,6 +823,8 @@ mod windows_loopback {
                     a.process(&f32_scratch, loudness);
                 }
                 spectrum::push_samples(spectrum, &f32_scratch, channels);
+                comp.write()
+                    .push_samples_mono_sum(&f32_scratch, channels, sample_rate);
             }
 
             match capture_client.get_next_packet_size() {
@@ -817,6 +847,7 @@ mod windows_loopback {
 
         let _ = audio_client.stop_stream();
         spectrum::configure(spectrum, sample_rate, false);
+        comp.write().clear();
         Ok(())
     }
 
