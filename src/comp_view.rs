@@ -84,7 +84,7 @@ pub const BUCKETS_PER_SEC: f32 = 200.0;
 /// Rolling window (seconds).
 pub const WINDOW_SECS: f32 = 8.0;
 
-/// Ring capacity — one slot per bucket.
+/// Number of buckets drawn on screen (one slot per bucket in the visible window).
 pub const BUCKETS: usize = (WINDOW_SECS * BUCKETS_PER_SEC) as usize;
 
 /// Absolute gate for the peak-range computation (linear peak magnitude). Buckets
@@ -105,6 +105,24 @@ const PR_MIN_GATED_BUCKETS: usize = 20;
 /// matching EBU R128's short-term loudness window. Long enough to span multiple
 /// phrases of sparse vocal / dialogue material so percentile spreads are stable.
 const PR_WINDOW_BUCKETS: usize = (3.0 * BUCKETS_PER_SEC) as usize;
+
+/// Extra buckets kept in the ring BEFORE the visible [`BUCKETS`] region so that the
+/// leftmost (oldest) displayed bucket already has a full [`PR_WINDOW_BUCKETS`] of
+/// history behind it contributing to its Peak Range value.
+///
+/// Without this pre-roll, the PR window at display position 0 is only 1 bucket long,
+/// at position 1 it's 2 buckets long, … and doesn't become fully populated until
+/// ~3 s in. That manifested as a visible discontinuity at the left edge of the Comp
+/// graph: the first ~100 ms tinted flat amber (NaN PR from [`PR_MIN_GATED_BUCKETS`]
+/// not met), the next ~3 s flickering erratically as the window grew, and only the
+/// rightmost ~5 s of the display rendering with its steady-state tint + trace. By
+/// keeping [`PR_WINDOW_BUCKETS`] of extra history behind the display we eliminate
+/// the ramp-up region; every drawn bucket gets the same-sized window.
+const PR_CONTEXT_BUCKETS: usize = PR_WINDOW_BUCKETS;
+
+/// Total ring capacity = displayed region + PR pre-roll context. Only the last
+/// [`BUCKETS`] entries are drawn.
+const RING_CAPACITY: usize = BUCKETS + PR_CONTEXT_BUCKETS;
 
 /// Minimum width of the Comp panel (matches history / spectrum right-panel min).
 const MIN_WIDTH: f32 = 360.0;
@@ -233,7 +251,7 @@ pub struct CompEnvelope {
     ring: Vec<CompBucket>,
     /// Next write slot.
     write_idx: usize,
-    /// How many buckets have been written since the ring was last cleared (saturates at [`BUCKETS`]).
+    /// How many buckets have been written since the ring was last cleared (saturates at [`RING_CAPACITY`]).
     filled: usize,
     /// Sample rate the in-flight accumulator is configured for. 0 until first `push_samples_mono_sum`.
     sample_rate: u32,
@@ -252,7 +270,7 @@ pub fn make_shared_comp() -> SharedComp {
 impl CompEnvelope {
     pub fn new() -> Self {
         Self {
-            ring: vec![CompBucket::default(); BUCKETS],
+            ring: vec![CompBucket::default(); RING_CAPACITY],
             write_idx: 0,
             filled: 0,
             sample_rate: 0,
@@ -313,16 +331,19 @@ impl CompEnvelope {
             if self.in_flight.n >= spb {
                 let b = self.in_flight.flush(spb);
                 self.ring[self.write_idx] = b;
-                self.write_idx = (self.write_idx + 1) % BUCKETS;
-                self.filled = (self.filled + 1).min(BUCKETS);
+                self.write_idx = (self.write_idx + 1) % RING_CAPACITY;
+                self.filled = (self.filled + 1).min(RING_CAPACITY);
             }
         }
     }
 
     /// Copy the ring into oldest→newest order. Called on the UI thread once per frame.
+    /// The returned vec has up to [`RING_CAPACITY`] entries; the caller slices off
+    /// the last [`BUCKETS`] for display and passes the full vec to
+    /// [`windowed_peak_range_db`] so every displayed bucket has its full PR window.
     fn ordered(&self) -> Vec<CompBucket> {
         let mut out = Vec::with_capacity(self.filled);
-        if self.filled < BUCKETS {
+        if self.filled < RING_CAPACITY {
             out.extend_from_slice(&self.ring[..self.filled]);
         } else {
             out.extend_from_slice(&self.ring[self.write_idx..]);
@@ -788,11 +809,21 @@ pub fn show_comp(ui: &mut Ui, shared: &SharedComp, _now: f64) -> Response {
         let g = shared.read();
         g.ordered()
     };
-    // One pass to get the gated 3 s-windowed Peak Range at every bucket.
+    // One pass across the FULL ring (display region + PR_CONTEXT_BUCKETS of pre-roll
+    // history) so every entry in `window_pr` — including the ones at the left edge
+    // of the visible display — has a complete trailing 3 s of context behind it.
     let window_pr = windowed_peak_range_db(&ordered, PR_WINDOW_BUCKETS);
-    // Headline = most recent finite window value; falls back to NaN → "--" if the
-    // window doesn't have enough loud buckets yet.
-    let pr_db = window_pr
+
+    // Slice off the pre-roll. Only the last BUCKETS entries are drawn; the leading
+    // PR_CONTEXT_BUCKETS are pure history that already did their job seeding the
+    // percentile window for the leftmost display bucket.
+    let display_start = ordered.len().saturating_sub(BUCKETS);
+    let display_buckets = &ordered[display_start..];
+    let display_pr = &window_pr[display_start..];
+
+    // Headline = most recent finite window value in the displayed region; falls back
+    // to NaN → "--" if the window doesn't have enough loud buckets yet.
+    let pr_db = display_pr
         .iter()
         .rev()
         .copied()
@@ -802,8 +833,8 @@ pub fn show_comp(ui: &mut Ui, shared: &SharedComp, _now: f64) -> Response {
     paint_band_backdrop(&painter, upper_rect);
     paint_band_backdrop(&painter, lower_rect);
 
-    paint_envelope(&painter, &ordered, &window_pr, upper_rect);
-    paint_pr_band(&painter, &ordered, &window_pr, lower_rect);
+    paint_envelope(&painter, display_buckets, display_pr, upper_rect);
+    paint_pr_band(&painter, display_buckets, display_pr, lower_rect);
     paint_headline(&painter, upper_rect, pr_db);
 
     // Scroll at ~60 Hz. Audio thread pushes new buckets at 200 Hz, but 60 Hz visual
