@@ -20,6 +20,13 @@ pub struct UserSettingsData {
     /// so the next launch opens with the same layout. Default (unset) = expanded.
     #[serde(default)]
     pub left_panel_collapsed: bool,
+
+    /// First-run trial welcome modal has been dismissed. Stays `false` until
+    /// the user closes the one-shot "Trial started — 14 days" dialog; after
+    /// that we never show it again even across reinstalls (the anti-rollback
+    /// trial anchor makes showing it again pointless anyway).
+    #[serde(default)]
+    pub license_welcome_shown: bool,
 }
 
 impl Default for UserSettingsData {
@@ -27,6 +34,7 @@ impl Default for UserSettingsData {
         Self {
             clips_save_dir: None,
             left_panel_collapsed: false,
+            license_welcome_shown: false,
         }
     }
 }

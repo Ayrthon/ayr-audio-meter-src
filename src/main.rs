@@ -13,6 +13,7 @@ mod comp_view;
 mod user_settings;
 mod dsp;
 mod history_graph;
+mod license;
 mod loudness;
 mod meter;
 mod meter_widget;

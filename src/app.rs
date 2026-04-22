@@ -204,6 +204,21 @@ pub struct AudioMeterApp {
     /// reappear. We intentionally do not persist a "skipped version" because the
     /// user explicitly asked for a prompt every startup.
     update_dismissed: bool,
+    /// Trial / license / activation state, populated by `crate::license::load_or_init`
+    /// and subsequently mutated by the background LS activate/validate/deactivate
+    /// threads. Read each frame by `maybe_show_license_gate` and
+    /// `render_license_status_chip`.
+    license: crate::license::SharedLicense,
+    /// User clicked the license chip (or a "Manage License" button) and wants
+    /// the modal to pop even when the app isn't in a locked state. Cleared
+    /// when the modal is dismissed.
+    license_modal_forced: bool,
+    /// Scratch buffer for the key-entry `TextEdit` inside the license modal.
+    /// Trimmed + uppercased at submit time.
+    license_key_input: String,
+    /// Human-readable error shown under the key field on a failed activation
+    /// attempt. Cleared as soon as the user edits the key again.
+    license_activation_error: Option<String>,
 }
 
 /// Target window widths for the two UI modes.  The app snaps to one
@@ -386,6 +401,10 @@ impl AudioMeterApp {
             main_window_revealed: false,
             update: crate::updater::make_shared_status(),
             update_dismissed: false,
+            license: crate::license::make_shared_license(),
+            license_modal_forced: false,
+            license_key_input: String::new(),
+            license_activation_error: None,
         };
         // Fire the GitHub release check on a background thread. The result
         // flows back into `_app.update` and is picked up by the UI loop next
@@ -396,6 +415,12 @@ impl AudioMeterApp {
             env!("CARGO_PKG_VERSION"),
             _app.update.clone(),
         );
+        // Resolve the trial anchor + cached license grant *before* the first
+        // frame. If we had a key on disk and its last-validate is older than
+        // REVALIDATE_EVERY_DAYS, this call also kicks a background thread to
+        // re-hit Lemon Squeezy so a refunded / deactivated key doesn't stay
+        // trusted forever.
+        crate::license::load_or_init(_app.license.clone());
         crate::startup_log::log("AudioMeterApp::new: end");
         #[allow(clippy::let_and_return)]
         return _app;
@@ -788,8 +813,19 @@ impl eframe::App for AudioMeterApp {
         // of the UI has been laid out. No-op while the updater is Idle /
         // Checking / UpToDate / NetworkError / dismissed.
         self.maybe_show_update_modal(&ctx);
+        // Same pattern for the paid-license / trial gate. When the user is in
+        // TrialExpired / Invalid the modal is un-dismissable until they
+        // activate or quit — see `maybe_show_license_gate` for state mapping.
+        self.maybe_show_license_gate(&ctx);
         let now = ctx.input(|i| i.time);
-        self.tick_meters();
+        // Freeze meter animation when the license gate is blocking the UI so
+        // the dim overlay doesn't sit on top of still-dancing meters. Audio
+        // capture keeps running in the background (we don't stop the engine)
+        // so unlocking the app resumes instantly from the live signal.
+        let license_grants_access = self.license.lock().grants_full_access();
+        if license_grants_access {
+            self.tick_meters();
+        }
         // Spectrum: run the analyzer while the tab is open, and keep decaying after Stop even if
         // another panel is selected (otherwise FFT state never reaches the noise floor).
         let spectrum_capturing = self.spectrum.read().active;
@@ -832,6 +868,16 @@ impl eframe::App for AudioMeterApp {
                         .size(11.0),
                 );
                 self.render_update_status_chip(ui);
+                // Second separator + license status chip. Clicking it pops the
+                // license gate modal even when the app isn't in a locked state
+                // (useful while licensed, so the user can get to Manage
+                // License / Deactivate without digging into the left panel).
+                ui.label(
+                    RichText::new("·")
+                        .color(Color32::from_gray(80))
+                        .size(11.0),
+                );
+                self.render_license_status_chip(ui);
 
                 // Right-align credits. In `right_to_left`, the first child is at the far right,
                 // so add chunks tail-first: margin → `Ayrthon` (clickable link) → leading
@@ -1252,6 +1298,486 @@ impl AudioMeterApp {
             if let Err(e) = save_settings_file(p, &data) {
                 log::warn!("failed to save settings: {e}");
             }
+        }
+    }
+
+    /// Status chip sibling of [`render_update_status_chip`], placed just after
+    /// it in the title row. Shows:
+    ///
+    /// * `Trial: N days left` (or `last day` at N=1) — dim white, clickable;
+    ///   opens the license modal preloaded in "enter key / buy" mode.
+    /// * `Trial expired — enter license` — amber, clickable; forced modal.
+    /// * `Licensed` — muted green, clickable; opens Manage License.
+    /// * `Licensed — re-check in N d` — amber, clickable, while inside the
+    ///   offline grace slope past REVALIDATE_EVERY_DAYS.
+    /// * `License invalid — fix` — soft red, clickable.
+    /// * `Updating license…` — dim grey, non-clickable (Activating /
+    ///   Deactivating).
+    /// * Hidden for `Unknown` / `NetworkError` (no noise at startup).
+    fn render_license_status_chip(&mut self, ui: &mut egui::Ui) {
+        use crate::license::LicenseStatus;
+        let status = { self.license.lock().clone() };
+
+        // Muted green for "you're fine", matches the ACCENT used elsewhere
+        // for positive / active states but at lower intensity.
+        let licensed_green = Color32::from_rgb(0x7d, 0xc6, 0x7e);
+        let warn_amber = Color32::from_rgb(0xff, 0xc4, 0x7a);
+        let err_red = Color32::from_rgb(0xff, 0xb4, 0xb4);
+
+        // (text, color, clickable) tuple so the common rendering path is
+        // shared. Clickable chips sense input and flip `license_modal_forced`.
+        let (text, color, clickable): (String, Color32, bool) = match &status {
+            LicenseStatus::Unknown => return,
+            LicenseStatus::NetworkError(_) => return,
+            LicenseStatus::TrialActive { days_left } => {
+                let label = if *days_left <= 1 {
+                    "Trial: last day".to_string()
+                } else {
+                    format!("Trial: {} days left", days_left)
+                };
+                (label, Color32::from_gray(180), true)
+            }
+            LicenseStatus::TrialExpired => (
+                "Trial expired — enter license".to_string(),
+                warn_amber,
+                true,
+            ),
+            LicenseStatus::Licensed {
+                offline_days_left, ..
+            } => match offline_days_left {
+                None => ("Licensed".to_string(), licensed_green, true),
+                Some(n) => (
+                    format!("Licensed — re-check in {} d", n),
+                    warn_amber,
+                    true,
+                ),
+            },
+            LicenseStatus::Invalid(_) => {
+                ("License invalid — fix".to_string(), err_red, true)
+            }
+            LicenseStatus::Activating => (
+                "Activating license…".to_string(),
+                Color32::from_gray(170),
+                false,
+            ),
+            LicenseStatus::Deactivating => (
+                "Deactivating…".to_string(),
+                Color32::from_gray(170),
+                false,
+            ),
+        };
+
+        if clickable {
+            let resp = ui.add(
+                Label::new(RichText::new(text).color(color).size(11.0).strong())
+                    .sense(Sense::click()),
+            );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                self.license_modal_forced = true;
+                self.license_activation_error = None;
+            }
+        } else {
+            ui.label(RichText::new(text).color(color).size(11.0));
+        }
+    }
+
+    /// The license-gate equivalent of [`maybe_show_update_modal`]. Auto-shows
+    /// an unskippable modal when the user is TrialExpired / Invalid (so the
+    /// app is functionally behind a pay/activate wall); otherwise only shows
+    /// the modal when `license_modal_forced` is set (user clicked the chip or
+    /// a "Manage License" button).
+    fn maybe_show_license_gate(&mut self, ctx: &egui::Context) {
+        use crate::license::LicenseStatus;
+
+        // Defer until the splash has handed off to the main window — no modal
+        // should pop while the viewport is still parked off-screen.
+        #[cfg(windows)]
+        if !self.main_window_revealed {
+            return;
+        }
+
+        let status = { self.license.lock().clone() };
+
+        // First-run "welcome to your trial" info modal. Runs once per Windows
+        // user (persisted in `user_settings.license_welcome_shown`) and only
+        // when the app legitimately believes we're inside a fresh trial —
+        // i.e. ≥ 12 of the 14 days are still on the clock. This guards
+        // against surfacing the welcome after a support-driven license.json
+        // reset on an old install.
+        if let crate::license::LicenseStatus::TrialActive { days_left } = &status {
+            let shown = self.user_settings.lock().license_welcome_shown;
+            if !shown && *days_left as i64 >= crate::license::TRIAL_DAYS - 1 {
+                self.render_trial_welcome_modal(ctx, *days_left);
+                // While the welcome modal is up, suppress the license gate
+                // modal so the user isn't hit with a key-entry form on their
+                // very first launch.
+                return;
+            }
+        }
+
+        let locked = !status.grants_full_access();
+        if !locked && !self.license_modal_forced {
+            return;
+        }
+        self.render_license_modal(ctx, &status, locked);
+    }
+
+    fn render_trial_welcome_modal(&mut self, ctx: &egui::Context, days_left: u32) {
+        let mut click_close = false;
+        let mut click_buy = false;
+        let dlg = Modal::new(egui::Id::new("license_trial_welcome_modal"))
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                ui.heading(
+                    RichText::new("Welcome to AYR Audio Meter")
+                        .color(TITLE_COL)
+                        .size(17.0),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "You have a free {}-day trial — every feature is unlocked. \
+                         You're on day 1; {} day{} remaining.",
+                        crate::license::TRIAL_DAYS,
+                        days_left,
+                        if days_left == 1 { "" } else { "s" }
+                    ))
+                    .size(11.5)
+                    .color(Color32::from_gray(215)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "When the trial ends, enter a license key to keep going. \
+                         You can buy one any time from the License chip in the top bar.",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_gray(175)),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Buy a license")
+                                    .size(12.0)
+                                    .color(Color32::from_gray(220)),
+                            )
+                            .min_size(egui::vec2(130.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        click_buy = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Start trial")
+                                        .strong()
+                                        .color(Color32::from_rgb(0xb4, 0xe0, 0xff)),
+                                )
+                                .min_size(egui::vec2(110.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            click_close = true;
+                            ui.close();
+                        }
+                    });
+                });
+            });
+        if click_close || dlg.should_close() {
+            self.user_settings.lock().license_welcome_shown = true;
+            self.persist_user_settings();
+        }
+        if click_buy {
+            ctx.open_url(OpenUrl::new_tab(crate::license::CHECKOUT_URL));
+        }
+    }
+
+    fn render_license_modal(
+        &mut self,
+        ctx: &egui::Context,
+        status: &crate::license::LicenseStatus,
+        locked: bool,
+    ) {
+        use crate::license::{self, LicenseStatus};
+
+        // Snapshot values we need inside the closure so we don't need a
+        // double-borrow of `self`. User-driven actions set booleans we act on
+        // after the closure runs.
+        let mut submit_key = false;
+        let mut click_buy = false;
+        let mut click_deactivate = false;
+        let mut click_portal = false;
+        let mut click_close = false;
+        let mut click_revalidate = false;
+
+        let dlg = Modal::new(egui::Id::new("license_gate_modal")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+
+            // --- Title + subtitle based on current status ---------------
+            let (title, subtitle, title_color) = match status {
+                LicenseStatus::TrialActive { days_left } => (
+                    "Trial active".to_string(),
+                    format!(
+                        "You have {} day{} of the free trial remaining.",
+                        days_left,
+                        if *days_left == 1 { "" } else { "s" }
+                    ),
+                    Color32::from_rgb(0x7d, 0xc6, 0x7e),
+                ),
+                LicenseStatus::TrialExpired => (
+                    "Trial expired".to_string(),
+                    "Enter a license key to keep using AYR Audio Meter.".into(),
+                    Color32::from_rgb(0xff, 0xc4, 0x7a),
+                ),
+                LicenseStatus::Invalid(msg) => (
+                    "License issue".to_string(),
+                    msg.clone(),
+                    Color32::from_rgb(0xff, 0xb4, 0xb4),
+                ),
+                LicenseStatus::Licensed {
+                    offline_days_left, ..
+                } => {
+                    let sub = match offline_days_left {
+                        None => "Thanks for supporting AYR Audio.".to_string(),
+                        Some(n) => format!(
+                            "Thanks for supporting AYR Audio. Offline grace: \
+                             {} day{} until a re-check is required.",
+                            n,
+                            if *n == 1 { "" } else { "s" }
+                        ),
+                    };
+                    ("Manage license".to_string(), sub, Color32::WHITE)
+                }
+                LicenseStatus::Activating => (
+                    "Activating…".to_string(),
+                    "Contacting the license server — this normally takes a second or two.".into(),
+                    Color32::from_gray(210),
+                ),
+                LicenseStatus::Deactivating => (
+                    "Deactivating…".to_string(),
+                    "Releasing this PC from your license.".into(),
+                    Color32::from_gray(210),
+                ),
+                // Unknown / NetworkError never open the modal, but render a
+                // safe placeholder if somehow reached.
+                _ => ("License".into(), String::new(), Color32::WHITE),
+            };
+
+            ui.heading(RichText::new(title).color(title_color).size(17.0));
+            if !subtitle.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(subtitle)
+                        .size(11.5)
+                        .color(Color32::from_gray(210)),
+                );
+            }
+
+            ui.add_space(12.0);
+
+            // --- Licensed: show summary + Manage actions ----------------
+            if let LicenseStatus::Licensed {
+                email,
+                activations_used,
+                activations_limit,
+                ..
+            } = status
+            {
+                ui.add_space(2.0);
+                if !email.is_empty() {
+                    kv_row(ui, "Email", email);
+                }
+                kv_row(
+                    ui,
+                    "Activations",
+                    &format!("{} of {}", activations_used, activations_limit),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Re-check now")
+                                    .size(12.0)
+                                    .color(Color32::from_gray(220)),
+                            )
+                            .min_size(egui::vec2(110.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        click_revalidate = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Customer portal")
+                                    .size(12.0)
+                                    .color(Color32::from_gray(220)),
+                            )
+                            .min_size(egui::vec2(140.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        click_portal = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Deactivate this PC")
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(0xff, 0xc4, 0x7a)),
+                            )
+                            .min_size(egui::vec2(170.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        click_deactivate = true;
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Close")
+                                        .strong()
+                                        .color(Color32::from_rgb(0xb4, 0xe0, 0xff)),
+                                )
+                                .min_size(egui::vec2(100.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            click_close = true;
+                            ui.close();
+                        }
+                    });
+                });
+                return;
+            }
+
+            // --- Unlicensed (trial / expired / invalid) ------------------
+            // Key entry row.
+            ui.label(
+                RichText::new("License key")
+                    .size(10.5)
+                    .color(Color32::from_gray(160)),
+            );
+            ui.add_space(3.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.license_key_input)
+                    .hint_text("XXXX-XXXX-XXXX-XXXX-XXXX")
+                    .desired_width(420.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            if resp.changed() {
+                self.license_activation_error = None;
+            }
+            if resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !matches!(status, LicenseStatus::Activating)
+            {
+                submit_key = true;
+            }
+
+            if let Some(ref err) = self.license_activation_error {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(err)
+                        .size(10.5)
+                        .color(Color32::from_rgb(0xff, 0xb4, 0xb4)),
+                );
+            }
+
+            ui.add_space(12.0);
+
+            let activating = matches!(status, LicenseStatus::Activating);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !activating,
+                        egui::Button::new(
+                            RichText::new("Activate")
+                                .strong()
+                                .color(Color32::from_rgb(0xb4, 0xe0, 0xff))
+                                .size(12.0),
+                        )
+                        .min_size(egui::vec2(110.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    submit_key = true;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Buy license — €24.95")
+                                .size(12.0)
+                                .color(Color32::from_gray(220)),
+                        )
+                        .min_size(egui::vec2(180.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    click_buy = true;
+                }
+            });
+
+            // --- Footer: Later button only when NOT locked --------------
+            if !locked {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("Later").min_size(egui::vec2(92.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            click_close = true;
+                            ui.close();
+                        }
+                    });
+                });
+            }
+        });
+
+        // --- Handle actions ---------------------------------------------
+        if submit_key {
+            let key = self.license_key_input.trim().to_string();
+            if key.len() < 8 {
+                self.license_activation_error =
+                    Some("That key doesn't look right. Please check and try again.".into());
+            } else {
+                self.license_activation_error = None;
+                license::spawn_activate(key, self.license.clone());
+            }
+        }
+        if click_buy {
+            ctx.open_url(OpenUrl::new_tab(license::CHECKOUT_URL));
+        }
+        if click_portal {
+            ctx.open_url(OpenUrl::new_tab(license::CUSTOMER_PORTAL_URL));
+        }
+        if click_revalidate {
+            license::spawn_validate(self.license.clone());
+        }
+        if click_deactivate {
+            license::spawn_deactivate(self.license.clone());
+        }
+
+        // Auto-dismiss when a click-outside / Esc was honored by the modal —
+        // but only when the user isn't locked (otherwise the modal is
+        // effectively required and we re-open on the next frame).
+        if (click_close || dlg.should_close()) && !locked {
+            self.license_modal_forced = false;
         }
     }
 
@@ -2741,6 +3267,26 @@ fn left_panel_1px_band(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), Sense::hover());
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, color);
+}
+
+/// Simple two-column key/value row used inside the license modal. Left label
+/// is dim, right value is full-width so long emails don't wrap oddly.
+fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [92.0, 16.0],
+            egui::Label::new(
+                RichText::new(key)
+                    .size(10.5)
+                    .color(Color32::from_gray(150)),
+            ),
+        );
+        ui.label(
+            RichText::new(value)
+                .size(11.0)
+                .color(Color32::from_gray(225)),
+        );
+    });
 }
 
 /// Two-tone inset horizontal divider: 1 px dark shadow stacked above a 1 px light highlight.

@@ -1,6 +1,6 @@
 [package]
 name = "audio-meter-rs"
-version = "1.6.8"
+version = "2.0.0"
 edition = "2024"
 description = "Real-time audio meter and level history viewer."
 
@@ -15,17 +15,22 @@ parking_lot = "0.12"
 ebur128 = "0.1"
 realfft = "3"
 hound = "3.5"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Blocking HTTP client for the in-app update check (GitHub Releases API).
-# Kept on default features (`tls` via rustls + webpki-roots, `json`, `gzip`) so
-# HTTPS to api.github.com / objects.githubusercontent.com works with zero
+# Blocking HTTP client for the in-app update check (GitHub Releases API) and
+# Lemon Squeezy license keys API (`src/license.rs`). Kept on default features
+# (`tls` via rustls + webpki-roots, `json`, `gzip`) so HTTPS to api.github.com
+# / objects.githubusercontent.com / api.lemonsqueezy.com works with zero
 # per-platform TLS config. No async runtime pulled in.
 ureq = { version = "2", features = ["json"] }
+# SHA-256 used to hash the (MachineGuid, Windows user) pair into the per-device
+# `instance_name` we send to Lemon Squeezy at activation time. Salted + hex
+# encoded so the raw machine/user identifiers never leave the device.
+sha2 = "0.10"
 
 # Linux / macOS: Glow (OpenGL). Repo's visual baseline was tuned against
 # Glow on Linux, and Wayland/X11 wgpu has its own quirks we haven't
@@ -62,6 +67,12 @@ eframe = { version = "0.34", default-features = false, features = [
     "wgpu",
 ] }
 wasapi = "0.23"
+# Registry access for:
+#   - HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid (stable per-OS-install id,
+#     one half of the device fingerprint in `src/license.rs`)
+#   - HKCU\Software\AYR Audio\AudioMeter (trial-start timestamp stored redundantly
+#     next to the JSON anchor for rollback resistance; we take the min of both).
+winreg = "0.52"
 
 [build-dependencies]
 ico = "0.3"
