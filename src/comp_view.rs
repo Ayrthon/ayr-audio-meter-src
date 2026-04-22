@@ -340,23 +340,63 @@ impl Default for CompEnvelope {
 
 // ---- Analysis ---------------------------------------------------------------------
 
+/// Peak-level histogram range / resolution used by the sliding-window PR calc.
+/// 0.25 dB bins over [-80, +3] dBFS → 332 bins. Matches EBU R128-style loudness
+/// histograms: fine enough that percentile quantization error is under 0.5 dB
+/// (well below the ±2 dB wobble caused by content variation itself), coarse
+/// enough that sliding cost is negligible.
+const PR_HIST_MIN_DB: f32 = -80.0;
+const PR_HIST_MAX_DB: f32 = 3.0;
+const PR_HIST_BIN_DB: f32 = 0.25;
+const PR_HIST_BINS: usize =
+    ((PR_HIST_MAX_DB - PR_HIST_MIN_DB) / PR_HIST_BIN_DB) as usize;
+
+/// Map a dBFS peak value to its histogram bin index, clamped to `[0, PR_HIST_BINS)`.
+#[inline]
+fn pr_hist_bin_of(db: f32) -> usize {
+    let t = ((db - PR_HIST_MIN_DB) / PR_HIST_BIN_DB).floor() as isize;
+    t.clamp(0, PR_HIST_BINS as isize - 1) as usize
+}
+
+/// Given a peak-level histogram (`hist`) with `total` gated buckets in it, return
+/// the dBFS value at percentile `pctl ∈ [0, 1]` by scanning cumulative counts.
+/// O(PR_HIST_BINS) per call. Returns bin-center dB so results quantize cleanly.
+#[inline]
+fn pr_percentile_from_hist(hist: &[u32], total: u32, pctl: f32) -> f32 {
+    debug_assert!(total > 0);
+    // Nearest-rank percentile on the (total-1)-indexed distribution.
+    let target = ((total as f32 - 1.0) * pctl).round() as u32;
+    let mut cum: u32 = 0;
+    for (i, &c) in hist.iter().enumerate() {
+        let next = cum + c;
+        if next > target {
+            return PR_HIST_MIN_DB + (i as f32 + 0.5) * PR_HIST_BIN_DB;
+        }
+        cum = next;
+    }
+    PR_HIST_MIN_DB + (PR_HIST_BINS as f32 - 0.5) * PR_HIST_BIN_DB
+}
+
 /// Returns the Peak Range (dB) at every bucket position, computed over a trailing
 /// window of [`PR_WINDOW_BUCKETS`]. At each `i`:
 ///
-/// 1. Collect per-bucket peak magnitudes (max(|peak_pos|, |peak_neg|)) across the
-///    window `[i - w + 1 ..= i]`.
-/// 2. Discard any bucket whose peak is below [`PR_PEAK_GATE_LIN`] (absolute silence
-///    gate — keeps tails and room tone out of the distribution).
-/// 3. If fewer than [`PR_MIN_GATED_BUCKETS`] survive → `NaN` (insufficient material).
-/// 4. Otherwise return `P95(peak_dB) - P10(peak_dB)` in dB.
+/// 1. The peak magnitude (`max(|peak_pos|, |peak_neg|)`) of the arriving bucket is
+///    added to a sliding peak-level histogram, and the departing bucket's entry
+///    (if it was above the gate) is removed.
+/// 2. Buckets below [`PR_PEAK_GATE_LIN`] are ignored (absolute silence gate — keeps
+///    tails and room tone out of the distribution).
+/// 3. If fewer than [`PR_MIN_GATED_BUCKETS`] gated buckets are currently in the
+///    window → `NaN` (insufficient material).
+/// 4. Otherwise `P95(peak_dB) - P10(peak_dB)` is computed from the histogram.
 ///
 /// The percentile spread is what the eye is reading when it looks at the "flatness"
 /// of the upper envelope — it goes to zero when all peaks sit at the same level
 /// (brickwall limiter) and grows as peaks spread out (dynamic transients).
 ///
-/// Per-window cost: one `O(w log w)` sort on ≤ `w` samples. Across all `n` buckets
-/// that's ≈ 1600 × 600 × log(600) ≈ 10 M compares per UI frame, well inside the
-/// 16 ms budget — and only recomputed on frames when the view is open.
+/// Per-frame cost: O(n × PR_HIST_BINS) = 1600 × 332 ≈ 0.5 M bin ops plus 2 percentile
+/// scans per bucket. Replaces an earlier O(n · w log w) ≈ 10 M compare formulation
+/// that sorted a fresh scratch vec at every bucket and was visibly slow under debug
+/// builds / on low-power GPUs.
 fn windowed_peak_range_db(ordered: &[CompBucket], window: usize) -> Vec<f32> {
     let n = ordered.len();
     let mut out = vec![f32::NAN; n];
@@ -364,36 +404,43 @@ fn windowed_peak_range_db(ordered: &[CompBucket], window: usize) -> Vec<f32> {
         return out;
     }
 
-    // Precompute per-bucket peak in dBFS, or NaN for gated-out buckets. Done once so
-    // the per-window loop only has to copy finite values into a scratch buffer.
-    let mut peak_db: Vec<f32> = Vec::with_capacity(n);
+    // Precompute per-bucket histogram bin (or `usize::MAX` for sub-gate buckets). One
+    // pass over `ordered` so the sliding loop is a tight integer hop.
+    let mut peak_bin: Vec<usize> = Vec::with_capacity(n);
     for b in ordered {
         let p = b.peak_pos.abs().max(b.peak_neg.abs());
-        peak_db.push(if p >= PR_PEAK_GATE_LIN {
-            20.0 * p.log10()
+        peak_bin.push(if p >= PR_PEAK_GATE_LIN {
+            pr_hist_bin_of(20.0 * p.log10())
         } else {
-            f32::NAN
+            usize::MAX
         });
     }
 
-    let mut scratch: Vec<f32> = Vec::with_capacity(window);
+    let mut hist = vec![0u32; PR_HIST_BINS];
+    let mut total: u32 = 0;
+
     for i in 0..n {
-        let start = (i + 1).saturating_sub(window);
-        scratch.clear();
-        for &v in &peak_db[start..=i] {
-            if v.is_finite() {
-                scratch.push(v);
+        // Add the arriving bucket if it was above the gate.
+        let bin_in = peak_bin[i];
+        if bin_in != usize::MAX {
+            hist[bin_in] += 1;
+            total += 1;
+        }
+        // Remove the departing bucket (the one that just slid out of the trailing
+        // `window` samples) if it was above the gate.
+        if i >= window {
+            let bin_out = peak_bin[i - window];
+            if bin_out != usize::MAX {
+                hist[bin_out] -= 1;
+                total -= 1;
             }
         }
-        if scratch.len() < PR_MIN_GATED_BUCKETS {
-            continue; // leave NaN
+
+        if (total as usize) < PR_MIN_GATED_BUCKETS {
+            continue; // NaN stays
         }
-        scratch.sort_unstable_by(f32::total_cmp);
-        let last = scratch.len() - 1;
-        let p10_idx = (last as f32 * 0.10).round() as usize;
-        let p95_idx = (last as f32 * 0.95).round() as usize;
-        let p10 = scratch[p10_idx];
-        let p95 = scratch[p95_idx];
+        let p10 = pr_percentile_from_hist(&hist, total, 0.10);
+        let p95 = pr_percentile_from_hist(&hist, total, 0.95);
         out[i] = (p95 - p10).max(0.0);
     }
     out
