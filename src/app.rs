@@ -12,7 +12,7 @@ use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Label, Layout, Margin,
     OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions,
-    Widget,
+    UiBuilder, Widget,
 };
 use egui::collapsing_header::CollapsingState;
 use egui::containers::menu::menu_style;
@@ -149,6 +149,12 @@ pub struct AudioMeterApp {
     /// a difference triggers a width snap + min-inner-size update next stable frame
     /// (same pattern as `last_panel`).
     last_left_collapsed: bool,
+    /// Last-frame value of the left-column open animation (`0.0` = fully collapsed,
+    /// `1.0` = fully expanded). Written by `ui()`, read by `maybe_resize_for_graph`
+    /// so it can *defer* the OS window shrink until the slide-out animation has
+    /// actually finished (otherwise the meters briefly overflow the shrinking
+    /// window edge mid-animation).
+    left_open_anim_t: f32,
     /// Per-channel levels fed to the history ring (same as each meter **bar fill**).
     history_trace: SharedHistoryTrace,
     levels: SharedLevels,
@@ -193,24 +199,28 @@ pub struct AudioMeterApp {
 
 /// Target window widths for the two UI modes.  The app snaps to one
 /// of these whenever the user toggles the history graph.
-const WINDOW_W_WITH_GRAPH: f32 = 1140.0;
+const WINDOW_W_WITH_GRAPH: f32 = 1220.0;
 
 /// Minimum window width when the graph / spectrum panel is visible —
 /// enough to keep the right-hand panel usable (in particular the
 /// spectrum analyzer needs a few hundred pixels for its log-frequency
 /// axis to be readable).  Matches the graph snap width so the user
 /// always sees a full-width graph when it's on.
-const WINDOW_W_MIN_WITH_GRAPH: f32 = 1140.0;
+const WINDOW_W_MIN_WITH_GRAPH: f32 = 1220.0;
 
 /// Fixed outer width of the left column (reserved in the main horizontal layout).
 const LEFT_COLUMN_OUTER_W: f32 = 340.0;
 /// Width of the always-visible collapse/expand rail to the LEFT of the left column.
 /// A thin strip with a chevron toggle; clicking hides the full left column and gives
 /// the meters / graph its width back.
-const LEFT_COLLAPSE_RAIL_W: f32 = 18.0;
+const LEFT_COLLAPSE_RAIL_W: f32 = 26.0;
 /// Horizontal spacer between the rail and whatever sits to its right (the left column
 /// when expanded, or the meters divider when collapsed).
 const LEFT_COLLAPSE_RAIL_GAP: f32 = 2.0;
+/// Duration of the slide animation when the user toggles the left collapse rail.
+/// Fast enough to feel snappy (matches egui's default `animation_time`) while still
+/// being perceptible as "sliding under the rail" rather than a teleport.
+const LEFT_COLLAPSE_ANIM_SECS: f32 = 0.22;
 /// Inner width inside the left column’s padded frame (`inner_margin` 10 px each side).
 const LEFT_COLUMN_INNER_W: f32 = LEFT_COLUMN_OUTER_W - 20.0;
 /// Reserve space for the vertical scrollbar so combo/slider width does not depend on tab content.
@@ -343,6 +353,9 @@ impl AudioMeterApp {
             left_tab: LeftPanelTab::default(),
             left_collapsed: left_collapsed_from_disk,
             last_left_collapsed: left_collapsed_from_disk,
+            // Seed the animation state to match the persisted collapse state so the
+            // very first frame lays out without a spurious slide animation.
+            left_open_anim_t: if left_collapsed_from_disk { 0.0 } else { 1.0 },
             history_trace: make_shared_history_trace(),
             levels: make_shared_levels(),
             loudness: make_shared_loudness(),
@@ -523,6 +536,17 @@ impl AudioMeterApp {
         // re-attempts the update.
         let pointer_busy = ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed());
         if pointer_busy || !rect_stable {
+            return;
+        }
+
+        // When the user is COLLAPSING the left column, the OS window must only
+        // shrink AFTER the slide-out animation has finished — otherwise the
+        // meters (pinned to the right of the still-animating column slot) would
+        // briefly overflow the shrinking window edge. Expanding is fine to fire
+        // immediately: the window widens first, then the column slides in from
+        // under the rail into the newly-available space.
+        let just_collapsed = collapse_changed && self.left_collapsed;
+        if just_collapsed && self.left_open_anim_t > 0.01 {
             return;
         }
 
@@ -812,7 +836,9 @@ impl eframe::App for AudioMeterApp {
             ui.horizontal_top(|ui| {
                 // Always-on collapse / expand rail at the far left. Clicking toggles
                 // `self.left_collapsed`, which on the next stable frame triggers
-                // a window width snap via `maybe_resize_for_graph`.
+                // a window width snap via `maybe_resize_for_graph` (gated on the
+                // slide animation below so the window doesn't shrink until the
+                // column has finished sliding out).
                 if paint_left_collapse_rail(ui, self.left_collapsed) {
                     self.left_collapsed = !self.left_collapsed;
                     self.user_settings.lock().left_panel_collapsed = self.left_collapsed;
@@ -820,21 +846,54 @@ impl eframe::App for AudioMeterApp {
                 }
                 ui.add_space(LEFT_COLLAPSE_RAIL_GAP);
 
-                if !self.left_collapsed {
-                    // Fixed width so Controls / Loudness / Clips never change the column width.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(LEFT_COLUMN_OUTER_W, ui.available_height()),
-                        Layout::top_down(Align::Min),
+                // Smooth 0..1 slide factor. `animate_bool_with_time` interpolates
+                // linearly and internally calls `request_repaint` while the
+                // animation is in flight, so we don't need to drive frames manually.
+                // We apply a `smoothstep` on top for a gentler ease-in-out curve.
+                let open_linear = ui.ctx().animate_bool_with_time(
+                    egui::Id::new("left_column_open_anim"),
+                    !self.left_collapsed,
+                    LEFT_COLLAPSE_ANIM_SECS,
+                );
+                let open_t = {
+                    let x = open_linear.clamp(0.0, 1.0);
+                    x * x * (3.0 - 2.0 * x) // smoothstep
+                };
+                self.left_open_anim_t = open_t;
+
+                // Column slot width animates between 0 and `LEFT_COLUMN_OUTER_W`.
+                // The content is rendered at its NATURAL full 340 px width inside
+                // a clipped sub-ui whose right edge is pinned to the slot's right
+                // edge — so as the slot shrinks, the column appears to slide left
+                // *under* the rail rather than reflowing / squeezing its widgets.
+                let avail_h = ui.available_height();
+                let slot_w = LEFT_COLUMN_OUTER_W * open_t;
+                if slot_w > 0.5 {
+                    let (slot_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(slot_w, avail_h),
+                        Sense::hover(),
+                    );
+                    let content_rect = egui::Rect::from_min_size(
+                        egui::pos2(slot_rect.max.x - LEFT_COLUMN_OUTER_W, slot_rect.min.y),
+                        egui::vec2(LEFT_COLUMN_OUTER_W, avail_h),
+                    );
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .max_rect(content_rect)
+                            .layout(Layout::top_down(Align::Min)),
                         |ui| {
+                            // Hide any content that extends past the slot's left
+                            // edge while the animation is in progress.
+                            ui.set_clip_rect(slot_rect);
                             ui.set_min_width(LEFT_COLUMN_OUTER_W);
                             ui.set_max_width(LEFT_COLUMN_OUTER_W);
                             self.left_controls(ui);
                         },
                     );
-                    // A bit of clearance on the left for the left-column's scrollbar,
-                    // tighter on the meter side so the divider hugs the meters column.
-                    ui.add_space(3.0);
                 }
+                // Trailing scrollbar clearance also animates so it doesn't leave a
+                // 3 px dead gap next to the rail once the column is fully collapsed.
+                ui.add_space(3.0 * open_t);
                 inset_vertical_divider(ui);
                 ui.add_space(2.0);
                 self.meters_and_graph(ui, now);
@@ -2305,9 +2364,10 @@ fn paint_left_collapse_rail(ui: &mut egui::Ui, collapsed: bool) -> bool {
         p.rect_filled(light, CornerRadius::ZERO, LEFT_SECTION_INNER_HIGHLIGHT);
     }
 
-    // Chevron: centered on the rail. Drawn with line segments to match the
-    // accordion chevrons pixel-for-pixel.
-    let cx = rect.center().x - 1.0; // nudge left of center so the chevron doesn't visually crowd the divider
+    // Chevron: true-centered on the rail (both axes). The rail is wide enough
+    // (26 px) that no horizontal nudge is needed to avoid crowding the right-edge
+    // divider — roughly 11 px of clearance sits on each side.
+    let cx = rect.center().x;
     let cy = rect.center().y;
     let s = 3.2;
     let arm = 3.0;

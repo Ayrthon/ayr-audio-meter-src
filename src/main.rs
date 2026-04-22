@@ -38,7 +38,7 @@ const SPLASH_FADE_OUT: Duration = Duration::from_millis(500);
 
 /// Initial outer size of the main window in logical pixels, used to compute
 /// a centered launch position.
-pub const MAIN_W: f32 = 1140.0;
+pub const MAIN_W: f32 = 1220.0;
 pub const MAIN_H: f32 = 649.0;
 
 /// Re-exported so `app.rs` can know when to un-park the main window and
