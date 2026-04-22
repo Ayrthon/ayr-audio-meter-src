@@ -15,12 +15,18 @@ pub struct UserSettingsData {
     /// When `None`, clips use the built‑in default under local app data (`audio-meter-rs/clips`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clips_save_dir: Option<PathBuf>,
+
+    /// Remember whether the user had the left column collapsed when the app exited,
+    /// so the next launch opens with the same layout. Default (unset) = expanded.
+    #[serde(default)]
+    pub left_panel_collapsed: bool,
 }
 
 impl Default for UserSettingsData {
     fn default() -> Self {
         Self {
             clips_save_dir: None,
+            left_panel_collapsed: false,
         }
     }
 }

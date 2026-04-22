@@ -142,6 +142,13 @@ pub struct AudioMeterApp {
     user_settings_path: Option<PathBuf>,
     /// Which section of the left column is visible (Controls / Loudness / Clips).
     left_tab: LeftPanelTab,
+    /// When true, the full left column is hidden and only a thin collapse/expand
+    /// rail remains at the far left. Persisted in `user_settings`.
+    left_collapsed: bool,
+    /// Mirrors [`Self::left_collapsed`] on the last frame the auto-resize logic saw;
+    /// a difference triggers a width snap + min-inner-size update next stable frame
+    /// (same pattern as `last_panel`).
+    last_left_collapsed: bool,
     /// Per-channel levels fed to the history ring (same as each meter **bar fill**).
     history_trace: SharedHistoryTrace,
     levels: SharedLevels,
@@ -197,6 +204,13 @@ const WINDOW_W_MIN_WITH_GRAPH: f32 = 1140.0;
 
 /// Fixed outer width of the left column (reserved in the main horizontal layout).
 const LEFT_COLUMN_OUTER_W: f32 = 340.0;
+/// Width of the always-visible collapse/expand rail to the LEFT of the left column.
+/// A thin strip with a chevron toggle; clicking hides the full left column and gives
+/// the meters / graph its width back.
+const LEFT_COLLAPSE_RAIL_W: f32 = 18.0;
+/// Horizontal spacer between the rail and whatever sits to its right (the left column
+/// when expanded, or the meters divider when collapsed).
+const LEFT_COLLAPSE_RAIL_GAP: f32 = 2.0;
 /// Inner width inside the left column’s padded frame (`inner_margin` 10 px each side).
 const LEFT_COLUMN_INNER_W: f32 = LEFT_COLUMN_OUTER_W - 20.0;
 /// Reserve space for the vertical scrollbar so combo/slider width does not depend on tab content.
@@ -217,17 +231,27 @@ const LUFS_GRID_WIDTH_FRAC: f32 = 0.86;
 /// Compute how wide the window needs to be to fit the left panel + the
 /// N meters + the "0 dB ref" label column (no graph).  Keeping this
 /// dynamic means mono / stereo / 5.1 / 7.1 all snap to the right size.
-fn window_w_without_graph(channels: usize) -> f32 {
-    // Left column outer width (see `LEFT_COLUMN_OUTER_W` + frame margins in layout).
-    const LEFT_PANEL: f32 = LEFT_COLUMN_OUTER_W;
-    // 6 px gap + vertical separator (~2 px + item_spacing) + 6 px gap.
-    const GUTTERS: f32 = 20.0;
+///
+/// `left_collapsed` accounts for the user having hidden the full 340 px left column
+/// via the collapse rail; when true the window can safely shrink by that amount while
+/// keeping the rail + dividers + meters in view.
+fn window_w_without_graph(channels: usize, left_collapsed: bool) -> f32 {
+    // Rail (always visible) + its trailing spacer to the left of everything else.
+    const RAIL_BLOCK: f32 = LEFT_COLLAPSE_RAIL_W + LEFT_COLLAPSE_RAIL_GAP;
+    // Left column (only contributes when expanded) + its trailing spacer.
+    let left_column_block = if left_collapsed {
+        0.0
+    } else {
+        LEFT_COLUMN_OUTER_W + 3.0
+    };
+    // Vertical divider (~2 px) + small leading spacer before the meters column.
+    const DIVIDER_BLOCK: f32 = 4.0;
     // CentralPanel / window-frame padding on each side.
     const OUTER_PAD: f32 = 18.0;
     // Allocated meters-column width inside `meters_and_graph` (must match
     // `meter_strip_content_width` + any in-strip extras).
     let meter_col = crate::meter_widget::meter_strip_content_width(channels);
-    LEFT_PANEL + GUTTERS + meter_col + OUTER_PAD
+    RAIL_BLOCK + left_column_block + DIVIDER_BLOCK + meter_col + OUTER_PAD
 }
 
 impl AudioMeterApp {
@@ -288,6 +312,7 @@ impl AudioMeterApp {
         history.write().set_channels(2);
 
         let (settings_data, settings_path) = load_settings_file();
+        let left_collapsed_from_disk = settings_data.left_panel_collapsed;
         let user_settings = make_shared_user_settings(settings_data);
 
         let _app = Self {
@@ -316,6 +341,8 @@ impl AudioMeterApp {
             user_settings,
             user_settings_path: settings_path,
             left_tab: LeftPanelTab::default(),
+            left_collapsed: left_collapsed_from_disk,
+            last_left_collapsed: left_collapsed_from_disk,
             history_trace: make_shared_history_trace(),
             levels: make_shared_levels(),
             loudness: make_shared_loudness(),
@@ -452,10 +479,11 @@ impl AudioMeterApp {
     }
 
     /// Snap the OS window to the appropriate width whenever the user
-    /// switches the right panel between Off / History / Spectrum —
-    /// but only when the user hasn't manually resized or maximized
-    /// the window, and only when the viewport has been sitting still
-    /// long enough that we're sure we aren't mid-drag / mid-DPI-change.
+    /// switches the right panel between Off / History / Spectrum — or
+    /// toggles the left column collapse/expand rail — but only when
+    /// the user hasn't manually resized or maximized the window, and
+    /// only when the viewport has been sitting still long enough that
+    /// we're sure we aren't mid-drag / mid-DPI-change.
     fn maybe_resize_for_graph(&mut self, ctx: &egui::Context) {
         let rect_stable = self.update_rect_stability(ctx);
 
@@ -469,7 +497,9 @@ impl AudioMeterApp {
             && !ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed())
         {
             let min_w = match self.panel {
-                GraphView::Off => window_w_without_graph(self.meter_states.len()),
+                GraphView::Off => {
+                    window_w_without_graph(self.meter_states.len(), self.left_collapsed)
+                }
                 GraphView::History | GraphView::Spectrum | GraphView::Comp => {
                     WINDOW_W_MIN_WITH_GRAPH
                 }
@@ -480,14 +510,17 @@ impl AudioMeterApp {
             self.initial_min_sent = true;
         }
 
-        if self.panel == self.last_panel {
+        let panel_changed = self.panel != self.last_panel;
+        let collapse_changed = self.left_collapsed != self.last_left_collapsed;
+        if !panel_changed && !collapse_changed {
             return;
         }
 
         // Don't fire ANY viewport commands while the user is interacting
         // with the window chrome or while the window hasn't settled
-        // after a recent move / resize.  We keep `last_panel` unchanged
-        // so the next idle frame re-attempts the update.
+        // after a recent move / resize.  We keep `last_panel` /
+        // `last_left_collapsed` unchanged so the next idle frame
+        // re-attempts the update.
         let pointer_busy = ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed());
         if pointer_busy || !rect_stable {
             return;
@@ -497,7 +530,9 @@ impl AudioMeterApp {
         // what's needed for the current layout.  Safe to send only
         // once we're sure the platform layer is idle.
         let min_w = match self.panel {
-            GraphView::Off => window_w_without_graph(self.meter_states.len()),
+            GraphView::Off => {
+                window_w_without_graph(self.meter_states.len(), self.left_collapsed)
+            }
             GraphView::History | GraphView::Spectrum | GraphView::Comp => {
                 WINDOW_W_MIN_WITH_GRAPH
             }
@@ -523,7 +558,8 @@ impl AudioMeterApp {
             && maximized
             && !fullscreen
         {
-            let compact_w = window_w_without_graph(self.meter_states.len());
+            let compact_w =
+                window_w_without_graph(self.meter_states.len(), self.left_collapsed);
             let h = inner_rect.map(|r| r.height()).unwrap_or(640.0);
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -531,16 +567,25 @@ impl AudioMeterApp {
             )));
             self.last_auto_width = Some(compact_w);
             self.last_panel = self.panel;
+            self.last_left_collapsed = self.left_collapsed;
             return;
         }
         if maximized || fullscreen {
             self.last_panel = self.panel;
+            self.last_left_collapsed = self.left_collapsed;
             self.last_auto_width = None;
             return;
         }
 
+        // Target width for the current layout. When the right graph panel is on we
+        // keep the window at its standard 1140 px regardless of collapse state — the
+        // meters + graph simply get more horizontal room when the left column is
+        // hidden. When the graph is off we snap to the exact compact width, which
+        // changes by ~320 px across the collapse toggle.
         let target_w = match self.panel {
-            GraphView::Off => window_w_without_graph(self.meter_states.len()),
+            GraphView::Off => {
+                window_w_without_graph(self.meter_states.len(), self.left_collapsed)
+            }
             GraphView::History | GraphView::Spectrum | GraphView::Comp => {
                 WINDOW_W_WITH_GRAPH
             }
@@ -564,7 +609,15 @@ impl AudioMeterApp {
                     self.panel,
                     GraphView::History | GraphView::Spectrum | GraphView::Comp
                 );
-            let snap_to_target = hide_panel || opening_right_panel || !user_resized;
+            // When the user toggles the left column collapse rail while the graph
+            // is off, always snap to the new compact width — the old
+            // `last_auto_width` was for the *previous* collapse state and would
+            // otherwise leave the window 320 px wider than it needs to be
+            // (or 320 px too narrow) until the next panel switch.
+            let collapse_snap =
+                collapse_changed && self.panel == GraphView::Off;
+            let snap_to_target =
+                hide_panel || opening_right_panel || collapse_snap || !user_resized;
             if snap_to_target {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     target_w,
@@ -576,6 +629,7 @@ impl AudioMeterApp {
             }
         }
         self.last_panel = self.panel;
+        self.last_left_collapsed = self.left_collapsed;
     }
 
     fn sync_channels(&mut self) {
@@ -756,19 +810,31 @@ impl eframe::App for AudioMeterApp {
             ui.add_space(4.0);
 
             ui.horizontal_top(|ui| {
-                // Fixed width so Controls / Loudness / Clips never change the column width.
-                ui.allocate_ui_with_layout(
-                    egui::vec2(LEFT_COLUMN_OUTER_W, ui.available_height()),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.set_min_width(LEFT_COLUMN_OUTER_W);
-                        ui.set_max_width(LEFT_COLUMN_OUTER_W);
-                        self.left_controls(ui);
-                    },
-                );
-                // A bit of clearance on the left for the left-column's scrollbar,
-                // tighter on the meter side so the divider hugs the meters column.
-                ui.add_space(3.0);
+                // Always-on collapse / expand rail at the far left. Clicking toggles
+                // `self.left_collapsed`, which on the next stable frame triggers
+                // a window width snap via `maybe_resize_for_graph`.
+                if paint_left_collapse_rail(ui, self.left_collapsed) {
+                    self.left_collapsed = !self.left_collapsed;
+                    self.user_settings.lock().left_panel_collapsed = self.left_collapsed;
+                    self.persist_user_settings();
+                }
+                ui.add_space(LEFT_COLLAPSE_RAIL_GAP);
+
+                if !self.left_collapsed {
+                    // Fixed width so Controls / Loudness / Clips never change the column width.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(LEFT_COLUMN_OUTER_W, ui.available_height()),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_width(LEFT_COLUMN_OUTER_W);
+                            ui.set_max_width(LEFT_COLUMN_OUTER_W);
+                            self.left_controls(ui);
+                        },
+                    );
+                    // A bit of clearance on the left for the left-column's scrollbar,
+                    // tighter on the meter side so the divider hugs the meters column.
+                    ui.add_space(3.0);
+                }
                 inset_vertical_divider(ui);
                 ui.add_space(2.0);
                 self.meters_and_graph(ui, now);
@@ -2190,6 +2256,92 @@ fn left_panel_chevron_paint(ui: &mut egui::Ui, openness: f32) {
         p.line_segment([l, tip], stroke);
         p.line_segment([tip, r], stroke);
     }
+}
+
+/// Always-visible thin rail that sits to the LEFT of the left column and toggles
+/// the column's collapse state when clicked. Returns `true` if the rail was clicked
+/// this frame so the caller can flip `AudioMeterApp::left_collapsed` + persist.
+///
+/// Styling: no rounded-rect border; blends with the window background by default
+/// and brightens subtly on hover. A two-tone inset divider (matching
+/// [`inset_vertical_divider`] — 1 px dark shadow + 1 px light highlight) runs down
+/// the rail's inner edge so it reads as a separator flush with the rest of the
+/// panel chrome, not a button island. A sideways chevron (`◀` when expanded,
+/// `▶` when collapsed) sits vertically centered on the rail.
+fn paint_left_collapse_rail(ui: &mut egui::Ui, collapsed: bool) -> bool {
+    let h = ui.available_height().max(1.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(LEFT_COLLAPSE_RAIL_W, h), Sense::click());
+    let hovered = resp.hovered();
+    let p = ui.painter();
+
+    // Hover-only subtle white fill at ~10% opacity. Must be a *valid* premultiplied
+    // color (RGB ≤ A), otherwise egui renders it far brighter than intended.
+    if hovered {
+        const HOVER_A: u8 = 0x1a; // ≈ 10% of 255
+        p.rect_filled(
+            rect,
+            egui::CornerRadius::ZERO,
+            Color32::from_rgba_premultiplied(HOVER_A, HOVER_A, HOVER_A, HOVER_A),
+        );
+    }
+
+    // Two-tone inset divider on the rail's inner edge — matches `inset_vertical_divider`
+    // (1 px dark shadow + 1 px light highlight). Only drawn when EXPANDED so the rail
+    // visually caps the left column. When collapsed, the meters area already draws its
+    // own `inset_vertical_divider` 2 px to the right, and painting ours too yields
+    // two parallel lines.
+    if !collapsed {
+        let div_x = rect.right() - 2.0;
+        let dark = egui::Rect::from_min_size(
+            egui::pos2(div_x, rect.top()),
+            egui::vec2(1.0, rect.height()),
+        );
+        let light = egui::Rect::from_min_size(
+            egui::pos2(div_x + 1.0, rect.top()),
+            egui::vec2(1.0, rect.height()),
+        );
+        p.rect_filled(dark, CornerRadius::ZERO, LEFT_SECTION_DIVIDER_DARK);
+        p.rect_filled(light, CornerRadius::ZERO, LEFT_SECTION_INNER_HIGHLIGHT);
+    }
+
+    // Chevron: centered on the rail. Drawn with line segments to match the
+    // accordion chevrons pixel-for-pixel.
+    let cx = rect.center().x - 1.0; // nudge left of center so the chevron doesn't visually crowd the divider
+    let cy = rect.center().y;
+    let s = 3.2;
+    let arm = 3.0;
+    let stroke_color = if hovered {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(0xc0, 0xc0, 0xc8)
+    };
+    let stroke = Stroke::new(1.5, stroke_color);
+    if collapsed {
+        // Right-pointing chevron (click to expand).
+        let tip = egui::pos2(cx + s * 0.6, cy);
+        let top = egui::pos2(cx - s * 0.4, cy - arm);
+        let bot = egui::pos2(cx - s * 0.4, cy + arm);
+        p.line_segment([top, tip], stroke);
+        p.line_segment([tip, bot], stroke);
+    } else {
+        // Left-pointing chevron (click to collapse).
+        let tip = egui::pos2(cx - s * 0.6, cy);
+        let top = egui::pos2(cx + s * 0.4, cy - arm);
+        let bot = egui::pos2(cx + s * 0.4, cy + arm);
+        p.line_segment([top, tip], stroke);
+        p.line_segment([tip, bot], stroke);
+    }
+
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let tooltip = if collapsed {
+        "Show controls panel"
+    } else {
+        "Hide controls panel"
+    };
+    resp.on_hover_text(tooltip).clicked()
 }
 
 /// Paints a full-width 1 px horizontal band (used for inset highlights and dividers).
