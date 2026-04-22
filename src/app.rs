@@ -820,20 +820,27 @@ impl eframe::App for AudioMeterApp {
                     .color(Color32::from_gray(120))
                     .size(11.0),
                 );
+                // Dot separator + update-status chip. The chip rotates between
+                // "Checking for updates…" / "Running the latest release (X.Y.Z)" /
+                // "Update available — Update now" (green, clickable; reopens the
+                // modal) / "Downloading update…" / etc., based on the shared
+                // `UpdateStatus` the background thread writes to. See
+                // `render_update_status_chip` for the full state mapping.
+                ui.label(
+                    RichText::new("·")
+                        .color(Color32::from_gray(80))
+                        .size(11.0),
+                );
+                self.render_update_status_chip(ui);
 
-                // Right-align credits. In `right_to_left`, the first child is at the far right, so
-                // add chunks as: margin, ` - Build (…)`, `Ayrthon`, `Created by ` → reads LTR as
-                // `Created by Ayrthon - Build (…)`.
+                // Right-align credits. In `right_to_left`, the first child is at the far right,
+                // so add chunks tail-first: margin → `Ayrthon` (clickable link) → leading
+                // `AYR Audio, a brand by ` copy. Reads LTR as `AYR Audio, a brand by Ayrthon`.
+                // The version number used to live here ("- Build (…)") but now shows on the
+                // left next to the weighted subtitle so it can do double duty as the
+                // update-status indicator.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(RIGHT_PANEL_GUTTER);
-                    ui.label(
-                        RichText::new(format!(
-                            " - Build ({})",
-                            audio_meter_build_label()
-                        ))
-                        .color(Color32::from_gray(130))
-                        .size(11.0),
-                    );
                     let ayrthon = ui.add(
                         Label::new(
                             RichText::new("Ayrthon")
@@ -849,7 +856,7 @@ impl eframe::App for AudioMeterApp {
                         ui.ctx().open_url(OpenUrl::new_tab(AYRTHON_URL));
                     }
                     ui.label(
-                        RichText::new("Created by ")
+                        RichText::new("AYR Audio, a brand by ")
                             .color(Color32::from_gray(130))
                             .size(11.0),
                     );
@@ -941,6 +948,96 @@ impl eframe::App for AudioMeterApp {
 }
 
 impl AudioMeterApp {
+    /// Inline status chip rendered in the title row (next to the "real-time
+    /// dBFS metering" subtitle). Doubles as both the build-version indicator
+    /// (it always shows the current version when idle / up-to-date) and the
+    /// dismissed-update nag: when an update is available but the user clicked
+    /// "Later" on the modal, this chip shows "Update available — Update now"
+    /// in green and clicking it re-arms `update_dismissed = false` so the
+    /// modal pops back up next frame.
+    fn render_update_status_chip(&mut self, ui: &mut egui::Ui) {
+        // Prefer the build-label env override (set by CI / `launch-release.ps1`
+        // to a git hash) so dev builds show "Version abc1234" rather than
+        // claiming to be the Cargo.toml version. Falls back to CARGO_PKG_VERSION.
+        let current = audio_meter_build_label();
+        let status = { self.update.lock().clone() };
+
+        // Text + color for the non-clickable states. For Available / LaunchFailed
+        // we fall through below to render a clickable label instead.
+        let (text, color): (String, Color32) = match &status {
+            crate::updater::UpdateStatus::Idle
+            | crate::updater::UpdateStatus::Checking => (
+                "Checking for updates…".to_string(),
+                Color32::from_gray(120),
+            ),
+            crate::updater::UpdateStatus::UpToDate => (
+                format!("Running the latest release ({current})"),
+                Color32::from_gray(140),
+            ),
+            crate::updater::UpdateStatus::Downloading { progress, .. } => (
+                format!("Downloading update… {:.0}%", (progress * 100.0).clamp(0.0, 100.0)),
+                Color32::from_gray(170),
+            ),
+            crate::updater::UpdateStatus::Downloaded(_)
+            | crate::updater::UpdateStatus::Launching => (
+                "Launching installer…".to_string(),
+                Color32::from_gray(170),
+            ),
+            // Offline / parse error: don't nag the user, just show the version
+            // so the chip doesn't read as "something went wrong".
+            crate::updater::UpdateStatus::NetworkError(_) => (
+                format!("Version {current}"),
+                Color32::from_gray(120),
+            ),
+            // Clickable green call-to-action states (fall through).
+            crate::updater::UpdateStatus::Available(_)
+            | crate::updater::UpdateStatus::LaunchFailed(_) => (String::new(), Color32::TRANSPARENT),
+        };
+
+        match &status {
+            crate::updater::UpdateStatus::Available(info) => {
+                let label = format!("Update available ({}) — Update now", info.version);
+                let resp = ui.add(
+                    Label::new(RichText::new(label).color(ACCENT).strong().size(11.0))
+                        .sense(Sense::click()),
+                );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    // Re-arm the modal flow: clear the session-level dismissal
+                    // so `maybe_show_update_modal` picks it up next frame.
+                    self.update_dismissed = false;
+                }
+            }
+            crate::updater::UpdateStatus::LaunchFailed(_) => {
+                // A previous download/launch attempt errored out. Invite a retry
+                // with the same chip (clicking re-opens the "Update available"
+                // modal via the same `LaunchFailed` state, which the modal
+                // renders with an OK button — clicking that dismisses and the
+                // next launch will re-check).
+                let resp = ui.add(
+                    Label::new(
+                        RichText::new("Update failed — retry")
+                            .color(Color32::from_rgb(0xff, 0xb4, 0xb4))
+                            .strong()
+                            .size(11.0),
+                    )
+                    .sense(Sense::click()),
+                );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    self.update_dismissed = false;
+                }
+            }
+            _ => {
+                ui.label(RichText::new(text).color(color).size(11.0));
+            }
+        }
+    }
+
     /// Drive the in-app GitHub-release update flow. Pulls the latest status
     /// from `self.update` once per frame and renders whichever modal matches:
     ///
