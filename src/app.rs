@@ -10,9 +10,9 @@ use anyhow::Result;
 use eframe::egui;
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{
-    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Label, Layout, Margin,
-    OpenUrl, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions,
-    UiBuilder, Widget,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Label, Layout, Margin, Modal,
+    OpenUrl, ProgressBar, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextureHandle,
+    TextureOptions, UiBuilder, Widget,
 };
 use egui::collapsing_header::CollapsingState;
 use egui::containers::menu::menu_style;
@@ -195,6 +195,15 @@ pub struct AudioMeterApp {
     /// viewport commands once rather than fighting any user drag later.
     #[cfg(windows)]
     main_window_revealed: bool,
+    /// Shared state flipped by the background updater thread (see
+    /// `updater::spawn_check` in `AudioMeterApp::new`). The UI reads this every
+    /// frame in `maybe_show_update_modal` to drive the "Update available" flow.
+    update: crate::updater::SharedUpdateStatus,
+    /// Set when the user clicks "Later" (or dismisses the modal via Esc / click
+    /// outside). Session-only — next launch re-runs the check and the modal can
+    /// reappear. We intentionally do not persist a "skipped version" because the
+    /// user explicitly asked for a prompt every startup.
+    update_dismissed: bool,
 }
 
 /// Target window widths for the two UI modes.  The app snaps to one
@@ -375,7 +384,18 @@ impl AudioMeterApp {
             launched_at: Instant::now(),
             #[cfg(windows)]
             main_window_revealed: false,
+            update: crate::updater::make_shared_status(),
+            update_dismissed: false,
         };
+        // Fire the GitHub release check on a background thread. The result
+        // flows back into `_app.update` and is picked up by the UI loop next
+        // frame. Intentionally done after the struct is constructed so the
+        // shared handle is cloned from the same `Arc` the UI will read.
+        crate::updater::spawn_check(
+            crate::updater::UPDATE_REPO,
+            env!("CARGO_PKG_VERSION"),
+            _app.update.clone(),
+        );
         crate::startup_log::log("AudioMeterApp::new: end");
         #[allow(clippy::let_and_return)]
         return _app;
@@ -762,6 +782,12 @@ impl eframe::App for AudioMeterApp {
         }
 
         paint_metallic_background(&ui.painter(), ui.max_rect(), &self.bg_noise);
+        // Render the GitHub-release update modal over the main UI (if any). The
+        // modal is drawn as an egui top layer, so calling it here — before the
+        // main layout — just means it's composed correctly on top once the rest
+        // of the UI has been laid out. No-op while the updater is Idle /
+        // Checking / UpToDate / NetworkError / dismissed.
+        self.maybe_show_update_modal(&ctx);
         let now = ctx.input(|i| i.time);
         self.tick_meters();
         // Spectrum: run the analyzer while the tab is open, and keep decaying after Stop even if
@@ -915,6 +941,214 @@ impl eframe::App for AudioMeterApp {
 }
 
 impl AudioMeterApp {
+    /// Drive the in-app GitHub-release update flow. Pulls the latest status
+    /// from `self.update` once per frame and renders whichever modal matches:
+    ///
+    /// * `Available` — "Update available" prompt with [Update now] / [Later]
+    ///   buttons, plus a "View on GitHub" link if the asset URL is missing.
+    /// * `Downloading` — progress bar driven by the download thread's
+    ///   per-256 KB `Downloading { progress, .. }` updates. Requests a fast
+    ///   repaint so the bar animates smoothly.
+    /// * `Downloaded` — spawn the installer detached, flip state to `Launching`
+    ///   to avoid double-spawn, then send `ViewportCommand::Close` so Inno
+    ///   Setup can replace the running `.exe` cleanly.
+    /// * `LaunchFailed` — surfaces the error to the user with a single OK
+    ///   button. Any other status is a no-op (silent / internal).
+    ///
+    /// The modal is suppressed entirely while the splash solo phase is still
+    /// running (Windows) and once `update_dismissed` is set for the session.
+    fn maybe_show_update_modal(&mut self, ctx: &egui::Context) {
+        // Don't pop the modal while the main viewport is still parked
+        // off-screen behind the splash — that would look like the app has
+        // "launched straight into a dialog" before the user even sees it.
+        #[cfg(windows)]
+        if !self.main_window_revealed {
+            return;
+        }
+        if self.update_dismissed {
+            return;
+        }
+
+        // Snapshot the status so we hold the lock for as little time as
+        // possible; we only re-acquire it (briefly) if we need to mutate.
+        let status = { self.update.lock().clone() };
+
+        match status {
+            crate::updater::UpdateStatus::Available(info) => {
+                let current = env!("CARGO_PKG_VERSION");
+                let mut clicked_update = false;
+                let mut clicked_later = false;
+                let dlg = Modal::new(egui::Id::new("update_available_modal")).show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.heading(
+                        RichText::new(format!("Update available — {}", info.version)).size(16.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "You're on {current}. Install {} now?",
+                            info.version
+                        ))
+                        .size(11.5)
+                        .color(Color32::from_gray(210)),
+                    );
+
+                    if !info.notes.trim().is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("Release notes")
+                                .size(10.5)
+                                .color(Color32::from_gray(150)),
+                        );
+                        ui.add_space(2.0);
+                        ScrollArea::vertical()
+                            .max_height(180.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(info.notes.trim())
+                                        .size(10.5)
+                                        .color(Color32::from_gray(195)),
+                                );
+                            });
+                    }
+
+                    if !info.html_url.is_empty() {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .link(
+                                    RichText::new("View release on GitHub")
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(0x8a, 0xb4, 0xf8)),
+                                )
+                                .clicked()
+                            {
+                                ui.ctx().open_url(OpenUrl::new_tab(&info.html_url));
+                            }
+                        });
+                    }
+
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new("Later").min_size(egui::vec2(88.0, 28.0)))
+                            .clicked()
+                        {
+                            clicked_later = true;
+                            ui.close();
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Update now")
+                                            .strong()
+                                            .color(Color32::from_rgb(0xb4, 0xe0, 0xff)),
+                                    )
+                                    .min_size(egui::vec2(120.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                clicked_update = true;
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+
+                if clicked_update {
+                    // Spawn download; next frame will show the Downloading modal.
+                    crate::updater::spawn_download_and_run(info, self.update.clone());
+                } else if clicked_later || dlg.should_close() {
+                    // Esc / click-outside / Later all mean "not this session".
+                    self.update_dismissed = true;
+                }
+            }
+
+            crate::updater::UpdateStatus::Downloading {
+                progress,
+                total_bytes,
+            } => {
+                Modal::new(egui::Id::new("update_downloading_modal")).show(ctx, |ui| {
+                    ui.set_max_width(360.0);
+                    ui.heading(RichText::new("Downloading update…").size(15.0));
+                    ui.add_space(8.0);
+                    ui.add(
+                        ProgressBar::new(progress)
+                            .desired_width(320.0)
+                            .animate(progress < 1.0),
+                    );
+                    if total_bytes > 0 {
+                        let mb_total = total_bytes as f32 / (1024.0 * 1024.0);
+                        let mb_done = mb_total * progress;
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("{:.1} / {:.1} MB", mb_done, mb_total))
+                                .size(10.5)
+                                .color(Color32::from_gray(160)),
+                        );
+                    }
+                });
+                // The download thread updates progress only every ~256 KB, but
+                // we still want the bar to pulse between those ticks.
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            }
+
+            crate::updater::UpdateStatus::Downloaded(path) => {
+                // Flip to Launching FIRST so we don't re-enter this arm if
+                // viewport close is coalesced or if the installer spawn errors
+                // asynchronously on some other frame.
+                *self.update.lock() = crate::updater::UpdateStatus::Launching;
+                match crate::updater::launch_installer(&path) {
+                    Ok(()) => {
+                        crate::startup_log::log(
+                            "updater: installer spawned; requesting viewport close",
+                        );
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => {
+                        *self.update.lock() =
+                            crate::updater::UpdateStatus::LaunchFailed(e.to_string());
+                    }
+                }
+            }
+
+            crate::updater::UpdateStatus::LaunchFailed(msg) => {
+                let mut clicked_ok = false;
+                let dlg = Modal::new(egui::Id::new("update_failed_modal")).show(ctx, |ui| {
+                    ui.set_max_width(380.0);
+                    ui.heading(
+                        RichText::new("Update failed")
+                            .size(15.0)
+                            .color(Color32::from_rgb(0xff, 0xb4, 0xb4)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&msg).size(11.0).color(Color32::from_gray(210)));
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new("OK").min_size(egui::vec2(88.0, 28.0)))
+                                .clicked()
+                            {
+                                clicked_ok = true;
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+                if clicked_ok || dlg.should_close() {
+                    self.update_dismissed = true;
+                }
+            }
+
+            // All other states (Idle, Checking, UpToDate, NetworkError,
+            // Launching) are UI-silent: no modal, no repaint nudge.
+            _ => {}
+        }
+    }
+
     fn persist_user_settings(&self) {
         if let Some(ref p) = self.user_settings_path {
             let data = self.user_settings.lock().clone();

@@ -21,6 +21,7 @@ mod spectrum_view;
 #[cfg(windows)]
 mod splash;
 mod startup_log;
+mod updater;
 mod weighting;
 
 use std::time::Duration;
