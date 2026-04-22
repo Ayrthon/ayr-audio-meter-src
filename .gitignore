@@ -8,3 +8,16 @@
 #/target
 
 tmp/
+
+# Local scratch directories — never committed, often contain third-party
+# source or transcripts we're rummaging through and don't want to accidentally
+# push if someone runs `git add -A` from repo root.
+/.tmp-obs/
+/recovered-transcript-fragments/
+
+# IDE / editor scratch (per-user, not repo-shared).
+/.vscode/
+
+# Runtime logs dropped next to the dev staging dir.
+run.log
+run.log.err

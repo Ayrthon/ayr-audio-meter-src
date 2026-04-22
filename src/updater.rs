@@ -35,10 +35,16 @@ use serde::Deserialize;
 
 use crate::startup_log;
 
-/// GitHub repo slug we poll for releases. Baked in at compile time; if you fork
-/// the app, change this to your own fork (or the updater becomes a no-op because
-/// nothing new will ever be published under this slug).
-pub const UPDATE_REPO: &str = "Ayrthon/audio-meter";
+/// GitHub repo slug we poll for releases. This is **not** the source repo
+/// (which is kept private) — it's a dedicated public "downloads" repo that
+/// holds only compiled installers and release notes. Splitting them means we
+/// can keep the code closed while still using the public GitHub Releases API
+/// for the updater (the API returns 404 for private repos to unauthenticated
+/// clients, and we intentionally don't ship a token).
+///
+/// Baked in at compile time. If you fork the project, point this at your own
+/// public releases repo.
+pub const UPDATE_REPO: &str = "Ayrthon/ayr-audio-meter";
 
 /// Parsed view of a GitHub release's relevant fields.
 #[derive(Clone, Debug)]
