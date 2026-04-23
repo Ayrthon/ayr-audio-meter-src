@@ -943,9 +943,11 @@ mod windows_loopback {
 // Network source — AYR Audio Link (TCP)
 // -------------------------------------------------------------------
 
-/// Runs a single network capture session: dial the sender advertised in
-/// `endpoint`, read the handshake, then loop over incoming PCM frames
-/// through a small jitter buffer and into the existing DSP pipeline.
+/// Runs a network capture session to an AYR Audio Link sender: connect,
+/// read the handshake, stream PCM until the TCP session ends, then
+/// **reconnect in a loop** while metering stays enabled. That way a Link
+/// “Stop broadcasting” / “Start broadcasting” cycle resumes without a
+/// manual Stop/Start on the meter.
 ///
 /// Jitter buffer design:
 /// * Accumulate samples until we have ~30ms queued (`target_fill`).
@@ -983,137 +985,176 @@ fn run_network_source(
     use std::time::Duration;
 
     let addr = SocketAddr::new(endpoint.host, endpoint.port);
-    log::info!("network source: dialling {addr} (`{device_name}`)");
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))
-        .with_context(|| format!("connect {addr}"))?;
-    // Keep read latency tight — we poll with a small timeout so the stop
-    // flag is honoured within ~200ms of a UI disconnect.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .ok();
-    stream.set_nodelay(true).ok();
-    let mut reader = BufReader::with_capacity(16 * 1024, stream);
-    let hs = wire::read_handshake(&mut reader).context("read handshake")?;
-    let channels = (hs.channels as usize).min(MAX_CHANNELS);
-    let sample_rate = hs.sample_rate;
-    let stride = hs.frame_stride_bytes();
     log::info!(
-        "network source connected: {} @ {sample_rate}Hz, {channels}ch",
-        hs.display_name
+        "network source: AYR Audio Link at {addr} (`{device_name}`) — reconnects when the sender restarts"
     );
 
-    {
-        let mut lv = levels.write();
-        lv.active = true;
-        lv.channels = channels;
-        lv.sample_rate = sample_rate;
-        lv.device_name = device_name.to_owned();
-        lv.source_kind = SourceKind::Network;
-    }
-    {
-        let mut l = loudness.write();
-        *l = Default::default();
-    }
-    let mut analyzer = match LoudnessAnalyzer::new(channels as u32, sample_rate) {
-        Ok(a) => Some(a),
-        Err(err) => {
-            log::warn!("loudness analyzer init failed (network): {err:?}");
-            None
-        }
-    };
-    spectrum::configure(spectrum, sample_rate, true);
-    {
-        let mut c = comp.write();
-        c.clear();
-        c.configure(sample_rate);
-    }
-    history.write().reset_tick_clock();
-    let start_instant = std::time::Instant::now();
-
-    let target_fill = (sample_rate as usize * channels * 30 / 1000).max(1);
-    let drop_threshold = (sample_rate as usize * channels * 120 / 1000).max(target_fill);
-    let emit_chunk = (sample_rate as usize * channels * 10 / 1000).max(1);
-
-    let mut jitter: std::collections::VecDeque<f32> =
-        std::collections::VecDeque::with_capacity(drop_threshold);
-    let mut primed = false;
-    let mut frame_buf = FrameBuf::new();
-    let mut emit_scratch: Vec<f32> = Vec::with_capacity(emit_chunk);
-
     while !stop.load(Ordering::Relaxed) {
-        match wire::read_frame(&mut reader, stride, &mut frame_buf) {
-            Ok(()) => {}
-            Err(ayr_audio_link_core::LinkError::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // Read timeout — loop back and check the stop flag.
-                continue;
+        // Idle between sessions so the UI does not show a live meter while
+        // Link is not broadcasting.
+        {
+            let mut lv = levels.write();
+            lv.active = false;
+        }
+        spectrum::configure(spectrum, 48_000, false);
+        comp.write().clear();
+
+        let (mut reader, hs) = loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
             }
-            Err(e) => {
-                log::info!("network source: stream ended: {e}");
-                break;
-            }
-        }
-        for &s in &frame_buf.samples {
-            jitter.push_back(s);
-        }
-        // Drop down to `target_fill` if we're too far ahead — the meter
-        // cares about "right now", not historical playback.
-        while jitter.len() > drop_threshold {
-            jitter.pop_front();
-        }
-        if !primed {
-            if jitter.len() < target_fill {
-                continue;
-            }
-            primed = true;
-        }
-        while jitter.len() >= emit_chunk {
-            emit_scratch.clear();
-            for _ in 0..emit_chunk {
-                if let Some(v) = jitter.pop_front() {
-                    emit_scratch.push(v);
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .ok();
+                    stream.set_nodelay(true).ok();
+                    let mut r = BufReader::with_capacity(16 * 1024, stream);
+                    match wire::read_handshake(&mut r) {
+                        Ok(hs) => break (r, hs),
+                        Err(e) => {
+                            log::warn!("network source: handshake from {addr}: {e:#}");
+                            thread::sleep(Duration::from_millis(300));
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("network source: connect to {addr}: {e:#}");
+                    thread::sleep(Duration::from_millis(400));
                 }
             }
-            let now = wall_clock_secs();
-            let tp = meter_true_peak.load(Ordering::Relaxed);
-            let snap = process_weighted_levels(
-                meter_scratch,
-                weighting,
-                &emit_scratch,
-                channels,
-                sample_rate,
-                tp,
-                levels,
-            );
-            let trig = clip_trigger_hold_max_db(
-                &mut clip_trigger_states.lock(),
-                meter_mode.load(Ordering::Relaxed),
-                now,
-                &snap,
-            );
-            process_clip(
-                &emit_scratch,
-                channels,
-                sample_rate,
-                clip_settings.as_ref(),
-                clip_capture,
-                clip_status,
-                clip_dirs,
-                trig,
-            );
-            if let Some(a) = analyzer.as_mut() {
-                a.process(&emit_scratch, loudness);
-            }
-            spectrum::push_samples(spectrum, &emit_scratch, channels);
-            comp.write()
-                .push_samples_mono_sum(&emit_scratch, channels, sample_rate);
+        };
+
+        let channels = (hs.channels as usize).min(MAX_CHANNELS);
+        let sample_rate = hs.sample_rate;
+        let stride = hs.frame_stride_bytes();
+        log::info!(
+            "network source connected: {} @ {sample_rate}Hz, {channels}ch",
+            hs.display_name
+        );
+
+        {
+            let mut lv = levels.write();
+            lv.active = true;
+            lv.channels = channels;
+            lv.sample_rate = sample_rate;
+            lv.device_name = device_name.to_owned();
+            lv.source_kind = SourceKind::Network;
         }
-        tick_shared_history(levels, history, history_trace, start_instant);
+        {
+            let mut l = loudness.write();
+            *l = Default::default();
+        }
+        let mut analyzer = match LoudnessAnalyzer::new(channels as u32, sample_rate) {
+            Ok(a) => Some(a),
+            Err(err) => {
+                log::warn!("loudness analyzer init failed (network): {err:?}");
+                None
+            }
+        };
+        spectrum::configure(spectrum, sample_rate, true);
+        {
+            let mut c = comp.write();
+            c.clear();
+            c.configure(sample_rate);
+        }
+        history.write().reset_tick_clock();
+        let start_instant = std::time::Instant::now();
+
+        let target_fill = (sample_rate as usize * channels * 30 / 1000).max(1);
+        let drop_threshold = (sample_rate as usize * channels * 120 / 1000).max(target_fill);
+        let emit_chunk = (sample_rate as usize * channels * 10 / 1000).max(1);
+
+        let mut jitter: std::collections::VecDeque<f32> =
+            std::collections::VecDeque::with_capacity(drop_threshold);
+        let mut primed = false;
+        let mut frame_buf = FrameBuf::new();
+        let mut emit_scratch: Vec<f32> = Vec::with_capacity(emit_chunk);
+
+        'read: while !stop.load(Ordering::Relaxed) {
+            match wire::read_frame(&mut reader, stride, &mut frame_buf) {
+                Ok(()) => {}
+                Err(ayr_audio_link_core::LinkError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    log::info!("network source: stream ended ({e}), reconnecting…");
+                    break 'read;
+                }
+            }
+            for &s in &frame_buf.samples {
+                jitter.push_back(s);
+            }
+            while jitter.len() > drop_threshold {
+                jitter.pop_front();
+            }
+            if !primed {
+                if jitter.len() < target_fill {
+                    continue;
+                }
+                primed = true;
+            }
+            while jitter.len() >= emit_chunk {
+                emit_scratch.clear();
+                for _ in 0..emit_chunk {
+                    if let Some(v) = jitter.pop_front() {
+                        emit_scratch.push(v);
+                    }
+                }
+                let now = wall_clock_secs();
+                let tp = meter_true_peak.load(Ordering::Relaxed);
+                let snap = process_weighted_levels(
+                    meter_scratch,
+                    weighting,
+                    &emit_scratch,
+                    channels,
+                    sample_rate,
+                    tp,
+                    levels,
+                );
+                let trig = clip_trigger_hold_max_db(
+                    &mut clip_trigger_states.lock(),
+                    meter_mode.load(Ordering::Relaxed),
+                    now,
+                    &snap,
+                );
+                process_clip(
+                    &emit_scratch,
+                    channels,
+                    sample_rate,
+                    clip_settings.as_ref(),
+                    clip_capture,
+                    clip_status,
+                    clip_dirs,
+                    trig,
+                );
+                if let Some(a) = analyzer.as_mut() {
+                    a.process(&emit_scratch, loudness);
+                }
+                spectrum::push_samples(spectrum, &emit_scratch, channels);
+                comp.write()
+                    .push_samples_mono_sum(&emit_scratch, channels, sample_rate);
+            }
+            tick_shared_history(levels, history, history_trace, start_instant);
+        }
+
+        spectrum::configure(spectrum, sample_rate, false);
+        comp.write().clear();
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(150));
     }
 
-    spectrum::configure(spectrum, sample_rate, false);
+    spectrum::configure(spectrum, 48_000, false);
     comp.write().clear();
+    {
+        let mut lv = levels.write();
+        lv.active = false;
+        lv.channels = 0;
+    }
     Ok(())
 }
