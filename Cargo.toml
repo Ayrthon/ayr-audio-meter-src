@@ -35,18 +35,14 @@ sha2 = "0.10"
 # companion AYR Audio Link sender over the LAN.
 #
 # Lives in a separate repo (`Ayrthon/ayr-audio-link`) because Link is its
-# own product with its own release cadence. For local development we use a
-# path dep against a sibling checkout — clone both repos side-by-side:
+# own product with its own release cadence. Pulled as a git dep so fresh
+# clones of this repo (and CI) build without needing a Link checkout.
 #
-#   ~/code/audio-meter/        (this repo)
-#   ~/code/ayr-audio-link/     (the Link repo)
+# For local development against an unpublished change in Link, temporarily
+# swap this for a path dep against a sibling checkout:
 #
-# TODO(publish): once `Ayrthon/ayr-audio-link` is pushed to GitHub, swap
-# this for a git dep so the Meter can be built in CI without a Link
-# checkout, e.g.:
-#
-#   ayr-audio-link-core = { git = "https://github.com/Ayrthon/ayr-audio-link", branch = "main" }
-ayr-audio-link-core = { path = "../ayr-audio-link/crates/ayr-audio-link-core" }
+#   ayr-audio-link-core = { path = "../ayr-audio-link/crates/ayr-audio-link-core" }
+ayr-audio-link-core = { git = "https://github.com/Ayrthon/ayr-audio-link", branch = "main" }
 
 # Linux / macOS: Glow (OpenGL). Repo's visual baseline was tuned against
 # Glow on Linux, and Wayland/X11 wgpu has its own quirks we haven't
