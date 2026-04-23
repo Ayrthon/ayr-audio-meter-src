@@ -28,6 +28,7 @@ use crate::comp_view::{SharedComp, make_shared_comp, show_comp};
 use crate::history_graph::{SharedHistory, make_shared_history, show_history_graph};
 use crate::loudness::{NEG_INF_LUFS, SharedLoudness, make_shared_loudness};
 use crate::meter::{FillSource, MeterMode, config_for, wall_clock_secs};
+use crate::meter_monitor::MeterMonitorBus;
 use crate::meter_widget::{
     MeterPaintArgs, MeterState, channel_label, show_meter, show_reference_label,
 };
@@ -177,6 +178,8 @@ pub struct AudioMeterApp {
     spectrum_anchors: Vec<f32>,
     meter_states: Vec<MeterState>,
     history: SharedHistory,
+    /// Tap-to-listen: plays the same PCM the meters see through the default output device.
+    meter_monitor: Arc<MeterMonitorBus>,
     engine: Option<AudioEngine>,
     /// Wall-clock start of the current metering session (`None` when stopped).
     metering_runtime_start: Option<Instant>,
@@ -405,6 +408,7 @@ impl AudioMeterApp {
             spectrum_anchors: Vec::new(),
             meter_states,
             history,
+            meter_monitor: MeterMonitorBus::new(),
             engine: None,
             metering_runtime_start: None,
             channels: 2,
@@ -568,6 +572,7 @@ impl AudioMeterApp {
             self.clip_capture.clone(),
             self.clip_status.clone(),
             self.user_settings.clone(),
+            self.meter_monitor.clone(),
         )?;
         self.engine = Some(engine);
         self.metering_runtime_start = Some(Instant::now());
@@ -2531,11 +2536,10 @@ impl AudioMeterApp {
             egui::Vec2::new(ui.available_width(), row_h),
             Layout::left_to_right(Align::TOP),
             |ui| {
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(
-                        crate::meter_widget::meter_strip_content_width(self.meter_states.len()),
-                        ui.available_height(),
-                    ),
+                let meter_col_w =
+                    crate::meter_widget::meter_strip_content_width(self.meter_states.len());
+                let meter_strip_ir = ui.allocate_ui_with_layout(
+                    egui::Vec2::new(meter_col_w, ui.available_height()),
                     Layout::left_to_right(Align::TOP),
                     |ui| {
                         let prev_spacing = ui.spacing().item_spacing;
@@ -2565,6 +2569,50 @@ impl AudioMeterApp {
                         ui.spacing_mut().item_spacing = prev_spacing;
                     },
                 );
+
+                // Overlay the headphone listen toggle in the reference-label column,
+                // vertically aligned with the -40 dBFS ruler mark on the Sample Peak
+                // meter and horizontally centered in the ref column (same column as
+                // the "0 dB ref" text).
+                {
+                    let strip_rect = meter_strip_ir.response.rect;
+                    let bar_top = strip_rect.top() + crate::meter_widget::BAR_TOP_PAD;
+                    let bar_bottom = strip_rect.bottom()
+                        - crate::meter_widget::meter_bar_bottom_pad_for_strip(self.channels);
+                    // Anchor to the Sample Peak (dBFS) scale regardless of the
+                    // currently selected meter mode, so the button position is
+                    // stable across VU/K/SMPTE views.
+                    let sample_peak_scale =
+                        crate::meter::MeterScale::for_mode(crate::meter::MeterMode::SamplePeak);
+                    let y_at_minus_40 = sample_peak_scale.dbfs_to_y(-40.0, bar_top, bar_bottom);
+
+                    // Horizontally center in the full visible dark gutter between
+                    // the right edge of the last meter bar and the left edge of
+                    // the graph container. This gutter spans, from left to right:
+                    //   METER_STRIP_GAP_TO_REF
+                    // + METER_STRIP_REF_COLUMN_W (where the "0 dB ref" text sits)
+                    // + METER_STRIP_MARGIN_END
+                    // + outer add_space(3) + divider (2 px) + outer add_space(3)
+                    // The divider and outer spaces live *after* strip_rect.right().
+                    let last_meter_right = strip_rect.right()
+                        - crate::meter_widget::METER_STRIP_MARGIN_END
+                        - crate::meter_widget::METER_STRIP_REF_COLUMN_W
+                        - crate::meter_widget::METER_STRIP_GAP_TO_REF;
+                    let graph_left = strip_rect.right() + 3.0 + 2.0 + 3.0;
+                    let gutter_center_x = (last_meter_right + graph_left) * 0.5 - 10.0;
+
+                    let btn_size = egui::vec2(32.0, 26.0);
+                    let btn_rect = egui::Rect::from_center_size(
+                        egui::pos2(gutter_center_x, y_at_minus_40),
+                        btn_size,
+                    );
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .max_rect(btn_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                        |ui| self.meter_listen_toggle(ui),
+                    );
+                }
 
                 ui.add_space(3.0);
                 inset_vertical_divider(ui);
@@ -2640,6 +2688,28 @@ impl AudioMeterApp {
                 );
             },
         );
+    }
+
+    /// Headphone-shaped toggle: routes the metered PCM to the default output device.
+    fn meter_listen_toggle(&mut self, ui: &mut egui::Ui) {
+        let engine_on = self.engine.is_some();
+        let listen_on = self.meter_monitor.is_enabled();
+        let tip = if !engine_on {
+            "Start metering first to hear the signal."
+        } else if listen_on {
+            "Listen on — same audio the meters use. Click to turn off."
+        } else {
+            "Listen off — click to hear the metered signal (watch your monitor level; loud sources can clip)."
+        };
+
+        let size = egui::vec2(32.0, 26.0);
+        let ir = ui.add_enabled_ui(engine_on, |ui| {
+            ui.add_sized(size, HeadphoneListenButton { on: listen_on })
+        });
+        ir.response.on_hover_text(tip);
+        if engine_on && ir.inner.clicked() {
+            self.meter_monitor.set_enabled(!listen_on);
+        }
     }
 
     /// Transport, view mode, and runtime clock above the history / spectrum area.
@@ -2974,6 +3044,96 @@ impl Widget for RecordArmButton {
             painter.circle_filled(center, r_outer, fill);
             painter.circle_stroke(center, r_outer, ring);
             painter.circle_filled(center, r_dot, dot);
+        }
+
+        response
+    }
+}
+
+/// Headphone-shaped listen toggle next to the meters. Painted from primitives
+/// so it renders regardless of whether the default egui font has 🎧 (U+1F3A7).
+struct HeadphoneListenButton {
+    on: bool,
+}
+
+impl Widget for HeadphoneListenButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let size = ui.available_size();
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let painter = ui.painter_at(rect);
+        let enabled = ui.is_enabled();
+        let hovered = response.hovered() && enabled;
+
+        let (fill_bg, border_col, glyph_col) = if !enabled {
+            (
+                PANEL_BG,
+                Color32::from_rgb(0x38, 0x38, 0x42),
+                Color32::from_rgb(0x5a, 0x5a, 0x66),
+            )
+        } else if self.on {
+            (
+                Color32::from_rgb(0x14, 0x2a, 0x18),
+                ACCENT,
+                Color32::from_rgb(0xdc, 0xf3, 0xde),
+            )
+        } else if hovered {
+            (
+                Color32::from_rgb(0x2e, 0x2e, 0x36),
+                Color32::from_rgb(0x62, 0x62, 0x70),
+                Color32::from_rgb(0xe1, 0xe1, 0xea),
+            )
+        } else {
+            (
+                PANEL_BG,
+                DIVIDER,
+                Color32::from_rgb(0xc0, 0xc0, 0xc9),
+            )
+        };
+
+        painter.rect(
+            rect,
+            CornerRadius::same(4),
+            fill_bg,
+            Stroke::new(1.0, border_col),
+            StrokeKind::Inside,
+        );
+
+        let side = rect.width().min(rect.height());
+        let center = rect.center();
+        let half = side * 0.5;
+        let top = center.y - half * 0.62;
+        let band_bottom = center.y - half * 0.14;
+        let cup_y = center.y + half * 0.18;
+        let ear_r = half * 0.30;
+        let ear_offset_x = half * 0.52;
+        let band_stroke = (half * 0.20).max(1.6);
+        let arc_pts = {
+            const N: usize = 18;
+            let mut pts = Vec::with_capacity(N);
+            for i in 0..N {
+                let t = i as f32 / (N - 1) as f32;
+                let x = center.x + (t * 2.0 - 1.0) * (ear_offset_x + ear_r * 0.15);
+                let dy = {
+                    let s = (t * std::f32::consts::PI).sin();
+                    -s * (band_bottom - top)
+                };
+                pts.push(egui::pos2(x, band_bottom + dy));
+            }
+            pts
+        };
+        painter.add(egui::Shape::line(arc_pts, Stroke::new(band_stroke, glyph_col)));
+
+        let left_cup = egui::pos2(center.x - ear_offset_x, cup_y);
+        let right_cup = egui::pos2(center.x + ear_offset_x, cup_y);
+        painter.circle_filled(left_cup, ear_r, glyph_col);
+        painter.circle_filled(right_cup, ear_r, glyph_col);
+
+        if self.on {
+            painter.circle_filled(left_cup, ear_r * 0.38, ACCENT);
+            painter.circle_filled(right_cup, ear_r * 0.38, ACCENT);
         }
 
         response

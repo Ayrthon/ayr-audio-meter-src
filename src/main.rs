@@ -16,6 +16,7 @@ mod history_graph;
 mod license;
 mod loudness;
 mod meter;
+mod meter_monitor;
 mod meter_widget;
 mod network_source;
 mod spectrum;

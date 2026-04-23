@@ -33,9 +33,27 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PS1_WIN="$(wslpath -w "$SCRIPT_DIR/launch-release.ps1")"
 
+echo "==> WSL: invoking Windows PowerShell"
+echo "    $PS1_WIN"
+echo "    (build + stage to %LOCALAPPDATA%\\AudioMeter\\ then Start-Process)"
+echo ""
+
 # Invoke Windows PowerShell. Prepend %USERPROFILE%\.cargo\bin so cargo is on
 # PATH regardless of whether the user has restarted their Windows shell since
 # running rustup-init. The PS one-liner escapes all $env vars to survive the
 # bash double-quoted context; only $PS1_WIN expands here.
-exec powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
+#
+# Do not `exec` so we can print the exit code if the build/launch fails.
+# Temporarily allow non-zero from PowerShell so `set -e` does not skip `status=$?`.
+set +e
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
   "\$env:Path = \"\$env:USERPROFILE\\.cargo\\bin;\$env:Path\"; & '$PS1_WIN'"
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+  echo "" >&2
+  echo "error: PowerShell exited with status $status (cargo build or staging failed)." >&2
+  echo "  Run this script in your own WSL terminal to see full output, or from Windows PowerShell" >&2
+  echo "  after cd to the repo: .\\launch-release.ps1" >&2
+fi
+exit "$status"

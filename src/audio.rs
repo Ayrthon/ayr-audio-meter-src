@@ -22,6 +22,7 @@ use crate::loudness::{LoudnessAnalyzer, SharedLoudness};
 use crate::meter::{MeterMode, config_for, wall_clock_secs};
 use crate::meter_widget::MeterState;
 use crate::spectrum::{self, SharedSpectrum};
+use crate::meter_monitor::MeterMonitorBus;
 use crate::weighting::{FreqWeighting, MeterScratch};
 
 pub const MAX_CHANNELS: usize = 8;
@@ -165,6 +166,7 @@ pub fn default_output_name() -> Option<String> {
 pub struct AudioEngine {
     stop_flag: Arc<AtomicBool>,
     levels: SharedLevels,
+    meter_monitor: Arc<MeterMonitorBus>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -186,9 +188,11 @@ impl AudioEngine {
         clip_capture: SharedClipCapture,
         clip_status: SharedClipStatus,
         clip_dirs: SharedUserSettings,
+        meter_monitor: Arc<MeterMonitorBus>,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop.clone();
+        let meter_monitor_for_thread = meter_monitor.clone();
         let levels_for_thread = levels.clone();
         let loudness_for_thread = loudness.clone();
         let spectrum_for_thread = spectrum.clone();
@@ -229,6 +233,7 @@ impl AudioEngine {
                         &clip_status_th,
                         &clip_dirs_th,
                         &stop_for_thread,
+                        &meter_monitor_for_thread,
                     ),
                     #[cfg(windows)]
                     SourceKind::Loopback => windows_loopback::run(
@@ -249,6 +254,7 @@ impl AudioEngine {
                         &clip_status_th,
                         &clip_dirs_th,
                         &stop_for_thread,
+                        &meter_monitor_for_thread,
                     ),
                     #[cfg(not(windows))]
                     SourceKind::Loopback => Err(anyhow!(
@@ -274,6 +280,7 @@ impl AudioEngine {
                             &clip_status_th,
                             &clip_dirs_th,
                             &stop_for_thread,
+                            &meter_monitor_for_thread,
                         ),
                         None => Err(anyhow!(
                             "network source `{device_name}` is missing endpoint metadata"
@@ -293,6 +300,7 @@ impl AudioEngine {
         Ok(Self {
             stop_flag: stop,
             levels,
+            meter_monitor,
             thread: Some(handle),
         })
     }
@@ -302,6 +310,7 @@ impl AudioEngine {
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
+        self.meter_monitor.end_capture();
         let mut lv = self.levels.write();
         lv.active = false;
         for v in &mut lv.peak_db[..] {
@@ -337,6 +346,7 @@ fn run_cpal_input(
     clip_status: &SharedClipStatus,
     clip_dirs: &SharedUserSettings,
     stop: &Arc<AtomicBool>,
+    meter_monitor: &Arc<MeterMonitorBus>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -398,6 +408,9 @@ fn run_cpal_input(
     let meter_tp_f32 = meter_true_peak.clone();
     let meter_tp_i16 = meter_true_peak.clone();
     let meter_tp_u16 = meter_true_peak.clone();
+    let mm_f32 = meter_monitor.clone();
+    let mm_i16 = meter_monitor.clone();
+    let mm_u16 = meter_monitor.clone();
     let err_fn = |e| log::error!("cpal stream error: {e}");
 
     let stream = match sample_format {
@@ -438,6 +451,7 @@ fn run_cpal_input(
                 comp_clone
                     .write()
                     .push_samples_mono_sum(data, channels, sample_rate);
+                mm_f32.push_interleaved_f32(data, channels);
             },
             err_fn,
             None,
@@ -483,6 +497,7 @@ fn run_cpal_input(
                 comp_clone
                     .write()
                     .push_samples_mono_sum(&buf, channels, sample_rate);
+                mm_i16.push_interleaved_f32(&buf, channels);
             },
             err_fn,
             None,
@@ -528,6 +543,7 @@ fn run_cpal_input(
                 comp_clone
                     .write()
                     .push_samples_mono_sum(&buf, channels, sample_rate);
+                mm_u16.push_interleaved_f32(&buf, channels);
             },
             err_fn,
             None,
@@ -536,6 +552,7 @@ fn run_cpal_input(
     };
 
     stream.play()?;
+    meter_monitor.begin_capture(sample_rate, channels, stop.clone());
 
     history.write().reset_tick_clock();
     let start_instant = std::time::Instant::now();
@@ -722,6 +739,7 @@ mod windows_loopback {
         clip_status: &SharedClipStatus,
         clip_dirs: &SharedUserSettings,
         stop: &Arc<AtomicBool>,
+        meter_monitor: &Arc<MeterMonitorBus>,
     ) -> Result<()> {
         initialize_mta().ok();
         let enumerator = DeviceEnumerator::new().context("DeviceEnumerator::new")?;
@@ -794,6 +812,8 @@ mod windows_loopback {
 
         audio_client.start_stream().context("start_stream")?;
         log::info!("loopback started");
+
+        meter_monitor.begin_capture(sample_rate, channels, stop.clone());
 
         history.write().reset_tick_clock();
         let start_instant = std::time::Instant::now();
@@ -874,6 +894,7 @@ mod windows_loopback {
                 spectrum::push_samples(spectrum, &f32_scratch, channels);
                 comp.write()
                     .push_samples_mono_sum(&f32_scratch, channels, sample_rate);
+                meter_monitor.push_interleaved_f32(&f32_scratch, channels);
             }
 
             match capture_client.get_next_packet_size() {
@@ -978,6 +999,7 @@ fn run_network_source(
     clip_status: &SharedClipStatus,
     clip_dirs: &SharedUserSettings,
     stop: &Arc<AtomicBool>,
+    meter_monitor: &Arc<MeterMonitorBus>,
 ) -> Result<()> {
     use ayr_audio_link_core::wire::{self, FrameBuf};
     use std::io::BufReader;
@@ -1058,6 +1080,7 @@ fn run_network_source(
             c.clear();
             c.configure(sample_rate);
         }
+        meter_monitor.begin_capture(sample_rate, channels, stop.clone());
         history.write().reset_tick_clock();
         let start_instant = std::time::Instant::now();
 
@@ -1137,6 +1160,7 @@ fn run_network_source(
                 spectrum::push_samples(spectrum, &emit_scratch, channels);
                 comp.write()
                     .push_samples_mono_sum(&emit_scratch, channels, sample_rate);
+                meter_monitor.push_interleaved_f32(&emit_scratch, channels);
             }
             tick_shared_history(levels, history, history_trace, start_instant);
         }
