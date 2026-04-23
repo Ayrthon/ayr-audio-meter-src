@@ -416,27 +416,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "ayr-audio-link"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ayr-audio-link-core",
- "chrono",
- "cpal",
- "dirs",
- "eframe",
- "egui",
- "env_logger",
- "log",
- "parking_lot",
- "serde",
- "serde_json",
- "ureq",
- "wasapi",
- "winreg",
-]
-
-[[package]]
 name = "ayr-audio-link-core"
 version = "0.1.0"
 dependencies = [
