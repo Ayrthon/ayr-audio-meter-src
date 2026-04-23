@@ -209,6 +209,11 @@ pub struct AudioMeterApp {
     /// threads. Read each frame by `maybe_show_license_gate` and
     /// `render_license_status_chip`.
     license: crate::license::SharedLicense,
+    /// Background thread (see `license::spawn_activate`) drops per-attempt
+    /// activation errors into this slot so the UI can render them inline
+    /// without having to mutate the global `license` state. Drained into
+    /// `license_activation_error` once per frame.
+    license_activation_error_shared: crate::license::SharedActivationError,
     /// User clicked the license chip (or a "Manage License" button) and wants
     /// the modal to pop even when the app isn't in a locked state. Cleared
     /// when the modal is dismissed.
@@ -402,6 +407,8 @@ impl AudioMeterApp {
             update: crate::updater::make_shared_status(),
             update_dismissed: false,
             license: crate::license::make_shared_license(),
+            license_activation_error_shared:
+                crate::license::make_shared_activation_error(),
             license_modal_forced: false,
             license_key_input: String::new(),
             license_activation_error: None,
@@ -1401,6 +1408,14 @@ impl AudioMeterApp {
 
         let status = { self.license.lock().clone() };
 
+        // Drain the background activation-error slot once per frame so a
+        // failed `spawn_activate` surfaces as an inline error in the modal
+        // without mutating the global license state (which would otherwise
+        // trap a trial user who mistyped a key).
+        if let Some(err) = self.license_activation_error_shared.lock().take() {
+            self.license_activation_error = Some(err);
+        }
+
         // First-run "welcome to your trial" info modal. Runs once per Windows
         // user (persisted in `user_settings.license_welcome_shown`) and only
         // when the app legitimately believes we're inside a fresh trial —
@@ -1757,7 +1772,15 @@ impl AudioMeterApp {
                     Some("That key doesn't look right. Please check and try again.".into());
             } else {
                 self.license_activation_error = None;
-                license::spawn_activate(key, self.license.clone());
+                // Clear any stale error from a previous attempt so the UI
+                // doesn't flash an out-of-date message while the new activate
+                // call is in flight.
+                *self.license_activation_error_shared.lock() = None;
+                license::spawn_activate(
+                    key,
+                    self.license.clone(),
+                    self.license_activation_error_shared.clone(),
+                );
             }
         }
         if click_buy {

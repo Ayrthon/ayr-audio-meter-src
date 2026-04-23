@@ -186,6 +186,17 @@ pub fn make_shared_license() -> SharedLicense {
     Arc::new(Mutex::new(LicenseStatus::Unknown))
 }
 
+/// Side-channel used by `spawn_activate` to surface a *per-attempt* error
+/// message (e.g. "status code 404" when the user types a bad key) without
+/// clobbering the real `LicenseStatus`. The UI drains this once per frame
+/// and shows it as an inline error in the modal, so a failed activation
+/// during an active trial no longer traps the user in a locked state.
+pub type SharedActivationError = Arc<Mutex<Option<String>>>;
+
+pub fn make_shared_activation_error() -> SharedActivationError {
+    Arc::new(Mutex::new(None))
+}
+
 // ---- license.json on disk ---------------------------------------------------
 
 /// Persisted license cache. Everything is optional so an empty file
@@ -661,8 +672,17 @@ struct LsMeta {
 }
 
 /// User-initiated activation. Runs on a background thread; flips `shared`
-/// to `Activating` immediately, then terminal state when the call returns.
-pub fn spawn_activate(key: String, shared: SharedLicense) {
+/// to `Activating` immediately. On success, writes the terminal `Licensed`
+/// state. On failure, **does not** globally flag the license as invalid —
+/// the user's underlying trial (or previously-valid license) is untouched.
+/// Instead, the per-attempt error is published to `error_sink` and the
+/// shared status falls back to whatever the user legitimately has access
+/// to right now, so a bad key typed during a trial cannot lock them out.
+pub fn spawn_activate(
+    key: String,
+    shared: SharedLicense,
+    error_sink: SharedActivationError,
+) {
     *shared.lock() = LicenseStatus::Activating;
     let shared_bg = shared.clone();
     std::thread::Builder::new()
@@ -675,15 +695,54 @@ pub fn spawn_activate(key: String, shared: SharedLicense) {
                 short_hash(&instance_name)
             ));
             let outcome = match activate_call(&key, &instance_name) {
-                Ok(file) => persist_and_status(file),
+                Ok(file) => {
+                    *error_sink.lock() = None;
+                    persist_and_status(file)
+                }
                 Err(e) => {
                     startup_log::log(format!("license: activate failed: {e}"));
-                    LicenseStatus::Invalid(e.to_string())
+                    *error_sink.lock() = Some(friendly_activation_error(&e.to_string()));
+                    fallback_after_failed_activation()
                 }
             };
             *shared_bg.lock() = outcome;
         })
         .expect("spawn license-activate thread");
+}
+
+/// Re-computes the license state the user would have *without* the failed
+/// activation attempt. Used so a 404 on a bogus key doesn't wipe out an
+/// active trial or a previously-cached Licensed grant.
+fn fallback_after_failed_activation() -> LicenseStatus {
+    let (file, path) = load_license_file();
+    let (anchor, _needs_stamp) = trial::resolve_anchor(&file, path.as_deref());
+    initial_status(&file, anchor)
+}
+
+/// Turns a raw reqwest/ureq error message into something a human can act
+/// on. Keeps the string short — it's shown inline inside a narrow modal.
+fn friendly_activation_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("status code 404") || lower.contains("not found") {
+        "That key isn't recognised. Double-check for typos and try again."
+            .to_string()
+    } else if lower.contains("status code 400")
+        || lower.contains("status code 422")
+    {
+        "This key can't be activated on this PC — it may already be at its \
+         activation limit. Deactivate it from the customer portal and try again."
+            .to_string()
+    } else if lower.contains("timed out")
+        || lower.contains("dns")
+        || lower.contains("connect")
+        || lower.contains("network")
+    {
+        "Couldn't reach the license server. Check your internet connection \
+         and try again."
+            .to_string()
+    } else {
+        format!("Activation failed: {raw}")
+    }
 }
 
 /// Background revalidate of the cached grant. Called on startup when the last
@@ -1090,6 +1149,43 @@ mod tests {
         assert!(parse_override("   ").is_none());
         assert!(parse_override("potato").is_none());
         assert!(parse_override("licensed:").is_some()); // trailing colon is OK
+    }
+
+    #[test]
+    fn friendly_activation_error_maps_404_to_typo_hint() {
+        let msg = friendly_activation_error(
+            "lemon squeezy activate: https://api.lemonsqueezy.com/v1/licenses/activate: status code 404",
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("recognised")
+                || msg.to_ascii_lowercase().contains("recognized")
+                || msg.to_ascii_lowercase().contains("typo"),
+            "404 should surface a typo hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn friendly_activation_error_maps_422_to_activation_limit() {
+        let msg = friendly_activation_error("status code 422");
+        assert!(
+            msg.to_ascii_lowercase().contains("activation limit"),
+            "422 should mention activation limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn friendly_activation_error_maps_network_to_connectivity() {
+        let msg = friendly_activation_error("dns error: no such host");
+        assert!(
+            msg.to_ascii_lowercase().contains("internet"),
+            "network errors should mention connectivity, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn friendly_activation_error_passes_through_unknown() {
+        let msg = friendly_activation_error("teapot");
+        assert!(msg.contains("teapot"));
     }
 
     #[test]
