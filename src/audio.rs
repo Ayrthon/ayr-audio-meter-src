@@ -54,6 +54,24 @@ impl Default for Levels {
 pub enum SourceKind {
     Input,
     Loopback,
+    /// Remote sender discovered over mDNS and connected to over TCP. The
+    /// endpoint metadata lives on [`DeviceInfo::network`] — keeping
+    /// `SourceKind` as a fieldless enum preserves its `Copy` semantics
+    /// that the rest of the meter relies on.
+    Network,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkEndpoint {
+    /// Stable id the meter uses to match this sender across refreshes —
+    /// derived from the mDNS instance name + fingerprint so two senders
+    /// with the same friendly name don't collide.
+    pub service_id: String,
+    pub host: std::net::IpAddr,
+    pub port: u16,
+    /// Protocol version the sender advertised in its TXT record. Stored
+    /// so the UI can warn about version mismatches pre-connect.
+    pub protocol_version: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +79,9 @@ pub struct DeviceInfo {
     pub name: String,
     pub kind: SourceKind,
     pub max_channels: usize,
+    /// Only populated for `SourceKind::Network` entries. `None` for
+    /// cpal inputs / WASAPI loopbacks.
+    pub network: Option<NetworkEndpoint>,
 }
 
 pub type SharedLevels = Arc<RwLock<Levels>>;
@@ -105,6 +126,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
             name,
             kind: SourceKind::Input,
             max_channels: max,
+            network: None,
         });
     }
     devices.sort_by(|a, b| a.name.cmp(&b.name));
@@ -183,6 +205,7 @@ impl AudioEngine {
         let clip_dirs_th = clip_dirs.clone();
         let device_name = device.name.clone();
         let kind = device.kind;
+        let network_endpoint = device.network.clone();
 
         let handle = thread::Builder::new()
             .name(format!("audio-{:?}", kind))
@@ -231,6 +254,31 @@ impl AudioEngine {
                     SourceKind::Loopback => Err(anyhow!(
                         "loopback capture is not supported on this platform"
                     )),
+                    SourceKind::Network => match network_endpoint {
+                        Some(ep) => run_network_source(
+                            &device_name,
+                            ep,
+                            meter_true_peak.clone(),
+                            &levels_for_thread,
+                            &loudness_for_thread,
+                            &spectrum_for_thread,
+                            &comp_for_thread,
+                            &history_for_thread,
+                            &history_trace_for_thread,
+                            &weighting_for_thread,
+                            &scratch_for_thread,
+                            &meter_mode_th,
+                            &clip_states_th,
+                            &clip_settings_th,
+                            &clip_capture_th,
+                            &clip_status_th,
+                            &clip_dirs_th,
+                            &stop_for_thread,
+                        ),
+                        None => Err(anyhow!(
+                            "network source `{device_name}` is missing endpoint metadata"
+                        )),
+                    },
                 };
                 if let Err(err) = result {
                     log::error!("audio thread exited with error: {err:?}");
@@ -641,6 +689,7 @@ mod windows_loopback {
                 name,
                 kind: SourceKind::Loopback,
                 max_channels: channels,
+                network: None,
             });
         }
         Ok(out)
@@ -888,4 +937,183 @@ mod windows_loopback {
             }
         }
     }
+}
+
+// -------------------------------------------------------------------
+// Network source — AYR Audio Link (TCP)
+// -------------------------------------------------------------------
+
+/// Runs a single network capture session: dial the sender advertised in
+/// `endpoint`, read the handshake, then loop over incoming PCM frames
+/// through a small jitter buffer and into the existing DSP pipeline.
+///
+/// Jitter buffer design:
+/// * Accumulate samples until we have ~30ms queued (`target_fill`).
+/// * Only emit to the DSP once the buffer is primed, then release in
+///   ~10ms chunks matched to the wire frame cadence.
+/// * If the queue ever exceeds ~120ms, drop the oldest chunk — a meter
+///   cares about current level, not historical playback.
+/// * If the queue runs dry mid-stream, the DSP path just waits — we
+///   don't insert silence because the meters naturally tail off via
+///   their ballistic smoothing.
+#[allow(clippy::too_many_arguments)]
+fn run_network_source(
+    device_name: &str,
+    endpoint: NetworkEndpoint,
+    meter_true_peak: Arc<AtomicBool>,
+    levels: &SharedLevels,
+    loudness: &SharedLoudness,
+    spectrum: &SharedSpectrum,
+    comp: &SharedComp,
+    history: &SharedHistory,
+    history_trace: &SharedHistoryTrace,
+    weighting: &Arc<AtomicU8>,
+    meter_scratch: &Arc<Mutex<MeterScratch>>,
+    meter_mode: &Arc<AtomicU8>,
+    clip_trigger_states: &SharedClipTriggerStates,
+    clip_settings: &SharedClipSettings,
+    clip_capture: &SharedClipCapture,
+    clip_status: &SharedClipStatus,
+    clip_dirs: &SharedUserSettings,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
+    use ayr_audio_link_core::wire::{self, FrameBuf};
+    use std::io::BufReader;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::new(endpoint.host, endpoint.port);
+    log::info!("network source: dialling {addr} (`{device_name}`)");
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))
+        .with_context(|| format!("connect {addr}"))?;
+    // Keep read latency tight — we poll with a small timeout so the stop
+    // flag is honoured within ~200ms of a UI disconnect.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .ok();
+    stream.set_nodelay(true).ok();
+    let mut reader = BufReader::with_capacity(16 * 1024, stream);
+    let hs = wire::read_handshake(&mut reader).context("read handshake")?;
+    let channels = (hs.channels as usize).min(MAX_CHANNELS);
+    let sample_rate = hs.sample_rate;
+    let stride = hs.frame_stride_bytes();
+    log::info!(
+        "network source connected: {} @ {sample_rate}Hz, {channels}ch",
+        hs.display_name
+    );
+
+    {
+        let mut lv = levels.write();
+        lv.active = true;
+        lv.channels = channels;
+        lv.sample_rate = sample_rate;
+        lv.device_name = device_name.to_owned();
+        lv.source_kind = SourceKind::Network;
+    }
+    {
+        let mut l = loudness.write();
+        *l = Default::default();
+    }
+    let mut analyzer = match LoudnessAnalyzer::new(channels as u32, sample_rate) {
+        Ok(a) => Some(a),
+        Err(err) => {
+            log::warn!("loudness analyzer init failed (network): {err:?}");
+            None
+        }
+    };
+    spectrum::configure(spectrum, sample_rate, true);
+    {
+        let mut c = comp.write();
+        c.clear();
+        c.configure(sample_rate);
+    }
+    history.write().reset_tick_clock();
+    let start_instant = std::time::Instant::now();
+
+    let target_fill = (sample_rate as usize * channels * 30 / 1000).max(1);
+    let drop_threshold = (sample_rate as usize * channels * 120 / 1000).max(target_fill);
+    let emit_chunk = (sample_rate as usize * channels * 10 / 1000).max(1);
+
+    let mut jitter: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(drop_threshold);
+    let mut primed = false;
+    let mut frame_buf = FrameBuf::new();
+    let mut emit_scratch: Vec<f32> = Vec::with_capacity(emit_chunk);
+
+    while !stop.load(Ordering::Relaxed) {
+        match wire::read_frame(&mut reader, stride, &mut frame_buf) {
+            Ok(()) => {}
+            Err(ayr_audio_link_core::LinkError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Read timeout — loop back and check the stop flag.
+                continue;
+            }
+            Err(e) => {
+                log::info!("network source: stream ended: {e}");
+                break;
+            }
+        }
+        for &s in &frame_buf.samples {
+            jitter.push_back(s);
+        }
+        // Drop down to `target_fill` if we're too far ahead — the meter
+        // cares about "right now", not historical playback.
+        while jitter.len() > drop_threshold {
+            jitter.pop_front();
+        }
+        if !primed {
+            if jitter.len() < target_fill {
+                continue;
+            }
+            primed = true;
+        }
+        while jitter.len() >= emit_chunk {
+            emit_scratch.clear();
+            for _ in 0..emit_chunk {
+                if let Some(v) = jitter.pop_front() {
+                    emit_scratch.push(v);
+                }
+            }
+            let now = wall_clock_secs();
+            let tp = meter_true_peak.load(Ordering::Relaxed);
+            let snap = process_weighted_levels(
+                meter_scratch,
+                weighting,
+                &emit_scratch,
+                channels,
+                sample_rate,
+                tp,
+                levels,
+            );
+            let trig = clip_trigger_hold_max_db(
+                &mut clip_trigger_states.lock(),
+                meter_mode.load(Ordering::Relaxed),
+                now,
+                &snap,
+            );
+            process_clip(
+                &emit_scratch,
+                channels,
+                sample_rate,
+                clip_settings.as_ref(),
+                clip_capture,
+                clip_status,
+                clip_dirs,
+                trig,
+            );
+            if let Some(a) = analyzer.as_mut() {
+                a.process(&emit_scratch, loudness);
+            }
+            spectrum::push_samples(spectrum, &emit_scratch, channels);
+            comp.write()
+                .push_samples_mono_sum(&emit_scratch, channels, sample_rate);
+        }
+        tick_shared_history(levels, history, history_trace, start_instant);
+    }
+
+    spectrum::configure(spectrum, sample_rate, false);
+    comp.write().clear();
+    Ok(())
 }

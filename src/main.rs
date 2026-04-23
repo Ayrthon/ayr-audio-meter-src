@@ -17,6 +17,7 @@ mod license;
 mod loudness;
 mod meter;
 mod meter_widget;
+mod network_source;
 mod spectrum;
 mod spectrum_view;
 #[cfg(windows)]

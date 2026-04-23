@@ -224,6 +224,16 @@ pub struct AudioMeterApp {
     /// Human-readable error shown under the key field on a failed activation
     /// attempt. Cleared as soon as the user edits the key again.
     license_activation_error: Option<String>,
+    /// Discovery handle for AYR Audio Link senders on the LAN. Browser
+    /// thread is owned here so it lives for the app's lifetime. Polled
+    /// every `refresh_devices` to splice senders into `self.devices`.
+    network_sources: std::sync::Arc<crate::network_source::NetworkSources>,
+    /// Last wall-clock moment we reconciled `self.devices` against the
+    /// mDNS browser's view of the LAN. Poll every second so senders that
+    /// come online appear in the dropdown without the user having to hit
+    /// "Refresh" — but throttle so we don't allocate a fresh `Vec` on
+    /// every frame.
+    network_last_reconcile: Instant,
 }
 
 /// Target window widths for the two UI modes.  The app snaps to one
@@ -412,6 +422,10 @@ impl AudioMeterApp {
             license_modal_forced: false,
             license_key_input: String::new(),
             license_activation_error: None,
+            network_sources: crate::network_source::NetworkSources::start(),
+            network_last_reconcile: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
         };
         // Fire the GitHub release check on a background thread. The result
         // flows back into `_app.update` and is picked up by the UI loop next
@@ -433,21 +447,93 @@ impl AudioMeterApp {
         return _app;
     }
 
-    fn refresh_devices(&mut self) {
-        let prev_name = self
+    /// Reconciles the current `devices` list with what the mDNS browser
+    /// currently sees on the LAN. Preserves any physical (input/loopback)
+    /// entries and the user's selection — only the NETWORK entries are
+    /// swapped out. Intentionally cheap so it can run once a second from
+    /// the UI loop without a visible hiccup.
+    fn reconcile_network_sources(&mut self) {
+        let discovered = self.network_sources.discovered();
+
+        // Fast path: if the set of service_ids hasn't changed, skip the
+        // rebuild. Display names can drift (sender user edits) but the
+        // service_id is stable, so that's what we key on.
+        let current_ids: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|d| d.kind == SourceKind::Network)
+            .filter_map(|d| d.network.as_ref().map(|n| n.service_id.clone()))
+            .collect();
+        let new_ids: Vec<_> = discovered
+            .iter()
+            .filter_map(|d| d.network.as_ref().map(|n| n.service_id.clone()))
+            .collect();
+        if current_ids == new_ids {
+            return;
+        }
+
+        // Remember selection by service_id / (kind,name) so indices don't
+        // silently shift under the user.
+        let prev_selected = self
             .selected_device
             .and_then(|i| self.devices.get(i))
-            .map(|d| (d.kind, d.name.clone()));
-        self.devices = list_devices().unwrap_or_default();
-        // Try to preserve selection by matching (kind, name).
-        self.selected_device = prev_name
-            .as_ref()
-            .and_then(|(k, n)| {
-                self.devices
-                    .iter()
-                    .position(|d| d.kind == *k && d.name == *n)
+            .map(|d| match (&d.kind, &d.network) {
+                (SourceKind::Network, Some(n)) => (SourceKind::Network, n.service_id.clone()),
+                _ => (d.kind, d.name.clone()),
+            });
+
+        self.devices.retain(|d| d.kind != SourceKind::Network);
+        self.devices.extend(discovered);
+
+        self.selected_device = prev_selected.and_then(|(k, key)| {
+            self.devices.iter().position(|d| match k {
+                SourceKind::Network => {
+                    d.kind == SourceKind::Network
+                        && d.network.as_ref().map(|n| &n.service_id) == Some(&key)
+                }
+                _ => d.kind == k && d.name == key,
             })
-            .or_else(|| (0..self.devices.len()).next());
+        });
+    }
+
+    fn refresh_devices(&mut self) {
+        // Remember the user's previous selection so we can restore it after
+        // the list is rebuilt. For network sources, the display name can
+        // collide across machines, so we key on the mDNS service_id (stable
+        // per-sender) instead of the human-readable name.
+        #[derive(Clone)]
+        enum PrevSel {
+            Local(SourceKind, String),
+            Network(String),
+        }
+        let prev_sel = self
+            .selected_device
+            .and_then(|i| self.devices.get(i))
+            .map(|d| match (&d.kind, &d.network) {
+                (SourceKind::Network, Some(n)) => PrevSel::Network(n.service_id.clone()),
+                _ => PrevSel::Local(d.kind, d.name.clone()),
+            });
+
+        let mut devices = list_devices().unwrap_or_default();
+        // Splice in any senders the mDNS browser has turned up. The
+        // browser is a background thread that lives for the lifetime
+        // of the app, so repeated `refresh_devices` calls still see
+        // whatever set of senders is currently visible.
+        devices.extend(self.network_sources.discovered());
+        self.devices = devices;
+
+        self.selected_device = match prev_sel {
+            Some(PrevSel::Network(ref sid)) => self.devices.iter().position(|d| {
+                d.kind == SourceKind::Network
+                    && d.network.as_ref().map(|n| &n.service_id) == Some(sid)
+            }),
+            Some(PrevSel::Local(k, ref n)) => self
+                .devices
+                .iter()
+                .position(|d| d.kind == k && d.name == *n),
+            None => None,
+        }
+        .or_else(|| (0..self.devices.len()).next());
     }
 
     fn start_stream(&mut self) -> Result<()> {
@@ -488,6 +574,7 @@ impl AudioMeterApp {
         let kind_label = match dev.kind {
             SourceKind::Input => "input",
             SourceKind::Loopback => "output (loopback)",
+            SourceKind::Network => "network sender",
         };
         self.status = format!("Capturing {kind_label}: {}", dev.name);
         Ok(())
@@ -832,6 +919,18 @@ impl eframe::App for AudioMeterApp {
         let license_grants_access = self.license.lock().grants_full_access();
         if license_grants_access {
             self.tick_meters();
+        }
+        // Reconcile network sources into the device dropdown periodically.
+        // Only do this while we're not metering — if the user has already
+        // kicked off a stream, mutating `self.devices` would shift indices
+        // under the active `selected_device`. The browser thread keeps
+        // running regardless, so the next Stop → reconcile picks up any
+        // senders that appeared mid-stream.
+        if self.engine.is_none()
+            && self.network_last_reconcile.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            self.network_last_reconcile = Instant::now();
+            self.reconcile_network_sources();
         }
         // Spectrum: run the analyzer while the tab is open, and keep decaying after Stop even if
         // another panel is selected (otherwise FFT state never reaches the noise floor).
@@ -1939,6 +2038,11 @@ impl AudioMeterApp {
                         "speakers (loopback)",
                         Color32::from_rgb(0x2a, 0x56, 0x3c),
                     ),
+                    SourceKind::Network => (
+                        "NETWORK",
+                        "AYR Audio Link (LAN)",
+                        Color32::from_rgb(0x48, 0x36, 0x78),
+                    ),
                 };
                 draw_badge(ui, badge, badge_bg);
                 ui.label(
@@ -2226,6 +2330,7 @@ impl AudioMeterApp {
                 let tag = match d.kind {
                     SourceKind::Input => "IN",
                     SourceKind::Loopback => "OUT",
+                    SourceKind::Network => "NET",
                 };
                 format!("[{tag}] {}", d.name)
             })
@@ -2248,6 +2353,33 @@ impl AudioMeterApp {
                     .devices
                     .iter()
                     .any(|d| d.kind == SourceKind::Loopback);
+                let has_network = self
+                    .devices
+                    .iter()
+                    .any(|d| d.kind == SourceKind::Network);
+
+                if has_network {
+                    ui.label(
+                        RichText::new("NETWORK  (AYR Audio Link)")
+                            .color(LEFT_LABEL_SECONDARY)
+                            .size(10.0)
+                            .strong(),
+                    );
+                    for (i, d) in self.devices.iter().enumerate() {
+                        if d.kind != SourceKind::Network {
+                            continue;
+                        }
+                        let selected = self.selected_device == Some(i);
+                        let label = format!("[NET] {}", d.name);
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.selected_device = Some(i);
+                        }
+                    }
+                    if has_outputs || has_inputs {
+                        ui.add_space(4.0);
+                        ui.separator();
+                    }
+                }
 
                 if has_outputs {
                     ui.label(
@@ -2289,7 +2421,7 @@ impl AudioMeterApp {
                     }
                 }
 
-                if !has_inputs && !has_outputs {
+                if !has_inputs && !has_outputs && !has_network {
                     ui.label(
                         RichText::new("no devices found").color(Color32::from_gray(130)),
                     );

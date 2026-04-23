@@ -1,3 +1,30 @@
+# ---------------------------------------------------------------------------
+# Cargo workspace layout
+# ---------------------------------------------------------------------------
+#
+# The root directory is simultaneously:
+#   * the `audio-meter-rs` package (the AYR Audio Meter receiver app — this is
+#     the historical layout the installer, release workflow, and launch scripts
+#     were built against, so moving it under `crates/` would break all of
+#     those in exchange for nothing).
+#   * the workspace root for the new companion products that live under
+#     `crates/`:
+#       - `ayr-audio-link-core` — shared wire-format / mDNS / peer-identity
+#         library used by both the sender and the meter.
+#       - `ayr-audio-link`      — the standalone Windows sender binary (egui)
+#         that ships as a free addon.
+#
+# Cargo is happy with a hybrid root package + workspace — `cargo build` at
+# the root still builds just `audio-meter-rs` (so `launch-release.ps1` works
+# unchanged); `cargo build --workspace` builds everything; and `cargo build
+# -p ayr-audio-link` builds just the sender.
+[workspace]
+members = [
+    "crates/ayr-audio-link-core",
+    "crates/ayr-audio-link",
+]
+resolver = "2"
+
 [package]
 name = "audio-meter-rs"
 version = "2.0.0"
@@ -31,6 +58,10 @@ ureq = { version = "2", features = ["json"] }
 # `instance_name` we send to Lemon Squeezy at activation time. Salted + hex
 # encoded so the raw machine/user identifiers never leave the device.
 sha2 = "0.10"
+# Shared wire format + mDNS discovery helpers used to accept PCM from the
+# companion AYR Audio Link sender over the LAN. Path dep so the meter and
+# the sender always speak the same protocol version.
+ayr-audio-link-core = { path = "crates/ayr-audio-link-core" }
 
 # Linux / macOS: Glow (OpenGL). Repo's visual baseline was tuned against
 # Glow on Linux, and Wayland/X11 wgpu has its own quirks we haven't
