@@ -60,15 +60,69 @@ const PREFILL_MS: u32 = 20;
 /// instead of a sustained stutter.
 const REFILL_MS: u32 = 3;
 
-#[derive(Default)]
+/// Maximum playback-rate correction the drift compensator will apply, as a
+/// ratio. 200 ppm covers typical crystal oscillator drift between two
+/// consumer-grade audio interfaces (each ±50 ppm) plus headroom for NIC
+/// hardware jitter on Ethernet/Wi-Fi. Capping is essential: if an
+/// underrun-triggered re-prime tried to "catch up" at large ratios the
+/// audio would pitch-shift audibly.
+const DRIFT_MAX_RATIO_DELTA: f64 = 200e-6;
+
+/// Seconds of per-call slew applied by the PI controller. Kept small so
+/// transient dropouts (a single late RTP packet, a Wi-Fi burst) don't
+/// perturb the rate — only sustained depth bias does.
+const DRIFT_KP: f64 = 1.5e-6; // per-frame-of-error
+const DRIFT_KI: f64 = 8.0e-9; // per-frame-of-error · per-ms-elapsed
+
 struct DrainState {
     /// `false` until the queue is primed with at least `PREFILL_MS` of audio.
     primed: bool,
+    /// Most recently consumed interleaved frame (channel-major, up to
+    /// MAX_CHANNELS). Held across drain calls so the fractional read
+    /// position can interpolate between `cur_frame` and `next_frame`.
+    cur_frame: [f32; MAX_CHANNELS],
+    next_frame: [f32; MAX_CHANNELS],
+    /// Number of input channels currently held in `cur_frame`/`next_frame`.
+    /// Zero means neither slot is valid yet (fresh session or post-reset).
+    frame_width: usize,
+    /// Fractional read position between `cur_frame` (0.0) and
+    /// `next_frame` (1.0). Advances by `play_rate` per output frame.
+    frac: f64,
+    /// Current long-term playback rate multiplier. `1.0` = nominal;
+    /// `1.0 + δ` where |δ| ≤ `DRIFT_MAX_RATIO_DELTA` = slow drift
+    /// correction. Converges toward whatever ratio keeps the queue depth
+    /// centred on `target_depth_frames`.
+    play_rate: f64,
+    /// Integrator state for the PI controller.
+    integral: f64,
+    /// Wall-clock timestamp of the previous drain call — used to convert
+    /// the integral term from "per call" to "per millisecond" so the
+    /// controller behaves identically under different audio callback
+    /// periods.
+    last_tick: Option<std::time::Instant>,
+    /// Periodic drift log throttle.
+    last_log: Option<std::time::Instant>,
+}
+
+impl Default for DrainState {
+    fn default() -> Self {
+        Self {
+            primed: false,
+            cur_frame: [0.0; MAX_CHANNELS],
+            next_frame: [0.0; MAX_CHANNELS],
+            frame_width: 0,
+            frac: 0.0,
+            play_rate: 1.0,
+            integral: 0.0,
+            last_tick: None,
+            last_log: None,
+        }
+    }
 }
 
 impl DrainState {
     fn reset(&mut self) {
-        self.primed = false;
+        *self = DrainState::default();
     }
 }
 
@@ -264,38 +318,127 @@ impl MeterMonitorBus {
 
         let in_rate_u = self.in_rate.load(Ordering::Relaxed).max(1);
         let in_ch = (self.in_ch.load(Ordering::Relaxed).max(1) as usize).min(MAX_CHANNELS);
+        // Prefill / refill thresholds in *samples* (not frames) — the
+        // existing conventions elsewhere in this file are sample-indexed.
         let prefill_samples = (in_rate_u as usize) * in_ch * PREFILL_MS as usize / 1000;
         let refill_samples = (in_rate_u as usize) * in_ch * REFILL_MS as usize / 1000;
+        // Target queue depth the PI controller tries to keep us at: the
+        // midpoint between refill and prefill in *frames*, which gives the
+        // drift compensator equal headroom to slow down or speed up.
+        let target_depth_frames =
+            ((prefill_samples + refill_samples) / (2 * in_ch.max(1))).max(1) as f64;
 
         let mut q = self.queue.lock();
         let mut st = self.drain.lock();
 
         if !st.primed {
+            // Need at least two input frames queued so we have both
+            // `cur_frame` and `next_frame` before interpolation starts.
             if q.len() >= prefill_samples.max(in_ch * 2) {
+                // Pop the first two frames into the interpolation slots.
+                pop_frame_into(&mut q, &mut st.cur_frame, in_ch);
+                pop_frame_into(&mut q, &mut st.next_frame, in_ch);
+                st.frame_width = in_ch;
+                st.frac = 0.0;
                 st.primed = true;
+                // Keep the converged rate across prime/reprime cycles:
+                // if we've been tracking the sender's actual rate at
+                // +50 ppm for 10 minutes, a single 3 ms underrun
+                // shouldn't throw that away. Only zero the integral so
+                // the controller doesn't ramp from a stale windup state.
+                st.integral = 0.0;
             } else {
                 return 0;
             }
         }
 
-        let mut frame = [0.0_f32; MAX_CHANNELS];
+        // Update the PI controller exactly once per drain call. `error`
+        // is in *input frames*: positive = queue deeper than target
+        // (producer fast, we must speed up playback), negative =
+        // shallower than target (producer slow, slow down playback).
+        let now = std::time::Instant::now();
+        let dt_ms = match st.last_tick {
+            Some(prev) => now.saturating_duration_since(prev).as_secs_f64() * 1000.0,
+            None => 0.0,
+        };
+        st.last_tick = Some(now);
+        let depth_frames = (q.len() / in_ch.max(1)) as f64;
+        let error = depth_frames - target_depth_frames;
+        st.integral += error * dt_ms;
+        // Mild integral windup clamp (20 seconds of worst-case accumulation).
+        let int_clamp = target_depth_frames * 20_000.0;
+        if st.integral > int_clamp {
+            st.integral = int_clamp;
+        } else if st.integral < -int_clamp {
+            st.integral = -int_clamp;
+        }
+        let raw_delta = DRIFT_KP * error + DRIFT_KI * st.integral;
+        let delta = raw_delta.clamp(-DRIFT_MAX_RATIO_DELTA, DRIFT_MAX_RATIO_DELTA);
+        st.play_rate = 1.0 + delta;
+
+        // Linear-interpolated drain. We advance `frac` by `play_rate`
+        // per output frame; whenever it crosses an integer boundary we
+        // slide next_frame → cur_frame and pop a fresh next_frame from
+        // the queue. This gives a continuous, fractional resampling
+        // across the whole drain call without any block boundaries.
         let mut filled = 0usize;
         while filled < n_frames {
-            if q.len() < in_ch {
-                st.primed = false;
-                break;
-            }
+            let cur = &st.cur_frame;
+            let nxt = &st.next_frame;
+            let f = st.frac as f32;
+            let mut mixed = [0.0_f32; MAX_CHANNELS];
             for c in 0..in_ch {
-                frame[c] = q.pop_front().unwrap_or(0.0);
+                mixed[c] = cur[c] + (nxt[c] - cur[c]) * f;
             }
-            let (l, r) = stereo_downmix(&frame[..in_ch], in_ch);
+            let (l, r) = stereo_downmix(&mixed[..in_ch], in_ch);
             out_l[filled] = l;
             out_r[filled] = r;
             filled += 1;
+
+            st.frac += st.play_rate;
+            // Consume as many whole input frames as the ratio demands.
+            // Ratios stay within ±200 ppm so this loop typically runs 0
+            // or 1 times per output frame — 2 only under extreme
+            // correction.
+            while st.frac >= 1.0 {
+                if q.len() < in_ch {
+                    // Queue dry mid-frame — fall back to holding
+                    // `next_frame` so we output a flat hold instead of
+                    // silence until the next push. Re-arm the prefill
+                    // latch so the next dropout gets a proper refill.
+                    st.primed = false;
+                    break;
+                }
+                st.cur_frame = st.next_frame;
+                pop_frame_into(&mut q, &mut st.next_frame, in_ch);
+                st.frac -= 1.0;
+            }
+            if !st.primed {
+                break;
+            }
         }
+
         if q.len() < refill_samples {
+            // Dropping into re-prime territory. Don't clear the state
+            // mid-stream; just flip the latch so the next call waits for
+            // enough samples before it starts draining again.
             st.primed = false;
         }
+
+        // Periodic drift log so long sessions have a breadcrumb trail.
+        let should_log = match st.last_log {
+            Some(prev) => now.saturating_duration_since(prev) >= std::time::Duration::from_secs(30),
+            None => true,
+        };
+        if should_log {
+            st.last_log = Some(now);
+            let ppm = delta * 1.0e6;
+            log::debug!(
+                "monitor drift: depth={depth_frames:.0}f target={target_depth_frames:.0}f rate={:+.1}ppm",
+                ppm
+            );
+        }
+
         filled
     }
 
@@ -371,6 +514,19 @@ impl MeterMonitorBus {
         }
 
         drop(current);
+    }
+}
+
+/// Pop one interleaved frame (`in_ch` samples) off the queue into `dst`.
+/// Any missing samples are filled with 0 so `dst` is always valid after
+/// the call. Used by `drain_stereo`'s fractional interpolator to slide
+/// new input frames into `cur_frame` / `next_frame`.
+fn pop_frame_into(q: &mut VecDeque<f32>, dst: &mut [f32; MAX_CHANNELS], in_ch: usize) {
+    for c in 0..in_ch.min(MAX_CHANNELS) {
+        dst[c] = q.pop_front().unwrap_or(0.0);
+    }
+    for c in in_ch..MAX_CHANNELS {
+        dst[c] = 0.0;
     }
 }
 
