@@ -2116,7 +2116,7 @@ impl AudioMeterApp {
             let mode_combo = with_left_panel_combo_style(ui, |ui| {
                 egui::ComboBox::from_id_salt("mode_combo")
                     .width(cw)
-                    .selected_text(self.mode.name_outside_paren())
+                    .selected_text(truncate(self.mode.display_name(), 36))
                     .popup_style(left_panel_combo_popup_style())
                     .show_ui(ui, |ui| {
                         for mode in MeterMode::ALL {

@@ -50,7 +50,9 @@ impl MeterMode {
     }
 
     /// The part of [`display_name`](Self::display_name) before `(`,
-    /// end-trimmed. For the closed meter combo label (stable width, readable).
+    /// end-trimmed. Kept around as a short stable-width label option even
+    /// though the meter combo currently shows the full display name.
+    #[allow(dead_code)]
     pub fn name_outside_paren(self) -> &'static str {
         let s = self.display_name();
         match s.split_once('(') {

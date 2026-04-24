@@ -489,17 +489,71 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
 
     // --- scale ticks + labels ---------------------------------
     // Tick marks extend outward from the bar (longer than before); same #a3a3a7 as numerals.
+    // Minor (unlabeled) ticks are half the length and use the dimmer COL_TICK
+    // so they read as subdivisions without fighting the labeled majors.
     const RULER_TICK_INSET: f32 = 1.0;
     const RULER_TICK_OUTER: f32 = 8.0;
-    for &disp in scale.tick_display_values() {
-        if disp > scale.disp_max || disp < scale.disp_min {
-            continue;
-        }
+    const RULER_MINOR_TICK_OUTER: f32 = 4.0;
+
+    let tick_to_y = |disp: f32| -> f32 {
         let dbfs = match scale.kind {
             MeterScaleKind::Dbf => disp,
             MeterScaleKind::Vu | MeterScaleKind::K => scale.reference_dbfs + disp,
         };
-        let y = scale.dbfs_to_y(dbfs, bar_top, bar_bottom);
+        scale.dbfs_to_y(dbfs, bar_top, bar_bottom)
+    };
+
+    // Minor ticks: subdivide each adjacent major-major gap. The per-gap count
+    // keeps a useful density across modes with very different spacings:
+    //   * gap >= 10 dB (e.g. K-20's -40..-30..-20, or dBFS's -40..-50..-60)
+    //     → 3 quarter-points so 10 dB isn't a visually empty span.
+    //   * gap  in 4..10 (OBS's 6 dB, PPM's 5 dB, K-20's 4 dB) → 1 midpoint.
+    //   * gap  < 4 (VU's 1/2/3 dB near the top) → no minors; it's already
+    //     fine-grained enough that more marks only add clutter.
+    let majors = scale.tick_display_values();
+    for pair in majors.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        let gap = (a - b).abs();
+        let n: usize = if gap >= 10.0 {
+            3
+        } else if gap >= 4.0 {
+            1
+        } else {
+            0
+        };
+        for i in 1..=n {
+            let frac = i as f32 / (n as f32 + 1.0);
+            let disp = a + (b - a) * frac;
+            if disp > scale.disp_max || disp < scale.disp_min {
+                continue;
+            }
+            let y = tick_to_y(disp);
+            if y < bar_top - 1.0 || y > bar_bottom + 1.0 {
+                continue;
+            }
+            painter.line_segment(
+                [
+                    pos2(bar_x - RULER_MINOR_TICK_OUTER, y),
+                    pos2(bar_x - RULER_TICK_INSET, y),
+                ],
+                Stroke::new(1.0, COL_TICK),
+            );
+            painter.line_segment(
+                [
+                    pos2(bar_x + bar_w + RULER_TICK_INSET, y),
+                    pos2(bar_x + bar_w + RULER_MINOR_TICK_OUTER, y),
+                ],
+                Stroke::new(1.0, COL_TICK),
+            );
+        }
+    }
+
+    for &disp in majors {
+        if disp > scale.disp_max || disp < scale.disp_min {
+            continue;
+        }
+        let y = tick_to_y(disp);
         if y < bar_top - 1.0 || y > bar_bottom + 1.0 {
             continue;
         }
