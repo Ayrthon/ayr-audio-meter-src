@@ -1057,7 +1057,8 @@ fn run_network_source(
     meter_monitor: &Arc<MeterMonitorBus>,
 ) -> Result<()> {
     use ayr_audio_link_core::wire::{
-        self, classify_datagram, ControlMsg, DatagramKind, LatencyPreset, PT_F32LE,
+        self, classify_datagram, ControlMsg, DatagramKind, LatencyPreset, L24_BYTES_PER_SAMPLE,
+        PT_F32LE, PT_L24,
     };
     use std::net::{SocketAddr, UdpSocket};
     use std::time::{Duration, Instant};
@@ -1171,9 +1172,10 @@ fn run_network_source(
             thread::sleep(Duration::from_millis(400));
             continue;
         };
-        if payload_type != PT_F32LE {
+        if payload_type != PT_F32LE && payload_type != PT_L24 {
             log::warn!(
-                "network source: sender advertised payload_type={payload_type}, only f32le ({PT_F32LE}) supported today"
+                "network source: sender advertised payload_type={payload_type}, \
+                 only f32le ({PT_F32LE}) and AES67 L24 ({PT_L24}) are supported"
             );
             thread::sleep(Duration::from_millis(1000));
             continue;
@@ -1281,11 +1283,40 @@ fn run_network_source(
                                         last_seq = None;
                                         primed = false;
                                     }
-                                    if hdr.payload_type != PT_F32LE {
-                                        // Unknown payload — ignore rather than crash.
+                                    // Per-PT bytes-per-sample. Used below
+                                    // for validation, zero-fill sizing and
+                                    // to reject packets whose PT doesn't
+                                    // match the active stream format.
+                                    let bps_sample = match hdr.payload_type {
+                                        PT_F32LE => 4usize,
+                                        PT_L24 => L24_BYTES_PER_SAMPLE,
+                                        _ => {
+                                            // Unknown payload — skip.
+                                            continue 'read;
+                                        }
+                                    };
+                                    if hdr.payload_type != payload_type {
+                                        // Sender changed wire format mid-
+                                        // stream; the companion STREAM_INFO
+                                        // arrives on a separate datagram so
+                                        // we may hit one or two RTP packets
+                                        // with the new PT before the
+                                        // control path catches up. Drop
+                                        // them rather than decode at the
+                                        // wrong stride — STREAM_INFO will
+                                        // trigger a reconnect.
                                         continue 'read;
                                     }
-                                    if wire::validate_f32_payload(payload, channels_u8).is_err() {
+                                    let valid = match hdr.payload_type {
+                                        PT_F32LE => {
+                                            wire::validate_f32_payload(payload, channels_u8).is_ok()
+                                        }
+                                        PT_L24 => {
+                                            wire::validate_l24_payload(payload, channels_u8).is_ok()
+                                        }
+                                        _ => false,
+                                    };
+                                    if !valid {
                                         continue 'read;
                                     }
                                     // Sequence gap detection. `wrapping_sub`
@@ -1319,7 +1350,7 @@ fn run_network_source(
                                         // megabyte of silence into the
                                         // buffer at once.
                                         let per_pkt_samples =
-                                            (payload.len() / 4).max(1) as u32;
+                                            (payload.len() / bps_sample).max(1) as u32;
                                         let fill_samples =
                                             gap_samples.min(4) * per_pkt_samples;
                                         for _ in 0..fill_samples {
@@ -1328,7 +1359,15 @@ fn run_network_source(
                                     } else {
                                         consecutive_loss = 0;
                                     }
-                                    wire::decode_f32_payload(payload, &mut decoded);
+                                    match hdr.payload_type {
+                                        PT_F32LE => {
+                                            wire::decode_f32_payload(payload, &mut decoded);
+                                        }
+                                        PT_L24 => {
+                                            wire::decode_l24_payload(payload, &mut decoded);
+                                        }
+                                        _ => continue 'read,
+                                    }
                                     for &s in &decoded {
                                         jitter.push_back(s);
                                     }

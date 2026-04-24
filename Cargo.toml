@@ -41,9 +41,9 @@ sha2 = "0.10"
 # For local development against an unpublished change in Link, temporarily
 # swap this for a path dep against a sibling checkout:
 #
-# Pinned to the local sibling checkout while the v2 UDP protocol stabilises.
-# Flip back to a git dep once the Link repo has a v2-compatible branch or tag
-# we can point at:
+# Pinned to the local sibling checkout while the v3 AES67-shaped protocol
+# stabilises (M2). Flip back to a git dep once the Link repo has a v3-
+# compatible branch or tag we can point at:
 #   ayr-audio-link-core = { git = "https://github.com/Ayrthon/ayr-audio-link", branch = "main" }
 ayr-audio-link-core = { path = "../ayr-audio-link/crates/ayr-audio-link-core" }
 
