@@ -431,8 +431,10 @@ pub fn show_history_graph(
         }
     }
 
-    // Clip capture threshold (dotted) + label — always visible; red when armed, grey when not.
-    // OBS uses a slightly thicker stroke / dash spacing so the line reads on busy meter colours.
+    // Clip capture threshold + label — always visible. Armed state draws a
+    // solid line (reads as a committed trigger); disarmed keeps the dotted
+    // stroke so it clearly looks inert. OBS palette uses a slightly thicker
+    // stroke / dash spacing so the line stays legible on busy meter colours.
     const COL_CLIP_TRIGGER: Color32 = Color32::from_rgb(0xe8, 0x4a, 0x55);
     const COL_CLIP_TRIGGER_INACTIVE: Color32 = Color32::from_rgb(0x6a, 0x6e, 0x78);
     let clip_threshold_db = clip_settings.threshold_db();
@@ -452,7 +454,14 @@ pub fn show_history_graph(
         } else {
             (1.25_f32, 2.0_f32, 5.0_f32)
         };
-        draw_dotted_h(&painter, left, right, y, line_color, dot, gap, stroke_w);
+        if armed {
+            painter.line_segment(
+                [pos2(left, y), pos2(right, y)],
+                Stroke::new(stroke_w, line_color),
+            );
+        } else {
+            draw_dotted_h(&painter, left, right, y, line_color, dot, gap, stroke_w);
+        }
         let (text_y, align) = if y - 14.0 > top + 2.0 {
             (y - 4.0, egui::Align2::LEFT_BOTTOM)
         } else {
