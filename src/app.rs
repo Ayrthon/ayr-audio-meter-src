@@ -2728,7 +2728,7 @@ impl AudioMeterApp {
         let tip = if !engine_on {
             "Start metering first to hear the signal.".to_string()
         } else if !has_target {
-            "Pick a monitor output in Controls → AUDIO MONITORING first.".to_string()
+            "Pick a monitor output in Controls > AUDIO MONITORING first.".to_string()
         } else if conflict {
             format!(
                 "Monitor device matches the capture source ({}). Pick a different output to avoid a feedback loop.",
@@ -2736,7 +2736,7 @@ impl AudioMeterApp {
             )
         } else if listen_on {
             format!(
-                "Listen on → {} — same audio the meters use. Click to turn off.",
+                "Listen on -> {} — same audio the meters use. Click to turn off.",
                 target.clone().unwrap_or_default()
             )
         } else {
@@ -2836,7 +2836,7 @@ impl AudioMeterApp {
         } else if on {
             match target {
                 Some(name) => (
-                    format!("Routing meter audio → {name}"),
+                    format!("Routing meter audio -> {name}"),
                     Color32::from_rgb(0x5D, 0xC4, 0x90),
                 ),
                 None => ("Listen off".to_string(), LEFT_LABEL_SECONDARY),
