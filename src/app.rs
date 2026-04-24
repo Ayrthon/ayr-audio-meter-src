@@ -365,7 +365,13 @@ impl AudioMeterApp {
 
         let (settings_data, settings_path) = load_settings_file();
         let left_collapsed_from_disk = settings_data.left_panel_collapsed;
+        let monitor_device_from_disk = settings_data.monitor_device_name.clone();
         let user_settings = make_shared_user_settings(settings_data);
+
+        let meter_monitor = MeterMonitorBus::new();
+        // Restore the persisted monitor-device choice before any capture
+        // starts so the first enable opens on the user's previous pick.
+        meter_monitor.set_target_device(monitor_device_from_disk);
 
         let _app = Self {
             devices,
@@ -408,7 +414,7 @@ impl AudioMeterApp {
             spectrum_anchors: Vec::new(),
             meter_states,
             history,
-            meter_monitor: MeterMonitorBus::new(),
+            meter_monitor,
             engine: None,
             metering_runtime_start: None,
             channels: 2,
@@ -2069,6 +2075,22 @@ impl AudioMeterApp {
 
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
+        left_panel_collapsing(
+            ui,
+            "left_tab_ctrl_monitor",
+            "AUDIO MONITORING",
+            width,
+            LEFT_SECTION_CARD_BODY_PAD_X,
+            |ui| {
+                ui.add_space(4.0);
+                self.monitor_device_dropdown(ui, "monitor_device_combo", cw);
+                ui.add_space(4.0);
+                self.monitor_status_line(ui);
+            },
+        );
+
+        ui.add_space(LEFT_SECTION_STACK_GAP);
+
         left_panel_collapsing(ui, "left_tab_ctrl_meter_mode", "METER MODE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             let cfg = config_for(self.mode);
@@ -2690,26 +2712,148 @@ impl AudioMeterApp {
         );
     }
 
-    /// Headphone-shaped toggle: routes the metered PCM to the default output device.
+    /// Headphone-shaped toggle: routes the metered PCM to the user-chosen
+    /// monitor render endpoint (see the AUDIO MONITORING panel). Matches
+    /// OBS's explicit-monitor-device model — the button refuses to engage
+    /// when no device is picked, or when the chosen device is the same
+    /// endpoint we're loopback-capturing (feedback-loop protection).
     fn meter_listen_toggle(&mut self, ui: &mut egui::Ui) {
         let engine_on = self.engine.is_some();
         let listen_on = self.meter_monitor.is_enabled();
+        let target = self.meter_monitor.target_device();
+        let conflict = self.meter_monitor.self_monitor_conflict();
+        let has_target = target.is_some();
+        let can_listen = engine_on && has_target && !conflict;
+
         let tip = if !engine_on {
-            "Start metering first to hear the signal."
+            "Start metering first to hear the signal.".to_string()
+        } else if !has_target {
+            "Pick a monitor output in Controls → AUDIO MONITORING first.".to_string()
+        } else if conflict {
+            format!(
+                "Monitor device matches the capture source ({}). Pick a different output to avoid a feedback loop.",
+                target.clone().unwrap_or_default()
+            )
         } else if listen_on {
-            "Listen on — same audio the meters use. Click to turn off."
+            format!(
+                "Listen on → {} — same audio the meters use. Click to turn off.",
+                target.clone().unwrap_or_default()
+            )
         } else {
-            "Listen off — click to hear the metered signal (watch your monitor level; loud sources can clip)."
+            format!(
+                "Listen off — click to monitor on {}.  Watch your level, loud sources can clip.",
+                target.clone().unwrap_or_default()
+            )
         };
 
         let size = egui::vec2(32.0, 26.0);
-        let ir = ui.add_enabled_ui(engine_on, |ui| {
+        let ir = ui.add_enabled_ui(can_listen || listen_on, |ui| {
             ui.add_sized(size, HeadphoneListenButton { on: listen_on })
         });
         ir.response.on_hover_text(tip);
-        if engine_on && ir.inner.clicked() {
-            self.meter_monitor.set_enabled(!listen_on);
+        if ir.inner.clicked() {
+            if listen_on {
+                self.meter_monitor.set_enabled(false);
+            } else if can_listen {
+                self.meter_monitor.set_enabled(true);
+            }
         }
+    }
+
+    /// Dropdown that matches OBS's "Settings → Audio → Monitoring Device".
+    /// Choice is persisted to `user_settings.monitor_device_name` so the
+    /// next launch remembers it, and mirrored live into `MeterMonitorBus`
+    /// so the output thread can reopen on the new endpoint.
+    fn monitor_device_dropdown(&mut self, ui: &mut egui::Ui, id: &str, width: f32) {
+        let current = self.meter_monitor.target_device();
+        let current_label = current
+            .clone()
+            .unwrap_or_else(|| "Disabled (no monitoring)".into());
+
+        with_left_panel_combo_style(ui, |ui| {
+            egui::ComboBox::from_id_salt(id)
+                .width(width)
+                .selected_text(truncate(&current_label, 36))
+                .popup_style(left_panel_combo_popup_style())
+                .show_ui(ui, |ui| {
+                    let disabled = current.is_none();
+                    if ui
+                        .selectable_label(disabled, "Disabled (no monitoring)")
+                        .clicked()
+                        && !disabled
+                    {
+                        self.set_monitor_device(None);
+                    }
+                    ui.separator();
+                    let names = crate::audio::list_monitor_output_device_names();
+                    if names.is_empty() {
+                        ui.label(
+                            RichText::new("no output devices found")
+                                .color(Color32::from_gray(130)),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("OUTPUT  (speakers / headphones)")
+                                .color(LEFT_LABEL_SECONDARY)
+                                .size(10.0)
+                                .strong(),
+                        );
+                        for name in names {
+                            let selected = current.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(selected, &name).clicked() && !selected {
+                                self.set_monitor_device(Some(name));
+                            }
+                        }
+                    }
+                });
+        });
+    }
+
+    fn set_monitor_device(&mut self, name: Option<String>) {
+        self.meter_monitor.set_target_device(name.clone());
+        self.user_settings.lock().monitor_device_name = name;
+    }
+
+    /// One-line status under the monitor picker: currently-routed device,
+    /// any self-monitor conflict, or an error the output thread surfaced.
+    fn monitor_status_line(&mut self, ui: &mut egui::Ui) {
+        let target = self.meter_monitor.target_device();
+        let source = self.meter_monitor.source_device();
+        let conflict = self.meter_monitor.self_monitor_conflict();
+        let err = self.meter_monitor.last_error();
+        let on = self.meter_monitor.is_enabled();
+
+        let (text, color) = if conflict {
+            (
+                format!(
+                    "Can't monitor: output matches capture source ({}). Pick another device.",
+                    source.unwrap_or_default()
+                ),
+                Color32::from_rgb(0xE0, 0x8B, 0x60),
+            )
+        } else if let Some(msg) = err {
+            (msg, Color32::from_rgb(0xE0, 0x8B, 0x60))
+        } else if on {
+            match target {
+                Some(name) => (
+                    format!("Routing meter audio → {name}"),
+                    Color32::from_rgb(0x5D, 0xC4, 0x90),
+                ),
+                None => ("Listen off".to_string(), LEFT_LABEL_SECONDARY),
+            }
+        } else if target.is_some() {
+            (
+                "Pick the headphone button to start monitoring.".to_string(),
+                LEFT_LABEL_SECONDARY,
+            )
+        } else {
+            (
+                "Pick an output to enable the headphone button.".to_string(),
+                LEFT_LABEL_SECONDARY,
+            )
+        };
+
+        ui.label(RichText::new(text).color(color).size(10.5));
     }
 
     /// Transport, view mode, and runtime clock above the history / spectrum area.

@@ -54,6 +54,12 @@ eframe = { version = "0.34", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+# Polyphase / sinc-interpolated resampler for the headphone-monitor output
+# path, only on non-Windows targets. On Windows we route through WASAPI
+# shared mode with AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | SRC_DEFAULT_QUALITY,
+# which is the same path OBS uses (the audio engine itself resamples to the
+# device mix rate), so rubato isn't needed there.
+rubato = "0.15"
 
 # Windows: **wgpu only** — explicitly no `glow` feature.
 #

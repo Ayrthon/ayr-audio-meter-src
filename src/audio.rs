@@ -163,6 +163,43 @@ pub fn default_output_name() -> Option<String> {
     }
 }
 
+/// Friendly names of all render endpoints eligible as headphone-monitor
+/// targets. On Windows this reuses `windows_loopback::list_output_devices()`
+/// so the names match exactly what the user sees in Windows Sound Settings
+/// (and therefore match the friendly name stored in
+/// [`crate::user_settings::UserSettingsData::monitor_device_name`]). Other
+/// platforms fall back to `cpal::Host::output_devices()`.
+pub fn list_monitor_output_device_names() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        match windows_loopback::list_output_devices() {
+            Ok(devs) => {
+                let mut names: Vec<String> = devs.into_iter().map(|d| d.name).collect();
+                names.sort();
+                names.dedup();
+                names
+            }
+            Err(err) => {
+                log::warn!("list_monitor_output_device_names: {err:?}");
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let host = cpal::default_host();
+        let Ok(devs) = host.output_devices() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = devs
+            .filter_map(|d| d.name().ok())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
 pub struct AudioEngine {
     stop_flag: Arc<AtomicBool>,
     levels: SharedLevels,
@@ -552,7 +589,12 @@ fn run_cpal_input(
     };
 
     stream.play()?;
-    meter_monitor.begin_capture(sample_rate, channels, stop.clone());
+    meter_monitor.begin_capture(
+        sample_rate,
+        channels,
+        Some(device_name.to_string()),
+        stop.clone(),
+    );
 
     history.write().reset_tick_clock();
     let start_instant = std::time::Instant::now();
@@ -813,7 +855,12 @@ mod windows_loopback {
         audio_client.start_stream().context("start_stream")?;
         log::info!("loopback started");
 
-        meter_monitor.begin_capture(sample_rate, channels, stop.clone());
+        meter_monitor.begin_capture(
+            sample_rate,
+            channels,
+            Some(device_name.to_string()),
+            stop.clone(),
+        );
 
         history.write().reset_tick_clock();
         let start_instant = std::time::Instant::now();
@@ -1080,7 +1127,10 @@ fn run_network_source(
             c.clear();
             c.configure(sample_rate);
         }
-        meter_monitor.begin_capture(sample_rate, channels, stop.clone());
+        // Network sources have no local render endpoint to collide with, so
+        // leave the source-device name `None` — the self-monitor guard won't
+        // ever trigger on AYR Audio Link streams.
+        meter_monitor.begin_capture(sample_rate, channels, None, stop.clone());
         history.write().reset_tick_clock();
         let start_instant = std::time::Instant::now();
 

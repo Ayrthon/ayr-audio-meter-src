@@ -27,6 +27,21 @@ pub struct UserSettingsData {
     /// trial anchor makes showing it again pointless anyway).
     #[serde(default)]
     pub license_welcome_shown: bool,
+
+    /// Output endpoint the headphone monitor routes to. Matches OBS's
+    /// "Settings → Audio → Monitoring Device" model:
+    ///
+    /// * `None`  — monitoring is disabled (listen button inert). This is the
+    ///   default so users opt in explicitly and never accidentally create a
+    ///   loopback feedback loop on first launch.
+    /// * `Some(name)` — friendly name (`IMMDevice` friendly name on Windows,
+    ///   `cpal::Device::name()` elsewhere) of the render endpoint to use.
+    ///
+    /// Lookup is by display name because cpal on Windows doesn't surface
+    /// stable device IDs; names stay stable across app launches unless the
+    /// user renames the device in Sound Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_device_name: Option<String>,
 }
 
 impl Default for UserSettingsData {
@@ -35,6 +50,7 @@ impl Default for UserSettingsData {
             clips_save_dir: None,
             left_panel_collapsed: false,
             license_welcome_shown: false,
+            monitor_device_name: None,
         }
     }
 }
