@@ -2091,6 +2091,29 @@ impl AudioMeterApp {
 
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
+        left_panel_collapsing(
+            ui,
+            "left_tab_ctrl_network",
+            "NETWORK INPUT",
+            width,
+            LEFT_SECTION_CARD_BODY_PAD_X,
+            |ui| {
+                ui.add_space(4.0);
+                self.network_latency_preset_dropdown(ui, "network_preset_combo", cw);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Jitter-buffer target for incoming AYR Audio Link streams. \
+                         Applies on the next reconnect.",
+                    )
+                    .color(LEFT_LABEL_SECONDARY)
+                    .size(10.5),
+                );
+            },
+        );
+
+        ui.add_space(LEFT_SECTION_STACK_GAP);
+
         left_panel_collapsing(ui, "left_tab_ctrl_meter_mode", "METER MODE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             let cfg = config_for(self.mode);
@@ -2812,6 +2835,33 @@ impl AudioMeterApp {
     fn set_monitor_device(&mut self, name: Option<String>) {
         self.meter_monitor.set_target_device(name.clone());
         self.user_settings.lock().monitor_device_name = name;
+    }
+
+    /// Dropdown choosing the receiver-side jitter-buffer preset for AYR
+    /// Audio Link streams. Persisted to `user_settings.network_latency_preset`
+    /// and read by `run_network_source` on every (re-)subscribe, so a
+    /// change here takes effect the next time the sender bounces or the
+    /// user re-selects the network source.
+    fn network_latency_preset_dropdown(&mut self, ui: &mut egui::Ui, id: &str, width: f32) {
+        let current_byte = self.user_settings.lock().network_latency_preset;
+        let current = ayr_audio_link_core::wire::LatencyPreset::from_u8(current_byte)
+            .unwrap_or(ayr_audio_link_core::wire::LatencyPreset::Home);
+        let current_label = current.label();
+
+        with_left_panel_combo_style(ui, |ui| {
+            egui::ComboBox::from_id_salt(id)
+                .width(width)
+                .selected_text(truncate(current_label, 36))
+                .popup_style(left_panel_combo_popup_style())
+                .show_ui(ui, |ui| {
+                    for preset in ayr_audio_link_core::wire::LatencyPreset::ALL {
+                        let selected = preset == current;
+                        if ui.selectable_label(selected, preset.label()).clicked() && !selected {
+                            self.user_settings.lock().network_latency_preset = preset as u8;
+                        }
+                    }
+                });
+        });
     }
 
     /// One-line status under the monitor picker: currently-routed device,

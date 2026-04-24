@@ -1074,14 +1074,8 @@ fn run_network_source(
         }
         h ^ 0xA1EC_CAFE_DEAD_BEEF
     });
-    // TODO: wire a user-selectable latency preset through the Meter UI. For
-    // now we default to Home (20 ms) so the jitter buffer absorbs typical
-    // Wi-Fi without biting latency too hard. The preset UI is tracked as
-    // m1_ui in the AYR Audio Link TODO list.
-    let preset = LatencyPreset::Home;
-
     log::info!(
-        "network source: AYR Audio Link at {addr} (`{device_name}`) client_id={client_id:#018x} preset={preset:?}"
+        "network source: AYR Audio Link at {addr} (`{device_name}`) client_id={client_id:#018x}"
     );
 
     while !stop.load(Ordering::Relaxed) {
@@ -1091,6 +1085,15 @@ fn run_network_source(
         }
         spectrum::configure(spectrum, 48_000, false);
         comp.write().clear();
+
+        // Read the user's current latency preset every reconnect, so a
+        // dropdown change applies on the next subscribe without tearing
+        // down the audio thread.
+        let preset = {
+            let byte = clip_dirs.lock().network_latency_preset;
+            LatencyPreset::from_u8(byte).unwrap_or(LatencyPreset::Home)
+        };
+        log::debug!("network source: preset={preset:?} ({}ms target)", preset.target_ms());
 
         // Fresh socket per session: avoids stale kernel buffers from a
         // previous subscription that the sender might have forgotten about.

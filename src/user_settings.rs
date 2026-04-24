@@ -42,6 +42,21 @@ pub struct UserSettingsData {
     /// user renames the device in Sound Settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_device_name: Option<String>,
+
+    /// Jitter-buffer latency preset for incoming AYR Audio Link streams.
+    /// Persisted as the `LatencyPreset` discriminant (0=Studio / 1=Home /
+    /// 2=Safe) so a forward-compatible core crate can introduce new
+    /// presets without reading the old string format. Default on first
+    /// run is `Home` (≈20 ms).
+    #[serde(default = "default_network_latency_preset")]
+    pub network_latency_preset: u8,
+}
+
+fn default_network_latency_preset() -> u8 {
+    // LatencyPreset::Home — kept as a literal here so we don't take a
+    // compile-time dep on the core crate from user_settings.rs (which is
+    // loaded before the network stack is wired up).
+    1
 }
 
 impl Default for UserSettingsData {
@@ -51,6 +66,7 @@ impl Default for UserSettingsData {
             left_panel_collapsed: false,
             license_welcome_shown: false,
             monitor_device_name: None,
+            network_latency_preset: default_network_latency_preset(),
         }
     }
 }
