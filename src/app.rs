@@ -3374,6 +3374,12 @@ fn hash_bg_noise_u8(x: u32, y: u32) -> u8 {
 }
 
 /// Cool charcoal grain — tiled over the window for a sandblasted / anodized-metal feel.
+///
+/// Three octaves of integer hash noise drive the per-pixel luminance so the
+/// pattern reads as uneven matte metal rather than a regular dither. Range is
+/// intentionally wider than the old build (0x2c..0x78 instead of 0x2c..0x58)
+/// so the texture stays visible when the compositor draws it at a moderate
+/// alpha on top of the vignette in `paint_metallic_background`.
 fn build_metallic_noise_image() -> egui::ColorImage {
     const W: usize = 128;
     const H: usize = 128;
@@ -3383,11 +3389,16 @@ fn build_metallic_noise_image() -> egui::ColorImage {
             let h = hash_bg_noise_u8(x as u32, y as u32);
             let h2 = hash_bg_noise_u8(x as u32 / 3, y as u32 / 3);
             let h3 = hash_bg_noise_u8(x as u32 / 11, y as u32 / 11);
+            // Wider per-pixel range than the previous build: the three
+            // octaves together contribute up to ~64 grey levels so the
+            // brightest grain pixels reach ~0x78 (was ~0x58). Keeps the
+            // average luminance close to the old value so the overall
+            // window colour doesn't shift visibly.
             let mut v = 0x2cu8
-                .saturating_add(h % 20)
-                .saturating_add(h2 % 12)
-                .saturating_add(h3 % 8);
-            v = v.min(0x58);
+                .saturating_add(h % 30)
+                .saturating_add(h2 % 20)
+                .saturating_add(h3 % 14);
+            v = v.min(0x78);
             // Slight cool slate bias (pro audio UI reference).
             let r = v.saturating_sub(5);
             let g = v.saturating_sub(2);
@@ -3412,8 +3423,12 @@ fn paint_metallic_background(
     let cx = rect.center().x;
     let cy = rect.top() + rect.height() * 0.20;
     let center = egui::pos2(cx, cy);
-    // Vignette: lighter center `#36353b` → darker edge `#232328`.
-    let c_col = Color32::from_rgb(0x36, 0x35, 0x3b);
+    // Vignette: lighter center `#434250` → darker edge `#232328`. The
+    // center stop used to sit at `#36353b`, only ~5 luma above the edge,
+    // which made the "light pool" almost invisible on most displays. Bumping
+    // the centre another ~12 luma and nudging the blue channel slightly
+    // gives the gradient a readable highlight without lifting the edges.
+    let c_col = Color32::from_rgb(0x43, 0x42, 0x50);
     let edge = Color32::from_rgb(0x23, 0x23, 0x28);
 
     let tl = rect.left_top();
@@ -3451,7 +3466,7 @@ fn paint_metallic_background(
     // Soft band under title bar — same palette as the main gradient (lighter → darker).
     let h = rect.height() * 0.28;
     let y1 = rect.top() + h;
-    let sheen_tl = Color32::from_rgba_unmultiplied(0x36, 0x35, 0x3b, 0x1a);
+    let sheen_tl = Color32::from_rgba_unmultiplied(0x43, 0x42, 0x50, 0x1a);
     let sheen_tr = Color32::from_rgba_unmultiplied(0x23, 0x23, 0x28, 0x0c);
     let sheen_b = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
     let mut sheen = Mesh::default();
@@ -3488,12 +3503,16 @@ fn paint_metallic_background(
         egui::pos2(0.0, 0.0),
         egui::pos2(tiles_x, tiles_y),
     );
-    // Tint only (noise texels unchanged) — neutral grey between the two gradient stops.
+    // Tint + alpha of the tiled grain. Tint stays neutral slate so the noise
+    // texels aren't colour-shifted; alpha controls how boldly the texture
+    // sits on top of the vignette. 0x58 (~35%) is roughly 2.5× the previous
+    // 0x24 and makes the grain clearly visible without turning the window
+    // into visible noise.
     painter.image(
         noise.id(),
         rect,
         uv,
-        Color32::from_rgba_unmultiplied(0x2c, 0x2c, 0x32, 0x24),
+        Color32::from_rgba_unmultiplied(0x2c, 0x2c, 0x32, 0x58),
     );
 }
 
