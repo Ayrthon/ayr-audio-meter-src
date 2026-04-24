@@ -1008,24 +1008,32 @@ mod windows_loopback {
 }
 
 // -------------------------------------------------------------------
-// Network source — AYR Audio Link (TCP)
+// Network source — AYR Audio Link (UDP, protocol v2)
 // -------------------------------------------------------------------
 
-/// Runs a network capture session to an AYR Audio Link sender: connect,
-/// read the handshake, stream PCM until the TCP session ends, then
-/// **reconnect in a loop** while metering stays enabled. That way a Link
-/// “Stop broadcasting” / “Start broadcasting” cycle resumes without a
-/// manual Stop/Start on the meter.
+/// Runs a network capture session to an AYR Audio Link sender over UDP.
 ///
-/// Jitter buffer design:
-/// * Accumulate samples until we have ~30ms queued (`target_fill`).
-/// * Only emit to the DSP once the buffer is primed, then release in
-///   ~10ms chunks matched to the wire frame cadence.
-/// * If the queue ever exceeds ~120ms, drop the oldest chunk — a meter
-///   cares about current level, not historical playback.
-/// * If the queue runs dry mid-stream, the DSP path just waits — we
-///   don't insert silence because the meters naturally tail off via
-///   their ballistic smoothing.
+/// Protocol shape (see `ayr_audio_link_core::wire` for full details):
+///
+/// 1. Bind an ephemeral UDP socket and connect it to the sender's
+///    advertised endpoint.
+/// 2. Send `SUBSCRIBE { client_id, preset }` and wait for a
+///    `STREAM_INFO { sample_rate, channels, ssrc, … }` reply before we
+///    initialise DSP — the reply is the only source of truth that the
+///    sender is currently capturing (the mDNS TXT record may be stale).
+/// 3. Receive loop: classify each datagram as either RTP (audio) or
+///    control (`STREAM_INFO` updates). RTP packets feed a per-channel
+///    jitter buffer; out-of-order packets whose sequence is behind the
+///    current play-out are dropped, forward gaps are zero-filled so the
+///    DSP clock stays aligned with the sender's sample counter.
+/// 4. A small background thread fires `KEEPALIVE` every 500 ms so the
+///    sender's reaper doesn't evict us.
+/// 5. On stop we send `UNSUBSCRIBE` best-effort.
+///
+/// Reconnect loop: if the sender disappears (format change, restart,
+/// sender process bounce) the receive path drains, we resend SUBSCRIBE
+/// and continue. So a Link "Stop broadcasting"/"Start broadcasting"
+/// cycle resumes automatically without the user touching the meter.
 #[allow(clippy::too_many_arguments)]
 fn run_network_source(
     device_name: &str,
@@ -1048,19 +1056,35 @@ fn run_network_source(
     stop: &Arc<AtomicBool>,
     meter_monitor: &Arc<MeterMonitorBus>,
 ) -> Result<()> {
-    use ayr_audio_link_core::wire::{self, FrameBuf};
-    use std::io::BufReader;
-    use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
+    use ayr_audio_link_core::wire::{
+        self, classify_datagram, ControlMsg, DatagramKind, LatencyPreset, PT_F32LE,
+    };
+    use std::net::{SocketAddr, UdpSocket};
+    use std::time::{Duration, Instant};
 
     let addr = SocketAddr::new(endpoint.host, endpoint.port);
+    // Pick a stable-per-process client id so repeated subscribes from the
+    // same meter instance look like re-subscriptions to the sender rather
+    // than fresh clients.
+    static CLIENT_ID_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let client_id: u64 = *CLIENT_ID_SEED.get_or_init(|| {
+        let mut h = std::process::id() as u64;
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            h ^= (d.as_nanos() as u64).rotate_left(17);
+        }
+        h ^ 0xA1EC_CAFE_DEAD_BEEF
+    });
+    // TODO: wire a user-selectable latency preset through the Meter UI. For
+    // now we default to Home (20 ms) so the jitter buffer absorbs typical
+    // Wi-Fi without biting latency too hard. The preset UI is tracked as
+    // m1_ui in the AYR Audio Link TODO list.
+    let preset = LatencyPreset::Home;
+
     log::info!(
-        "network source: AYR Audio Link at {addr} (`{device_name}`) — reconnects when the sender restarts"
+        "network source: AYR Audio Link at {addr} (`{device_name}`) client_id={client_id:#018x} preset={preset:?}"
     );
 
     while !stop.load(Ordering::Relaxed) {
-        // Idle between sessions so the UI does not show a live meter while
-        // Link is not broadcasting.
         {
             let mut lv = levels.write();
             lv.active = false;
@@ -1068,38 +1092,92 @@ fn run_network_source(
         spectrum::configure(spectrum, 48_000, false);
         comp.write().clear();
 
-        let (mut reader, hs) = loop {
+        // Fresh socket per session: avoids stale kernel buffers from a
+        // previous subscription that the sender might have forgotten about.
+        let sock = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("network source: bind ephemeral udp: {e}");
+                thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+        };
+        if let Err(e) = sock.connect(addr) {
+            log::warn!("network source: connect {addr}: {e}");
+            thread::sleep(Duration::from_millis(400));
+            continue;
+        }
+        sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+
+        // Subscribe + wait for STREAM_INFO.
+        let mut ctrl_buf: Vec<u8> = Vec::with_capacity(128);
+        let subscribe = ControlMsg::Subscribe { client_id, preset };
+        if wire::encode_control(&mut ctrl_buf, &subscribe).is_ok() {
+            let _ = sock.send(&ctrl_buf);
+        }
+        let mut recv_buf = vec![0u8; 2048];
+        let stream_info_deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream_info: Option<(u32, u8, u8, u32, String)> = None;
+        while stream_info.is_none() && Instant::now() < stream_info_deadline {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-                Ok(stream) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(200)))
-                        .ok();
-                    stream.set_nodelay(true).ok();
-                    let mut r = BufReader::with_capacity(16 * 1024, stream);
-                    match wire::read_handshake(&mut r) {
-                        Ok(hs) => break (r, hs),
-                        Err(e) => {
-                            log::warn!("network source: handshake from {addr}: {e:#}");
-                            thread::sleep(Duration::from_millis(300));
+            match sock.recv(&mut recv_buf) {
+                Ok(n) if n > 0 => {
+                    if classify_datagram(recv_buf[0]) == DatagramKind::Control {
+                        match wire::decode_control(&recv_buf[..n]) {
+                            Ok(ControlMsg::StreamInfo {
+                                sample_rate,
+                                channels,
+                                payload_type,
+                                ssrc,
+                                display_name,
+                            }) => {
+                                stream_info =
+                                    Some((sample_rate, channels, payload_type, ssrc, display_name));
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::debug!("bad control from {addr}: {e}"),
                         }
                     }
+                    // Any RTP arriving before STREAM_INFO is dropped — we
+                    // can't decode interleaved samples without knowing
+                    // channels yet.
+                }
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // Resend SUBSCRIBE occasionally in case the first
+                    // datagram was dropped (UDP offers no guarantees).
+                    let _ = sock.send(&ctrl_buf);
                 }
                 Err(e) => {
-                    log::warn!("network source: connect to {addr}: {e:#}");
-                    thread::sleep(Duration::from_millis(400));
+                    log::warn!("network source: recv waiting for STREAM_INFO: {e}");
+                    break;
                 }
             }
+        }
+        let Some((sample_rate, channels_u8, payload_type, ssrc, display_name)) = stream_info else {
+            log::warn!(
+                "network source: no STREAM_INFO from {addr} within 2s — sender offline or firewalled"
+            );
+            thread::sleep(Duration::from_millis(400));
+            continue;
         };
-
-        let channels = (hs.channels as usize).min(MAX_CHANNELS);
-        let sample_rate = hs.sample_rate;
-        let stride = hs.frame_stride_bytes();
+        if payload_type != PT_F32LE {
+            log::warn!(
+                "network source: sender advertised payload_type={payload_type}, only f32le ({PT_F32LE}) supported today"
+            );
+            thread::sleep(Duration::from_millis(1000));
+            continue;
+        }
+        let channels = (channels_u8 as usize).min(MAX_CHANNELS);
         log::info!(
-            "network source connected: {} @ {sample_rate}Hz, {channels}ch",
-            hs.display_name
+            "network source connected: {display_name} @ {sample_rate}Hz, {channels}ch, ssrc={ssrc:#010x}"
         );
 
         {
@@ -1127,49 +1205,195 @@ fn run_network_source(
             c.clear();
             c.configure(sample_rate);
         }
-        // Network sources have no local render endpoint to collide with, so
-        // leave the source-device name `None` — the self-monitor guard won't
-        // ever trigger on AYR Audio Link streams.
         meter_monitor.begin_capture(sample_rate, channels, None, stop.clone());
         history.write().reset_tick_clock();
         let start_instant = std::time::Instant::now();
 
-        let target_fill = (sample_rate as usize * channels * 30 / 1000).max(1);
-        let drop_threshold = (sample_rate as usize * channels * 120 / 1000).max(target_fill);
-        let emit_chunk = (sample_rate as usize * channels * 10 / 1000).max(1);
+        // Jitter buffer sized by the preset. `target_fill` primes the buffer
+        // before we start emitting so underruns only happen on a genuine
+        // network stall. `drop_threshold` caps growth when the sender
+        // bursts (e.g. after a routing hiccup releases a backlog).
+        let target_ms = preset.target_ms() as usize;
+        let target_fill = (sample_rate as usize * channels * target_ms / 1000).max(1);
+        let drop_threshold =
+            (sample_rate as usize * channels * (target_ms * 6).max(50) / 1000).max(target_fill);
+        let emit_chunk = (sample_rate as usize * channels * 5 / 1000).max(1);
 
         let mut jitter: std::collections::VecDeque<f32> =
             std::collections::VecDeque::with_capacity(drop_threshold);
         let mut primed = false;
-        let mut frame_buf = FrameBuf::new();
         let mut emit_scratch: Vec<f32> = Vec::with_capacity(emit_chunk);
+        let mut decoded: Vec<f32> = Vec::with_capacity(MAX_CHANNELS * sample_rate as usize / 100);
+
+        // Track sequence + SSRC so we detect packet loss / source changes.
+        let mut current_ssrc = ssrc;
+        let mut last_seq: Option<u16> = None;
+        let mut consecutive_loss = 0u32;
+
+        // Keepalive thread: clone the socket, fire a keepalive every 500 ms
+        // until the stop flag is set or the receive loop exits.
+        let ka_sock = match sock.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("network source: try_clone for keepalive: {e}");
+                thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+        };
+        let ka_stop = Arc::new(AtomicBool::new(false));
+        let ka_stop_bg = ka_stop.clone();
+        let ka_global = stop.clone();
+        let keepalive_thread = std::thread::Builder::new()
+            .name("meter-link-keepalive".into())
+            .spawn(move || {
+                let mut ka_buf: Vec<u8> = Vec::with_capacity(32);
+                while !ka_stop_bg.load(Ordering::Relaxed) && !ka_global.load(Ordering::Relaxed) {
+                    if wire::encode_control(&mut ka_buf, &ControlMsg::Keepalive { client_id })
+                        .is_ok()
+                    {
+                        let _ = ka_sock.send(&ka_buf);
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .ok();
+
+        let mut last_activity = Instant::now();
 
         'read: while !stop.load(Ordering::Relaxed) {
-            match wire::read_frame(&mut reader, stride, &mut frame_buf) {
-                Ok(()) => {}
-                Err(ayr_audio_link_core::LinkError::Io(e))
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
+            match sock.recv(&mut recv_buf) {
+                Ok(n) if n > 0 => {
+                    last_activity = Instant::now();
+                    match classify_datagram(recv_buf[0]) {
+                        DatagramKind::Rtp => {
+                            match wire::decode_audio_packet(&recv_buf[..n]) {
+                                Ok((hdr, payload)) => {
+                                    if hdr.ssrc != current_ssrc {
+                                        log::info!(
+                                            "network source: ssrc changed {current_ssrc:#010x} -> {:#010x}, resetting jitter buffer",
+                                            hdr.ssrc
+                                        );
+                                        current_ssrc = hdr.ssrc;
+                                        jitter.clear();
+                                        last_seq = None;
+                                        primed = false;
+                                    }
+                                    if hdr.payload_type != PT_F32LE {
+                                        // Unknown payload — ignore rather than crash.
+                                        continue 'read;
+                                    }
+                                    if wire::validate_f32_payload(payload, channels_u8).is_err() {
+                                        continue 'read;
+                                    }
+                                    // Sequence gap detection. `wrapping_sub`
+                                    // on `u16` does the right thing across
+                                    // the 16-bit rollover for typical drift.
+                                    let gap_samples = match last_seq {
+                                        Some(prev) => {
+                                            let delta = hdr.sequence.wrapping_sub(prev);
+                                            if delta == 0 {
+                                                // Duplicate — ignore.
+                                                continue 'read;
+                                            }
+                                            if delta > 0x8000 {
+                                                // Packet is "in the past" —
+                                                // arrived late; drop.
+                                                continue 'read;
+                                            }
+                                            // Zero-fill for every missing
+                                            // packet so the DSP sample clock
+                                            // stays aligned with the sender.
+                                            (delta as u32).saturating_sub(1)
+                                        }
+                                        None => 0,
+                                    };
+                                    last_seq = Some(hdr.sequence);
+                                    if gap_samples > 0 {
+                                        consecutive_loss =
+                                            consecutive_loss.saturating_add(gap_samples);
+                                        // Cap the zero-fill so a huge gap
+                                        // (e.g. routing blip) doesn't dump a
+                                        // megabyte of silence into the
+                                        // buffer at once.
+                                        let per_pkt_samples =
+                                            (payload.len() / 4).max(1) as u32;
+                                        let fill_samples =
+                                            gap_samples.min(4) * per_pkt_samples;
+                                        for _ in 0..fill_samples {
+                                            jitter.push_back(0.0);
+                                        }
+                                    } else {
+                                        consecutive_loss = 0;
+                                    }
+                                    wire::decode_f32_payload(payload, &mut decoded);
+                                    for &s in &decoded {
+                                        jitter.push_back(s);
+                                    }
+                                    while jitter.len() > drop_threshold {
+                                        jitter.pop_front();
+                                    }
+                                }
+                                Err(e) => log::debug!("bad RTP from {addr}: {e}"),
+                            }
+                        }
+                        DatagramKind::Control => {
+                            if let Ok(ControlMsg::StreamInfo {
+                                sample_rate: sr,
+                                channels: ch,
+                                payload_type: pt,
+                                ssrc: new_ssrc,
+                                ..
+                            }) = wire::decode_control(&recv_buf[..n])
+                            {
+                                if sr != sample_rate
+                                    || ch as usize != channels
+                                    || pt != payload_type
+                                {
+                                    log::info!(
+                                        "network source: format changed ({sample_rate}/{channels}/{payload_type}) -> ({sr}/{ch}/{pt}), reconnecting"
+                                    );
+                                    break 'read;
+                                }
+                                if new_ssrc != current_ssrc {
+                                    current_ssrc = new_ssrc;
+                                    jitter.clear();
+                                    last_seq = None;
+                                    primed = false;
+                                }
+                            }
+                        }
+                        DatagramKind::Unknown => {}
+                    }
+                }
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
                 {
-                    continue;
+                    if last_activity.elapsed() > Duration::from_secs(3) {
+                        log::info!(
+                            "network source: no audio from {addr} for 3s, resubscribing"
+                        );
+                        break 'read;
+                    }
+                    // Loop back to check stop + process any queued audio.
                 }
                 Err(e) => {
-                    log::info!("network source: stream ended ({e}), reconnecting…");
+                    log::warn!("network source: recv: {e}");
                     break 'read;
                 }
             }
-            for &s in &frame_buf.samples {
-                jitter.push_back(s);
-            }
-            while jitter.len() > drop_threshold {
-                jitter.pop_front();
-            }
+
             if !primed {
-                if jitter.len() < target_fill {
+                if jitter.len() >= target_fill {
+                    primed = true;
+                } else {
                     continue;
                 }
-                primed = true;
             }
+
             while jitter.len() >= emit_chunk {
                 emit_scratch.clear();
                 for _ in 0..emit_chunk {
@@ -1213,6 +1437,15 @@ fn run_network_source(
                 meter_monitor.push_interleaved_f32(&emit_scratch, channels);
             }
             tick_shared_history(levels, history, history_trace, start_instant);
+        }
+
+        // Session ended: stop keepalive thread, best-effort UNSUBSCRIBE.
+        ka_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = keepalive_thread {
+            let _ = h.join();
+        }
+        if wire::encode_control(&mut ctrl_buf, &ControlMsg::Unsubscribe { client_id }).is_ok() {
+            let _ = sock.send(&ctrl_buf);
         }
 
         spectrum::configure(spectrum, sample_rate, false);

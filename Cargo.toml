@@ -41,8 +41,11 @@ sha2 = "0.10"
 # For local development against an unpublished change in Link, temporarily
 # swap this for a path dep against a sibling checkout:
 #
-#   ayr-audio-link-core = { path = "../ayr-audio-link/crates/ayr-audio-link-core" }
-ayr-audio-link-core = { git = "https://github.com/Ayrthon/ayr-audio-link", branch = "main" }
+# Pinned to the local sibling checkout while the v2 UDP protocol stabilises.
+# Flip back to a git dep once the Link repo has a v2-compatible branch or tag
+# we can point at:
+#   ayr-audio-link-core = { git = "https://github.com/Ayrthon/ayr-audio-link", branch = "main" }
+ayr-audio-link-core = { path = "../ayr-audio-link/crates/ayr-audio-link-core" }
 
 # Linux / macOS: Glow (OpenGL). Repo's visual baseline was tuned against
 # Glow on Linux, and Wayland/X11 wgpu has its own quirks we haven't

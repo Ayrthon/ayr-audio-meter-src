@@ -418,8 +418,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "ayr-audio-link-core"
-version = "0.1.0"
-source = "git+https://github.com/Ayrthon/ayr-audio-link?branch=main#58e859de8e021fcec1c39a2d88a786c08f1b03c0"
+version = "0.1.1"
 dependencies = [
  "flume",
  "hostname",
