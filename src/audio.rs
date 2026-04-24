@@ -73,6 +73,11 @@ pub struct NetworkEndpoint {
     /// Protocol version the sender advertised in its TXT record. Stored
     /// so the UI can warn about version mismatches pre-connect.
     pub protocol_version: u16,
+    /// M3: IPv4 multicast group for L24 (same `port` as the sender). When
+    /// set, the receiver binds to `0.0.0.0:port` and `join_multicast_v4`
+    /// so it can follow the session without unicast-audio (still uses
+    /// unicast to the sender for `SUBSCRIBE` / `STREAM_INFO` / `KEEPALIVE`).
+    pub mcast: Option<std::net::Ipv4Addr>,
 }
 
 #[derive(Debug, Clone)]
@@ -1060,7 +1065,7 @@ fn run_network_source(
         self, classify_datagram, ControlMsg, DatagramKind, LatencyPreset, L24_BYTES_PER_SAMPLE,
         PT_F32LE, PT_L24,
     };
-    use std::net::{SocketAddr, UdpSocket};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::time::{Duration, Instant};
 
     let addr = SocketAddr::new(endpoint.host, endpoint.port);
@@ -1075,8 +1080,14 @@ fn run_network_source(
         }
         h ^ 0xA1EC_CAFE_DEAD_BEEF
     });
+    // Multicast + IGMP: IPv4 mDNS + `mc` TXT; IPv6-only senders keep unicast.
+    let wants_mcast_igmp = endpoint
+        .mcast
+        .is_some()
+        && matches!(endpoint.host, IpAddr::V4(_));
+
     log::info!(
-        "network source: AYR Audio Link at {addr} (`{device_name}`) client_id={client_id:#018x}"
+        "network source: AYR Audio Link at {addr} (`{device_name}`) client_id={client_id:#018x} mcast_igmp={wants_mcast_igmp}"
     );
 
     while !stop.load(Ordering::Relaxed) {
@@ -1096,28 +1107,77 @@ fn run_network_source(
         };
         log::debug!("network source: preset={preset:?} ({}ms target)", preset.target_ms());
 
-        // Fresh socket per session: avoids stale kernel buffers from a
-        // previous subscription that the sender might have forgotten about.
-        let sock = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("network source: bind ephemeral udp: {e}");
-                thread::sleep(Duration::from_millis(400));
-                continue;
-            }
-        };
-        if let Err(e) = sock.connect(addr) {
-            log::warn!("network source: connect {addr}: {e}");
-            thread::sleep(Duration::from_millis(400));
-            continue;
-        }
+        // Fresh socket per session. M3: for AES67 L24 the sender also fans
+        // RTP to a `239.69.x.x:<same-port>` group — we bind that local port
+        // and `join_multicast_v4` so we receive those packets (and still use
+        // the same socket for unicast `SUBSCRIBE` / `STREAM_INFO` /
+        // `KEEPALIVE` to the sender, without `connect`, because a connected
+        // socket would not deliver multicast copies).
+        let (sock, mcast_mode): (UdpSocket, bool) =
+            if let (true, Some(g)) = (wants_mcast_igmp, endpoint.mcast) {
+                    let bind_addr =
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), endpoint.port);
+                    match UdpSocket::bind(bind_addr) {
+                        Ok(s) => {
+                            if let Err(e) =
+                                s.join_multicast_v4(&g, &Ipv4Addr::UNSPECIFIED)
+                            {
+                                log::warn!("network source: join_multicast {g}: {e}");
+                            }
+                            log::info!(
+                                "network source: bound {} + joined mcast {g} for L24",
+                                s.local_addr().unwrap_or(bind_addr)
+                            );
+                            (s, true)
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "network source: could not bind port {} (mcast): {e} — try closing other AYR/meter or pick another input",
+                                endpoint.port
+                            );
+                            let s = match UdpSocket::bind("0.0.0.0:0") {
+                                Ok(s) => s,
+                                Err(e2) => {
+                                    log::warn!("network source: bind fallback: {e2}");
+                                    thread::sleep(Duration::from_millis(400));
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = s.connect(addr) {
+                                log::warn!("network source: connect {addr}: {e}");
+                                thread::sleep(Duration::from_millis(400));
+                                continue;
+                            }
+                            (s, false)
+                        }
+                    }
+            } else {
+                let s = match UdpSocket::bind("0.0.0.0:0") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("network source: bind ephemeral udp: {e}");
+                        thread::sleep(Duration::from_millis(400));
+                        continue;
+                    }
+                };
+                if let Err(e) = s.connect(addr) {
+                    log::warn!("network source: connect {addr}: {e}");
+                    thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
+                (s, false)
+            };
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
 
         // Subscribe + wait for STREAM_INFO.
         let mut ctrl_buf: Vec<u8> = Vec::with_capacity(128);
         let subscribe = ControlMsg::Subscribe { client_id, preset };
         if wire::encode_control(&mut ctrl_buf, &subscribe).is_ok() {
-            let _ = sock.send(&ctrl_buf);
+            let _ = if mcast_mode {
+                sock.send_to(&ctrl_buf, addr)
+            } else {
+                sock.send(&ctrl_buf)
+            };
         }
         let mut recv_buf = vec![0u8; 2048];
         let stream_info_deadline = Instant::now() + Duration::from_secs(2);
@@ -1126,7 +1186,12 @@ fn run_network_source(
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            match sock.recv(&mut recv_buf) {
+            let recv_res = if mcast_mode {
+                sock.recv_from(&mut recv_buf).map(|(n, _)| n)
+            } else {
+                sock.recv(&mut recv_buf)
+            };
+            match recv_res {
                 Ok(n) if n > 0 => {
                     if classify_datagram(recv_buf[0]) == DatagramKind::Control {
                         match wire::decode_control(&recv_buf[..n]) {
@@ -1157,7 +1222,11 @@ fn run_network_source(
                 {
                     // Resend SUBSCRIBE occasionally in case the first
                     // datagram was dropped (UDP offers no guarantees).
-                    let _ = sock.send(&ctrl_buf);
+                    let _ = if mcast_mode {
+                        sock.send_to(&ctrl_buf, addr)
+                    } else {
+                        sock.send(&ctrl_buf)
+                    };
                 }
                 Err(e) => {
                     log::warn!("network source: recv waiting for STREAM_INFO: {e}");
@@ -1248,6 +1317,7 @@ fn run_network_source(
         let ka_stop = Arc::new(AtomicBool::new(false));
         let ka_stop_bg = ka_stop.clone();
         let ka_global = stop.clone();
+        let ka_mcast = mcast_mode;
         let keepalive_thread = std::thread::Builder::new()
             .name("meter-link-keepalive".into())
             .spawn(move || {
@@ -1256,7 +1326,11 @@ fn run_network_source(
                     if wire::encode_control(&mut ka_buf, &ControlMsg::Keepalive { client_id })
                         .is_ok()
                     {
-                        let _ = ka_sock.send(&ka_buf);
+                        let _ = if ka_mcast {
+                            ka_sock.send_to(&ka_buf, addr)
+                        } else {
+                            ka_sock.send(&ka_buf)
+                        };
                     }
                     thread::sleep(Duration::from_millis(500));
                 }
@@ -1266,7 +1340,12 @@ fn run_network_source(
         let mut last_activity = Instant::now();
 
         'read: while !stop.load(Ordering::Relaxed) {
-            match sock.recv(&mut recv_buf) {
+            let main_recv = if mcast_mode {
+                sock.recv_from(&mut recv_buf).map(|(n, _)| n)
+            } else {
+                sock.recv(&mut recv_buf)
+            };
+            match main_recv {
                 Ok(n) if n > 0 => {
                     last_activity = Instant::now();
                     match classify_datagram(recv_buf[0]) {
@@ -1487,7 +1566,11 @@ fn run_network_source(
             let _ = h.join();
         }
         if wire::encode_control(&mut ctrl_buf, &ControlMsg::Unsubscribe { client_id }).is_ok() {
-            let _ = sock.send(&ctrl_buf);
+            let _ = if mcast_mode {
+                sock.send_to(&ctrl_buf, addr)
+            } else {
+                sock.send(&ctrl_buf)
+            };
         }
 
         spectrum::configure(spectrum, sample_rate, false);

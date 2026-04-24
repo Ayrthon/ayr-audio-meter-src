@@ -81,6 +81,7 @@ fn sender_to_device_info(sender: DiscoveredSender) -> DeviceInfo {
             host,
             port: sender.port,
             protocol_version: sender.protocol_version,
+            mcast: sender.mcast,
         }),
     }
 }
