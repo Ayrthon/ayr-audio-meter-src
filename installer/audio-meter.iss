@@ -10,7 +10,10 @@
 ; Installed beside the .exe so shortcuts use an explicit .ico (Shell often ignores icons embedded in some Rust/GUI exes).
 #define MyAppIconFile  "AudioMeter.ico"
 
-#define ReleaseExe     "..\target\release\audio-meter-rs.exe"
+#ifndef ReleaseExe
+; Default matches `cargo build --release --target x86_64-pc-windows-msvc` with project `target\`.
+#define ReleaseExe "..\target\x86_64-pc-windows-msvc\release\audio-meter-rs.exe"
+#endif
 
 [Setup]
 AppId={{B4C8F2E9-1D3A-5C7E-9B2D-8A6F4E1C3D70}}

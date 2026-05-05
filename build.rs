@@ -20,6 +20,47 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+/// `winres`'s registry discovery (`reg query`) can fail for MSVC build scripts when the project
+/// lives on `\\wsl...\`, leaving an empty toolkit path. Older winres logic also joins
+/// `<Kits\10>\bin\x64\rc.exe`, but modern SDKs ship `bin\<version>\x64\rc.exe` only.
+/// Resolve the directory that actually contains `rc.exe` and pass it via [`set_toolkit_path`]
+/// (that directory is `bin\<version>\x64`, per winres docs).
+#[cfg(windows)]
+fn windows_kits_10_root() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("WindowsSdkDir") {
+        let p = PathBuf::from(dir.trim_end_matches(['\\', '/']));
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    for candidate in [
+        PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10"),
+        PathBuf::from(r"C:\Program Files\Windows Kits\10"),
+    ] {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn winres_msvc_toolkit_dir() -> Option<PathBuf> {
+    let kit_root = windows_kits_10_root()?;
+    let bin = kit_root.join("bin");
+    let mut with_rc: Vec<PathBuf> = std::fs::read_dir(&bin).ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("x64").join("rc.exe").is_file())
+        .collect();
+    with_rc.sort_by(|a, b| {
+        let sa = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let sb = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        sb.cmp(sa)
+    });
+    with_rc.into_iter().next().map(|v| v.join("x64"))
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let ico_path = manifest_dir.join("assets/app_icon.ico");
@@ -49,8 +90,30 @@ fn main() {
         let staged_ico = out_dir.join("app.ico");
         std::fs::copy(&ico_path, &staged_ico).expect("stage app.ico for winres");
 
+        // `llvm-rc` / the MSVC resource toolchain often fails on UNC paths such
+        // as `\\wsl.localhost\...` when the project lives on a WSL mount. Point
+        // winres at a normal path under `%TEMP%` in that case.
+        let icon_for_rc = {
+            let s = staged_ico.to_string_lossy();
+            if s.starts_with("\\\\") {
+                let tmp = std::env::temp_dir().join(format!(
+                    "ayr-audio-meter-winres-{}.ico",
+                    std::process::id()
+                ));
+                std::fs::copy(&staged_ico, &tmp).expect("copy ico to temp for winres");
+                tmp
+            } else {
+                staged_ico
+            }
+        };
+
         let mut res = winres::WindowsResource::new();
-        res.set_icon(staged_ico.to_str().expect("ico path utf-8"));
+        if let Some(toolkit) = winres_msvc_toolkit_dir() {
+            if let Some(s) = toolkit.to_str() {
+                res.set_toolkit_path(s);
+            }
+        }
+        res.set_icon(icon_for_rc.to_str().expect("ico path utf-8"));
         res.set("FileDescription", "AYR Audio Meter");
         res.set("ProductName", "AYR Audio Meter");
         res.compile().expect("WindowsResource::compile");
