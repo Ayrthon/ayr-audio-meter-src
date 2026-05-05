@@ -98,6 +98,7 @@ pub enum GraphView {
 enum LeftPanelTab {
     #[default]
     Controls,
+    Network,
     Loudness,
     Clips,
 }
@@ -2032,15 +2033,6 @@ impl AudioMeterApp {
 
     fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, width: f32) {
         let cw = left_panel_section_content_w(width);
-        // True when mDNS has at least one AYR Audio Link sender (reconciled
-        // into `self.devices`). Drives the NETWORK BUFFER section — no
-        // broadcast / no advert => dimmed controls.
-        let link_sender_on_lan = self
-            .devices
-            .iter()
-            .any(|d| d.kind == SourceKind::Network);
-        let metering_active = self.engine.is_some();
-        let network_buffer_editable = link_sender_on_lan && !metering_active;
         left_panel_collapsing(ui, "left_tab_ctrl_audio", "AUDIO SOURCE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
             ui.add_space(4.0);
             self.device_dropdown(ui, "device_combo", cw);
@@ -2154,58 +2146,6 @@ impl AudioMeterApp {
             });
             mode_combo.response.on_hover_text(mode_combo_hover);
         });
-
-        ui.add_space(LEFT_SECTION_STACK_GAP);
-
-        left_panel_collapsing(
-            ui,
-            "left_tab_ctrl_network",
-            "NETWORK BUFFER",
-            width,
-            LEFT_SECTION_CARD_BODY_PAD_X,
-            |ui| {
-                ui.add_space(4.0);
-                ui.add_enabled_ui(network_buffer_editable, |ui| {
-                    self.network_latency_preset_dropdown(ui, "network_preset_combo", cw);
-                });
-                ui.add_space(4.0);
-                if !link_sender_on_lan {
-                    ui.label(
-                        RichText::new(
-                            "No AYR Audio Link sender on the network. \
-                             Start the Link app and begin broadcasting, then use \
-                             Refresh devices above if this section stays dim.",
-                        )
-                        .color(LEFT_LABEL_SECONDARY)
-                        .size(10.5),
-                    );
-                } else if metering_active {
-                    ui.label(
-                        RichText::new(
-                            "Jitter-buffer target for incoming AYR Audio Link streams. \
-                             Applies on the next reconnect.",
-                        )
-                        .color(LEFT_LABEL_SECONDARY)
-                        .size(10.5),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new("Stop metering to change the buffer preset.")
-                            .color(LEFT_LABEL_SECONDARY)
-                            .size(10.5),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new(
-                            "Jitter-buffer target for incoming AYR Audio Link streams. \
-                             Applies on the next reconnect.",
-                        )
-                        .color(LEFT_LABEL_SECONDARY)
-                        .size(10.5),
-                    );
-                }
-            },
-        );
 
         ui.add_space(LEFT_SECTION_STACK_GAP);
 
@@ -2339,6 +2279,67 @@ impl AudioMeterApp {
                 }
             }
         });
+
+    }
+
+    fn left_controls_network_tab(&mut self, ui: &mut egui::Ui, width: f32) {
+        let cw = left_panel_section_content_w(width);
+        let link_sender_on_lan = self
+            .devices
+            .iter()
+            .any(|d| d.kind == SourceKind::Network);
+        let metering_active = self.engine.is_some();
+        let network_buffer_editable = link_sender_on_lan && !metering_active;
+
+        left_panel_collapsing(
+            ui,
+            "left_tab_ctrl_network",
+            "NETWORK BUFFER",
+            width,
+            LEFT_SECTION_CARD_BODY_PAD_X,
+            |ui| {
+                ui.add_space(4.0);
+                ui.add_enabled_ui(network_buffer_editable, |ui| {
+                    self.network_latency_preset_dropdown(ui, "network_preset_combo", cw);
+                });
+                ui.add_space(4.0);
+                if !link_sender_on_lan {
+                    ui.label(
+                        RichText::new(
+                            "No AYR Audio Link sender on the network. \
+                             Start the Link app and begin broadcasting, then use \
+                             Refresh devices above if this section stays dim.",
+                        )
+                        .color(LEFT_LABEL_SECONDARY)
+                        .size(10.5),
+                    );
+                } else if metering_active {
+                    ui.label(
+                        RichText::new(
+                            "Jitter-buffer target for incoming AYR Audio Link streams. \
+                             Applies on the next reconnect.",
+                        )
+                        .color(LEFT_LABEL_SECONDARY)
+                        .size(10.5),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Stop metering to change the buffer preset.")
+                            .color(LEFT_LABEL_SECONDARY)
+                            .size(10.5),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "Jitter-buffer target for incoming AYR Audio Link streams. \
+                             Applies on the next reconnect.",
+                        )
+                        .color(LEFT_LABEL_SECONDARY)
+                        .size(10.5),
+                    );
+                }
+            },
+        );
     }
 
     fn left_controls(&mut self, ui: &mut egui::Ui) {
@@ -2352,6 +2353,7 @@ impl AudioMeterApp {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
                         for (tab, label) in [
                             (LeftPanelTab::Controls, "CONTROLS"),
+                            (LeftPanelTab::Network, "NETWORK"),
                             (LeftPanelTab::Loudness, "LOUDNESS"),
                             (LeftPanelTab::Clips, "CLIPS"),
                         ] {
@@ -2386,6 +2388,9 @@ impl AudioMeterApp {
                                 match self.left_tab {
                                     LeftPanelTab::Controls => {
                                         self.left_controls_controls_tab(ui, width);
+                                    }
+                                    LeftPanelTab::Network => {
+                                        self.left_controls_network_tab(ui, width);
                                     }
                                     LeftPanelTab::Loudness => {
                                         left_panel_collapsing(
@@ -2630,9 +2635,10 @@ impl AudioMeterApp {
 
                         ui.add_space(crate::meter_widget::METER_STRIP_MARGIN_START);
                         let n = self.meter_states.len();
-                        for (i, state) in self.meter_states.iter().enumerate() {
+                        let mut reset_all_meters = false;
+                        for (i, state) in self.meter_states.iter_mut().enumerate() {
                             let label = channel_label(self.channels, i).to_string();
-                            show_meter(
+                            let meter_resp = show_meter(
                                 ui,
                                 MeterPaintArgs {
                                     label: &label,
@@ -2641,8 +2647,16 @@ impl AudioMeterApp {
                                 },
                                 now,
                             );
+                            if meter_resp.clicked() {
+                                reset_all_meters = true;
+                            }
                             if i + 1 < n {
                                 ui.add_space(crate::meter_widget::METER_STRIP_GAP_X);
+                            }
+                        }
+                        if reset_all_meters {
+                            for s in &mut self.meter_states {
+                                s.clear();
                             }
                         }
                         ui.add_space(crate::meter_widget::METER_STRIP_GAP_TO_REF);

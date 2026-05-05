@@ -630,7 +630,11 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
         FontId::proportional(FONT_READOUT),
         COL_READOUT_MAX,
     );
-
+    if let Some(pos) = response.hover_pos() {
+        if readout_rect.contains(pos) {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        }
+    }
     // --- channel label ----------------------------------------
     if !args.label.is_empty() {
         painter.text(

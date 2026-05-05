@@ -44,7 +44,7 @@ sha2 = "0.10"
 # Pinned to the local sibling checkout while the v4 protocol (M3 multicast +
 # SAP) stabilises. Flip back to a git dep once the Link repo has a tag:
 #   ayr-audio-link-core = { git = "https://github.com/Ayrthon/ayr-audio-link", branch = "main" }
-ayr-audio-link-core = { path = "../ayr-audio-link/crates/ayr-audio-link-core" }
+ayr-audio-link-core = { path = "../ayr-audio-link-src/crates/ayr-audio-link-core" }
 
 # Linux / macOS: Glow (OpenGL). Repo's visual baseline was tuned against
 # Glow on Linux, and Wayland/X11 wgpu has its own quirks we haven't
