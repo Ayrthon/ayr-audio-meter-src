@@ -199,6 +199,10 @@ pub struct AudioMeterApp {
     /// viewport commands once rather than fighting any user drag later.
     #[cfg(windows)]
     main_window_revealed: bool,
+    /// After first reveal, do a few extra recenter passes to account for
+    /// late-applied decorated-window sizing on some multi-display setups.
+    #[cfg(windows)]
+    startup_recenter_passes_left: u8,
     /// Shared state flipped by the background updater thread (see
     /// `updater::spawn_check` in `AudioMeterApp::new`). The UI reads this every
     /// frame in `maybe_show_update_modal` to drive the "Update available" flow.
@@ -425,6 +429,8 @@ impl AudioMeterApp {
             launched_at: Instant::now(),
             #[cfg(windows)]
             main_window_revealed: false,
+            #[cfg(windows)]
+            startup_recenter_passes_left: 0,
             update: crate::updater::make_shared_status(),
             update_dismissed: false,
             license: crate::license::make_shared_license(),
@@ -894,14 +900,19 @@ impl eframe::App for AudioMeterApp {
         if !self.main_window_revealed {
             let elapsed = self.launched_at.elapsed();
             if elapsed >= crate::SPLASH_SOLO_DURATION {
-                let center = crate::centered_launch_position(crate::MAIN_W, crate::MAIN_H);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(center));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(&ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                } else {
+                    let (inner_w, inner_h) = ctx
+                        .input(|i| i.viewport().inner_rect.map(|r| (r.width(), r.height())))
+                        .unwrap_or((crate::MAIN_W, crate::MAIN_H));
+                    let center = crate::centered_launch_position(inner_w, inner_h);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(center));
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 self.main_window_revealed = true;
-                crate::startup_log::log(format!(
-                    "ui: main window revealed at {:.1}x{:.1}",
-                    center.x, center.y
-                ));
+                self.startup_recenter_passes_left = 8;
+                crate::startup_log::log("ui: main window revealed + centered");
             } else {
                 // Tick the event loop so we come back right after the solo
                 // phase ends rather than sleeping until the next user input.
@@ -910,6 +921,12 @@ impl eframe::App for AudioMeterApp {
                     .saturating_add(std::time::Duration::from_millis(16));
                 ctx.request_repaint_after(remaining);
             }
+        } else if self.startup_recenter_passes_left > 0 {
+            if let Some(cmd) = egui::ViewportCommand::center_on_screen(&ctx) {
+                ctx.send_viewport_cmd(cmd);
+            }
+            self.startup_recenter_passes_left -= 1;
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 
         paint_metallic_background(&ui.painter(), ui.max_rect(), &self.bg_noise);

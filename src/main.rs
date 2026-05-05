@@ -254,6 +254,9 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         viewport,
+        // Keep startup placement deterministic: always honor our explicit
+        // centered reveal instead of restoring a stale OS/window position.
+        persist_window: false,
         renderer,
         // Keep vsync off so the renderer doesn't freeze on a monitor
         // transition where the refresh rate changes.
@@ -311,17 +314,66 @@ fn main() -> eframe::Result {
 pub fn centered_launch_position(width: f32, height: f32) -> egui::Pos2 {
     #[cfg(windows)]
     {
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        #[repr(C)]
+        struct Rect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        #[repr(C)]
+        struct MonitorInfo {
+            cb_size: u32,
+            rc_monitor: Rect,
+            rc_work: Rect,
+            dw_flags: u32,
+        }
         unsafe extern "system" {
             fn GetSystemMetrics(index: i32) -> i32;
+            fn MonitorFromPoint(pt: Point, dw_flags: u32) -> *mut core::ffi::c_void;
+            fn GetMonitorInfoW(
+                h_monitor: *mut core::ffi::c_void,
+                lpmi: *mut MonitorInfo,
+            ) -> i32;
         }
         const SM_CXSCREEN: i32 = 0;
         const SM_CYSCREEN: i32 = 1;
-        let (sw, sh) = unsafe {
-            (
-                GetSystemMetrics(SM_CXSCREEN) as f32,
-                GetSystemMetrics(SM_CYSCREEN) as f32,
-            )
-        };
+        const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
+        let hmon = unsafe { MonitorFromPoint(Point { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+        if !hmon.is_null() {
+            let mut mi = MonitorInfo {
+                cb_size: core::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                rc_work: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                dw_flags: 0,
+            };
+            if unsafe { GetMonitorInfoW(hmon, &mut mi as *mut MonitorInfo) } != 0 {
+                let work_w = (mi.rc_work.right - mi.rc_work.left) as f32;
+                let work_h = (mi.rc_work.bottom - mi.rc_work.top) as f32;
+                let x = mi.rc_work.left as f32 + (work_w - width) * 0.5;
+                let y = mi.rc_work.top as f32 + (work_h - height) * 0.5;
+                return egui::pos2(x, y);
+            }
+        }
+
+        // Fallback: primary monitor center.
+        let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) as f32 };
+        let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) as f32 };
         return egui::pos2(((sw - width) * 0.5).max(0.0), ((sh - height) * 0.5).max(0.0));
     }
     #[cfg(not(windows))]
