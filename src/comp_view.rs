@@ -124,8 +124,6 @@ const PR_CONTEXT_BUCKETS: usize = PR_WINDOW_BUCKETS;
 /// [`BUCKETS`] entries are drawn.
 const RING_CAPACITY: usize = BUCKETS + PR_CONTEXT_BUCKETS;
 
-/// Minimum width of the Comp panel (matches history / spectrum right-panel min).
-const MIN_WIDTH: f32 = 360.0;
 /// Left inset for the dB ruler numerals on the lower (PR) band.
 const LEFT_PAD: f32 = 28.0;
 /// Right gutter — same as history so plot-width discipline matches siblings.
@@ -784,12 +782,12 @@ fn paint_headline(painter: &egui::Painter, rect: Rect, pr_db: f32) {
     );
 }
 
-/// Scroll + paint the Comp view. Mirrors the allocation / layout discipline of
-/// [`crate::history_graph::show_history_graph`] so it slots into the right panel
-/// without changing the outer `ScrollArea` plumbing in `app.rs`.
+/// Paint the Comp view. Same allocation discipline as [`crate::history_graph::show_history_graph`]
+/// (fill parent `Ui`, no forced minimum width — avoids horizontal scroll affordances).
 pub fn show_comp(ui: &mut Ui, shared: &SharedComp, _now: f64) -> Response {
     let mut desired = ui.available_size();
-    desired.x = desired.x.max(MIN_WIDTH);
+    desired.x = desired.x.max(1.0);
+    desired.y = desired.y.max(1.0);
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
 

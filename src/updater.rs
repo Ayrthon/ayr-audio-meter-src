@@ -21,9 +21,12 @@
 //! assets API, and the per-release workflow is one `gh release create …` call.
 //! See `docs/release-checklist.md` for the exact commands.
 //!
-//! Network errors are intentionally silent (logged via [`crate::startup_log`]) —
-//! we never want to surface a "couldn't reach GitHub" modal to the user, since
-//! that's a normal offline state, not a user-actionable problem.
+//! Network errors avoid a modal (logged via [`crate::startup_log`]); the title-row
+//! chip shows a short "Couldn't reach GitHub…" line so offline isn't mistaken for
+//! "skipped checking".
+//!
+//! When **`releases/latest` equals your build**, there is no update popup — that is
+//! expected; [`UpdateStatus::UpToDate`] still proves the GitHub round-trip ran (chip text).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,7 +81,11 @@ pub enum UpdateStatus {
     /// `spawn_check` is awaiting the GitHub API response.
     Checking,
     /// Latest release tag ≤ current version. Modal stays hidden.
-    UpToDate,
+    /// `github_latest` is the semver from `releases/latest` (after stripping `v`),
+    /// so the UI can show that a network check completed.
+    UpToDate {
+        github_latest: String,
+    },
     /// Latest release tag > current version. Show the "Update available" modal.
     Available(ReleaseInfo),
     /// User clicked "Update now". `progress` ∈ [0, 1]; `total_bytes` is 0 when
@@ -142,7 +149,9 @@ pub fn spawn_check(repo: &'static str, current: &'static str, shared: SharedUpda
                             "updater: up to date ({current}; latest is {})",
                             info.version
                         ));
-                        UpdateStatus::UpToDate
+                        UpdateStatus::UpToDate {
+                            github_latest: info.version,
+                        }
                     }
                 }
                 Err(e) => {

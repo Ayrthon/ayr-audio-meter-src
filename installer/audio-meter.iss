@@ -3,7 +3,7 @@
 ; Bump MyAppVersion when you bump version in Cargo.toml.
 
 #define MyAppName      "AYR Audio Meter"
-#define MyAppVersion   "2.1.2"
+#define MyAppVersion   "2.1.3"
 #define MyAppPublisher "Ayrthon"
 #define MyAppURL       "https://ayrthon.com"
 #define MyAppExeName   "AYR Audio Meter.exe"

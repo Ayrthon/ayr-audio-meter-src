@@ -119,7 +119,6 @@ const ANCHOR_DEDUPE_LOG_HZ: f32 = 0.01;
 // keeping music well inside the visible band.
 const DISPLAY_OFFSET_DB: f32 = -16.0;
 
-pub const MIN_WIDTH: f32 = 360.0;
 pub const MIN_HEIGHT: f32 = 260.0;
 
 /// Vertical plot insets — shared with [`crate::history_graph::show_history_graph`] so both
@@ -141,7 +140,8 @@ pub fn show_spectrum(
 
     // Right-edge gutter is applied in `app.rs` around the toolbar + graph column.
     let mut desired = ui.available_size();
-    desired.x = desired.x.max(MIN_WIDTH);
+    desired.x = desired.x.max(1.0);
+    desired.y = desired.y.max(1.0);
     // `Sense::click()` so we get both hover-position reporting AND click events.
     // The hover cursor line, anchor pins, and delete-× hit-testing all ride on
     // this single response; egui resolves overlaps with the Pretty-mode checkbox

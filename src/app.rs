@@ -1149,10 +1149,18 @@ impl AudioMeterApp {
                 "Checking for updates…".to_string(),
                 Color32::from_gray(120),
             ),
-            crate::updater::UpdateStatus::UpToDate => (
-                format!("Running the latest release ({current})"),
-                Color32::from_gray(140),
-            ),
+            crate::updater::UpdateStatus::UpToDate { github_latest } => {
+                let msg = if github_latest == current {
+                    format!(
+                        "Updates checked — v{github_latest} is the latest public release"
+                    )
+                } else {
+                    format!(
+                        "Updates checked — you're on {current}; GitHub latest is v{github_latest}"
+                    )
+                };
+                (msg, Color32::from_gray(140))
+            }
             crate::updater::UpdateStatus::Downloading { progress, .. } => (
                 format!("Downloading update… {:.0}%", (progress * 100.0).clamp(0.0, 100.0)),
                 Color32::from_gray(170),
@@ -1162,10 +1170,9 @@ impl AudioMeterApp {
                 "Launching installer…".to_string(),
                 Color32::from_gray(170),
             ),
-            // Offline / parse error: don't nag the user, just show the version
-            // so the chip doesn't read as "something went wrong".
+            // Offline / parse error: quiet chip — confirms we're not claiming up-to-date.
             crate::updater::UpdateStatus::NetworkError(_) => (
-                format!("Version {current}"),
+                format!("Couldn't reach GitHub for updates — you're on {current}"),
                 Color32::from_gray(120),
             ),
             // Clickable green call-to-action states (fall through).
@@ -2647,50 +2654,49 @@ impl AudioMeterApp {
                                 ui.add_space(RIGHT_PANEL_TOOLBAR_TO_GRAPH_GAP);
 
                                 let rest_h = ui.available_height().max(1.0);
-                                match self.panel {
-                                    GraphView::Off => {}
-                                    GraphView::History => {
-                                        ScrollArea::horizontal()
-                                            .id_salt("graph_scroll")
-                                            .max_height(rest_h)
-                                            .show(ui, |ui| {
-                                                show_history_graph(
-                                                    ui,
-                                                    &self.history,
-                                                    self.mode,
-                                                    now,
-                                                    &self.clip_settings,
-                                                    &self.clip_status,
-                                                );
-                                            });
-                                    }
-                                    GraphView::Spectrum => {
-                                        ScrollArea::horizontal()
-                                            .id_salt("spectrum_scroll")
-                                            .max_height(rest_h)
-                                            .show(ui, |ui| {
-                                                show_spectrum(
-                                                    ui,
-                                                    &mut self.analyzer,
-                                                    &self.spectrum,
-                                                    now,
-                                                    &mut self.spectrum_pretty_mode,
-                                                    &mut self.spectrum_anchors,
-                                                    FreqWeighting::from_u8(
-                                                        self.weighting_atomic
-                                                            .load(Ordering::Relaxed),
-                                                    ),
-                                                );
-                                            });
-                                    }
-                                    GraphView::Comp => {
-                                        ScrollArea::horizontal()
-                                            .id_salt("comp_scroll")
-                                            .max_height(rest_h)
-                                            .show(ui, |ui| {
-                                                show_comp(ui, &self.comp, now);
-                                            });
-                                    }
+                                let graph_w = ui.available_width().max(1.0);
+                                // Pin graph height to `rest_h` — same constraint the old
+                                // `ScrollArea::horizontal().max_height(rest_h)` enforced.
+                                // Without this, `allocate_exact_size(ui.available_size())` in the
+                                // graph widgets can still see the full column height and overlaps
+                                // the transport toolbar.
+                                if self.panel != GraphView::Off {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(graph_w, rest_h),
+                                        Layout::top_down(Align::Min),
+                                        |ui| {
+                                            match self.panel {
+                                                GraphView::History => {
+                                                    show_history_graph(
+                                                        ui,
+                                                        &self.history,
+                                                        self.mode,
+                                                        now,
+                                                        &self.clip_settings,
+                                                        &self.clip_status,
+                                                    );
+                                                }
+                                                GraphView::Spectrum => {
+                                                    show_spectrum(
+                                                        ui,
+                                                        &mut self.analyzer,
+                                                        &self.spectrum,
+                                                        now,
+                                                        &mut self.spectrum_pretty_mode,
+                                                        &mut self.spectrum_anchors,
+                                                        FreqWeighting::from_u8(
+                                                            self.weighting_atomic
+                                                                .load(Ordering::Relaxed),
+                                                        ),
+                                                    );
+                                                }
+                                                GraphView::Comp => {
+                                                    show_comp(ui, &self.comp, now);
+                                                }
+                                                GraphView::Off => {}
+                                            }
+                                        },
+                                    );
                                 }
                             });
                     },

@@ -36,8 +36,6 @@ const TRIGGER_FLASH_DURATION: Duration = Duration::from_millis(520);
 const HISTORY_TRACE_FILL_OPACITY_BOTTOM: f32 = 0.15;
 const HISTORY_TRACE_FILL_OPACITY_TOP: f32 = 0.80;
 
-/// Min scroll width (right-edge gutter is applied in `app.rs` around the whole column).
-const MIN_WIDTH: f32 = 360.0;
 /// Left inset for dB ruler numerals (wider than spectrum’s freq axis — different label geometry).
 const HISTORY_LEFT_PAD: f32 = 32.0;
 /// Match spectrum’s right gutter so plot width discipline is the same between panels.
@@ -275,8 +273,11 @@ pub fn show_history_graph(
     clip_status: &SharedClipStatus,
 ) -> Response {
     let graph = shared.read();
+    // Fill the panel exactly — never inflate past parent width (that caused phantom
+    // horizontal scrollbars when this lived inside `ScrollArea::horizontal`).
     let mut desired = ui.available_size();
-    desired.x = desired.x.max(MIN_WIDTH);
+    desired.x = desired.x.max(1.0);
+    desired.y = desired.y.max(1.0);
     // Same sizing as `spectrum_view::show_spectrum`: use whatever height the right column
     // gives (no extra minimum vs the spectrum analyzer).
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
