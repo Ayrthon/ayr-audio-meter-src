@@ -1530,8 +1530,6 @@ impl AudioMeterApp {
     /// the modal when `license_modal_forced` is set (user clicked the chip or
     /// a "Manage License" button).
     fn maybe_show_license_gate(&mut self, ctx: &egui::Context) {
-        use crate::license::LicenseStatus;
-
         // Defer until the splash has handed off to the main window — no modal
         // should pop while the viewport is still parked off-screen.
         #[cfg(windows)]
