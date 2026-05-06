@@ -160,9 +160,21 @@ pub const MODE_H: f32 = 14.0;
 pub const READOUT_H: f32 = 22.0;
 pub const LABEL_H: f32 = 18.0;
 pub const READOUT_GAP: f32 = 2.0;
+/// Target width for the dual readout pill in **dBFS** modes (two signed values + divider).
+/// VU / K append `" VU"` / `" K"` — those modes use the full meter width instead (see below).
+const READOUT_PILL_TARGET_W_DBF: f32 = 92.0;
 
-pub const METER_WIDTH: f32 = 92.0;
 pub const METER_MIN_HEIGHT: f32 = 300.0;
+
+/// Left of the bar: ticks + dB/VU/K numerals (extra width so `+20` is not clipped).
+const RULER_GUTTER_LEFT_W: f32 = 44.0;
+/// Right of the bar: ticks only (labels are on the left).
+const RULER_GUTTER_RIGHT_W: f32 = 22.0;
+/// Coloured bar width — same as the original `92 − 22 − 22` strip layout.
+pub const METER_BAR_BODY_W: f32 = 48.0;
+/// Total meter column width (gutters + bar).
+pub const METER_WIDTH: f32 =
+    RULER_GUTTER_LEFT_W + RULER_GUTTER_RIGHT_W + METER_BAR_BODY_W;
 
 /// Horizontal inset before the first channel meter (inside the strip `Ui`).
 pub const METER_STRIP_MARGIN_START: f32 = 2.0;
@@ -192,6 +204,8 @@ pub fn meter_strip_content_width(channels: usize) -> f32 {
 
 // Typography — sized so readouts and scale labels stay legible.
 pub const FONT_TICK: f32 = 11.75;
+/// Gap between the outer end of major ruler ticks and the inner edge of the numeric label.
+const RULER_LABEL_PAD_PAST_TICKS: f32 = 3.0;
 pub const FONT_MODE: f32 = 10.5;
 pub const FONT_READOUT: f32 = 12.0;
 pub const FONT_CHANNEL: f32 = 12.0;
@@ -347,9 +361,8 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     let scale = MeterScale::for_mode(args.mode);
     let w = rect.width();
 
-    let scale_w = 22.0_f32;
-    let bar_x = rect.left() + scale_w;
-    let bar_w = (w - scale_w - scale_w).max(1.0);
+    let bar_x = rect.left() + RULER_GUTTER_LEFT_W;
+    let bar_w = (w - RULER_GUTTER_LEFT_W - RULER_GUTTER_RIGHT_W).max(1.0);
     let bottom_pad = meter_bar_bottom_pad_from_label_nonempty(!args.label.is_empty());
     let bar_top = rect.top() + BAR_TOP_PAD;
     // `bar_bottom` is the **physical bottom edge of the meter bar** — the
@@ -573,7 +586,10 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
         );
         let label = scale.tick_label(disp);
         painter.text(
-            pos2(bar_x - 4.0, y),
+            pos2(
+                bar_x - RULER_TICK_OUTER - RULER_LABEL_PAD_PAST_TICKS,
+                y,
+            ),
             egui::Align2::RIGHT_CENTER,
             label,
             FontId::proportional(FONT_TICK),
@@ -582,13 +598,28 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     }
 
     // --- readout pill -----------------------------------------
-    // The pill spans (almost) the full meter width rather than just the
-    // bar area so the two values have enough room at the larger font.
-    // Keep the readout below the live strip; otherwise the panel covers it.
+    // Center on the bar (`bar_cx`). Wider than `bar_w` so two signed readouts are not
+    // cramped; horizontal extent is clamped to the meter `rect` edges.
     let readout_top = indicator_rect.bottom() + READOUT_GAP;
+    const READOUT_CLIP_MARGIN: f32 = 2.0;
+    let bar_cx = bar_x + bar_w * 0.5;
+    let max_pill_w = rect.width() - 2.0 * READOUT_CLIP_MARGIN;
+    // Asymmetric ruler gutters put `bar_cx` off rect center. Cap width so the pill can stay
+    // centered on the **bar** without `clamp` pinching it to the left edge (VU/K full-width).
+    let max_centered_pill_w = 2.0
+        * (bar_cx - rect.left() - READOUT_CLIP_MARGIN)
+            .min(rect.right() - READOUT_CLIP_MARGIN - bar_cx);
+    let max_centered_pill_w = max_centered_pill_w.max(0.0);
+    let pill_target = match scale.kind {
+        MeterScaleKind::Dbf => READOUT_PILL_TARGET_W_DBF,
+        // `format_readout_dbfs` adds `" VU"` / `" K"` — as wide as fits while centered on bar.
+        MeterScaleKind::Vu | MeterScaleKind::K => max_pill_w,
+    };
+    let pill_w = pill_target.min(max_pill_w).min(max_centered_pill_w);
+    let pill_left = bar_cx - pill_w * 0.5;
     let readout_rect = Rect::from_min_max(
-        pos2(rect.left() + 3.0, readout_top),
-        pos2(rect.right() - 3.0, readout_top + READOUT_H),
+        pos2(pill_left, readout_top),
+        pos2(pill_left + pill_w, readout_top + READOUT_H),
     );
     painter.rect_filled(readout_rect, 3.0, COL_READOUT_BG);
     painter.rect_stroke(
@@ -605,9 +636,13 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
         ],
         Stroke::new(1.0, COL_READOUT_BORDER),
     );
-    // Anchor each number against the outer edges of its half, with a
-    // small inner margin, so the two values never touch the divider.
-    let inner_margin = 4.0;
+    // Anchor each number against the outer edges of its half, with inner margin so
+    // the two values never touch the divider or pill border. VU/K use a slightly tighter
+    // margin so copy still fits when the pill is width-limited by bar-centered geometry.
+    let inner_margin = match scale.kind {
+        MeterScaleKind::Dbf => 6.0,
+        MeterScaleKind::Vu | MeterScaleKind::K => 4.0,
+    };
     // Show the live value of whichever source the meter is filling
     // from — peak for sample-peak meters, RMS for VU / K-System.
     let live_db = match cfg.fill_source {
@@ -638,7 +673,7 @@ pub fn show_meter(ui: &mut Ui, args: MeterPaintArgs<'_>, now: f64) -> Response {
     // --- channel label ----------------------------------------
     if !args.label.is_empty() {
         painter.text(
-            pos2(rect.center().x, rect.bottom() - 2.0),
+            pos2(bar_x + bar_w * 0.5, rect.bottom() - 2.0),
             egui::Align2::CENTER_BOTTOM,
             args.label,
             FontId::proportional(FONT_CHANNEL),

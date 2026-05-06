@@ -465,7 +465,7 @@ impl MeterScale {
                 if display_val >= -0.05 {
                     "0".into()
                 } else {
-                    format!("{}", (-display_val) as i32)
+                    format!("{:.0}", display_val)
                 }
             }
             MeterScaleKind::Vu => {

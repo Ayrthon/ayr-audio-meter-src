@@ -39,7 +39,7 @@ const HISTORY_TRACE_FILL_OPACITY_TOP: f32 = 0.80;
 /// Min scroll width (right-edge gutter is applied in `app.rs` around the whole column).
 const MIN_WIDTH: f32 = 360.0;
 /// Left inset for dB ruler numerals (wider than spectrum’s freq axis — different label geometry).
-const HISTORY_LEFT_PAD: f32 = 28.0;
+const HISTORY_LEFT_PAD: f32 = 32.0;
 /// Match spectrum’s right gutter so plot width discipline is the same between panels.
 const HISTORY_RIGHT_PAD: f32 = 18.0;
 
@@ -393,7 +393,7 @@ pub fn show_history_graph(
         );
         let txt = scale.tick_label(disp);
         painter.text(
-            pos2(left - 4.0, y),
+            pos2(left - 8.0, y),
             egui::Align2::RIGHT_CENTER,
             txt,
             FontId::proportional(FONT_TICK),
