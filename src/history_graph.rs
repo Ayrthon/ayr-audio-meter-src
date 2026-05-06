@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2,
+    Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui,
+    pos2, vec2,
 };
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use parking_lot::RwLock;
@@ -472,10 +473,11 @@ pub fn show_history_graph(
         } else {
             FontId::proportional(9.0)
         };
+        let trigger_caption = format!("{:.1} dBFS - Armed Record Trigger", clip_threshold_db);
         painter.text(
             pos2(left + 6.0, text_y),
             align,
-            "Armed Record Trigger",
+            &trigger_caption,
             font,
             line_color,
         );
@@ -496,6 +498,43 @@ pub fn show_history_graph(
                 clip_settings.set_threshold_db(new_thr);
             }
             ui.ctx().request_repaint();
+        }
+        if drag_resp.is_pointer_button_down_on() {
+            if let Some(ptr) = drag_resp.interact_pointer_pos() {
+                let readout_db = clip_settings.threshold_db();
+                let readout = format!("{:.1} dBFS", readout_db);
+                let readout_font = FontId::proportional(if obs { 15.0 } else { 14.0 });
+                const READOUT_PAD_X: f32 = 10.0;
+                const READOUT_PAD_Y: f32 = 6.0;
+                let readout_bg = Color32::from_rgba_unmultiplied(0x12, 0x13, 0x18, 235);
+                let fg = Color32::WHITE;
+                let galley = painter.layout_no_wrap(readout, readout_font, fg);
+                let tw = galley.size().x + READOUT_PAD_X * 2.0;
+                let th = galley.size().y + READOUT_PAD_Y * 2.0;
+                let mut pill_min = pos2(ptr.x - tw * 0.5, ptr.y - th - 14.0);
+                pill_min.x = pill_min
+                    .x
+                    .clamp(plot.left() + 4.0, plot.right() - tw - 4.0);
+                pill_min.y = pill_min
+                    .y
+                    .clamp(plot.top() + 4.0, plot.bottom() - th - 4.0);
+                let pill = Rect::from_min_size(pill_min, vec2(tw, th));
+                painter.rect_filled(pill, 4.0, readout_bg);
+                painter.rect_stroke(
+                    pill,
+                    4.0,
+                    Stroke::new(1.0, line_color),
+                    StrokeKind::Inside,
+                );
+                painter.galley(
+                    pos2(
+                        pill.left() + READOUT_PAD_X,
+                        pill.top() + READOUT_PAD_Y,
+                    ),
+                    galley,
+                    fg,
+                );
+            }
         }
         response = response.union(drag_resp);
     }

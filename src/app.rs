@@ -137,8 +137,7 @@ pub struct AudioMeterApp {
     clip_settings: SharedClipSettings,
     clip_capture: SharedClipCapture,
     clip_status: SharedClipStatus,
-    /// [`ClipStatus::total_clips_saved`] when the user last turned **Arm Record Trigger** on.
-    clip_session_baseline: u64,
+    /// Clips-tab list, waveform preview, and playback scratch state.
     clip_playlist: ClipPlaylistState,
     user_settings: SharedUserSettings,
     user_settings_path: Option<PathBuf>,
@@ -399,7 +398,6 @@ impl AudioMeterApp {
             clip_settings: make_shared_clip_settings(),
             clip_capture: make_shared_clip_capture(),
             clip_status: make_shared_clip_status(),
-            clip_session_baseline: 0,
             clip_playlist: ClipPlaylistState::new(user_settings.clone()),
             user_settings,
             user_settings_path: settings_path,
@@ -1937,7 +1935,8 @@ impl AudioMeterApp {
         let clip_detail = format!(
             "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
              Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
-             The moving meter can still read a little lower between blocks or because of ballistics.",
+             The moving meter can still read a little lower between blocks or because of ballistics.\n\n\
+             Set the trigger threshold by dragging the horizontal line on the Level History graph (open the History view).",
             crate::clip_capture::PRE_ROLL_SECS,
             crate::clip_capture::POST_ROLL_SECS
         );
@@ -2191,110 +2190,6 @@ impl AudioMeterApp {
                  LUFS and the spectrum use full-band BS.1770 K-weighting.",
             );
             self.weighting_atomic.store(w as u8, Ordering::Relaxed);
-        });
-
-        ui.add_space(LEFT_SECTION_STACK_GAP);
-
-        let clip_detail_short = format!(
-            "Saves {:.0} s before + {:.0} s after the threshold is crossed (32-bit float WAV). Use the Clips tab for the list, waveform, and folder.",
-            crate::clip_capture::PRE_ROLL_SECS,
-            crate::clip_capture::POST_ROLL_SECS
-        );
-
-        left_panel_collapsing(ui, "left_tab_ctrl_clip_cap", "CLIP CAPTURE", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
-            ui.add_space(4.0);
-            let content_w = ui.available_width();
-            ui.set_width(content_w);
-
-            let mut thr = self.clip_settings.threshold_db();
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Threshold")
-                        .size(11.5)
-                        .color(TITLE_COL)
-                        .strong(),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{thr:.1} dBFS"))
-                            .size(12.5)
-                            .color(ACCENT)
-                            .strong(),
-                    );
-                });
-            });
-            ui.add_space(3.0);
-
-            let slider_w = ui.available_width();
-            let prev_slider_w = ui.style().spacing.slider_width;
-            ui.style_mut().spacing.slider_width = slider_w;
-            let rail_h = 18.0_f32;
-            let slider_resp = ui.add_sized(
-                egui::vec2(slider_w, rail_h),
-                egui::Slider::new(
-                    &mut thr,
-                    crate::clip_capture::CLIP_THRESHOLD_SLIDER_MIN_DB
-                        ..=crate::clip_capture::CLIP_THRESHOLD_SLIDER_MAX_DB,
-                )
-                    .fixed_decimals(1)
-                    .show_value(false)
-                    .trailing_fill(true),
-            );
-            ui.style_mut().spacing.slider_width = prev_slider_w;
-            if slider_resp.changed() {
-                self.clip_settings.set_threshold_db(thr);
-            }
-            slider_resp.on_hover_text(&clip_detail_short);
-
-            ui.add_space(6.0);
-            let lib = ui
-                .add_sized(
-                    egui::vec2(ui.available_width(), 26.0),
-                    egui::Button::new(if self.left_tab == LeftPanelTab::Clips {
-                        "Clips library (open)…"
-                    } else {
-                        "Clips library…"
-                    }),
-                )
-                .on_hover_text(
-                    "List, preview, folder, delete — Space plays/pauses the waveform",
-                );
-            if lib.clicked() {
-                self.left_tab = LeftPanelTab::Clips;
-            }
-
-            {
-                let st = self.clip_status.lock();
-                let armed_now = self.clip_settings.enabled();
-                if armed_now {
-                    let n = st
-                        .total_clips_saved
-                        .saturating_sub(self.clip_session_baseline);
-                    let (counter_text, counter_color) = if n == 0 {
-                        (
-                            "Clips saved this arm: 0".into(),
-                            Color32::from_gray(130),
-                        )
-                    } else {
-                        (format!("Clips saved this arm: {n}"), ACCENT)
-                    };
-                    ui.add_space(5.0);
-                    ui.label(
-                        RichText::new(counter_text)
-                            .size(10.5)
-                            .strong()
-                            .color(counter_color),
-                    );
-                }
-                if let Some(ref e) = st.last_error {
-                    ui.add_space(3.0);
-                    ui.label(
-                        RichText::new(format!("Error: {e}"))
-                            .color(Color32::from_rgb(200, 100, 100))
-                            .size(9.5),
-                    );
-                }
-            }
         });
 
     }
@@ -3089,12 +2984,7 @@ impl AudioMeterApp {
                         let rec_on = self.clip_settings.enabled();
                         let arm = ui.add_sized(ARM_RECORD, RecordArmButton { armed: rec_on });
                         if arm.clicked() {
-                            let new_on = !rec_on;
-                            self.clip_settings.set_enabled(new_on);
-                            if new_on {
-                                self.clip_session_baseline =
-                                    self.clip_status.lock().total_clips_saved;
-                            }
+                            self.clip_settings.set_enabled(!rec_on);
                         }
                     });
 
