@@ -1,7 +1,7 @@
 # Fast iteration: debug build + staged launch (same %LOCALAPPDATA%\AudioMeter\ copy as release,
 # so SmartScreen does not nag about \\wsl.localhost\ paths).
 #
-# Use this instead of launch-release.ps1 while editing UI — incremental debug builds are much
+# Use this instead of launch-release.ps1 while editing UI - incremental debug builds are much
 # quicker than --release.
 #
 # Optional: -SkipBuild  (used by launch-dev-watch.ps1 after cargo watch already ran `cargo build`)
@@ -14,21 +14,30 @@ $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 Set-Location $Root
 
+$Manifest = Join-Path $Root "Cargo.toml"
+if (-not (Test-Path -LiteralPath $Manifest)) {
+    Write-Error "No Cargo.toml next to launch-dev.ps1 - wrong working folder. Expected: $Manifest"
+}
+Write-Host "==> Package root: $Root" -ForegroundColor DarkGray
+Write-Host "==> Manifest:    $Manifest" -ForegroundColor DarkGray
+
 # Keep debug artifacts on NTFS (not the WSL-mounted repo path) so incremental compilation works.
-# Building with `target` under `\\wsl$\...` breaks incremental locks — that forced full rebuilds every time.
+# Building with `target` under `\\wsl$\...` breaks incremental locks - that forced full rebuilds every time.
 $DevTargetRoot = Join-Path $env:LOCALAPPDATA "AudioMeter\cargo-target-dev"
 $env:CARGO_TARGET_DIR = $DevTargetRoot
 Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue
 
 if (-not $SkipBuild) {
-    Write-Host "==> cargo build (debug) -> $DevTargetRoot" -ForegroundColor Cyan
-    cargo build
+    Write-Host "==> cargo build (debug) package audio-meter-rs -> $DevTargetRoot" -ForegroundColor Cyan
+    cargo build -p audio-meter-rs --bin audio-meter-rs
 }
 
 $Exe = Join-Path $DevTargetRoot "debug\audio-meter-rs.exe"
 if (-not (Test-Path $Exe)) {
     Write-Error "Missing $Exe - build failed."
 }
+$builtSize = (Get-Item -LiteralPath $Exe).Length
+Write-Host ("==> Built exe: {0} ({1:N0} bytes)" -f $Exe, $builtSize) -ForegroundColor DarkGray
 
 $Cache = Join-Path $env:LOCALAPPDATA "AudioMeter"
 if (-not (Test-Path $Cache)) {

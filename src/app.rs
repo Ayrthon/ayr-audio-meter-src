@@ -1937,6 +1937,7 @@ impl AudioMeterApp {
 
     /// Full clips library: folder chooser, “How capture works”, waveform list.
     fn clips_library_panel(&mut self, ui: &mut egui::Ui, width: f32) {
+        let _ = width;
         let clip_detail = format!(
             "When enabled, saves {:.0} s of audio before and {:.0} s after a block's peak first reaches the threshold. Files are 32-bit float WAV.\n\n\
              Trigger uses the same per-callback peak as the meters: frequency weighting, true-peak vs sample-peak mode, and the hottest channel in that block. \
@@ -1946,110 +1947,125 @@ impl AudioMeterApp {
             crate::clip_capture::POST_ROLL_SECS
         );
         let total_clips = self.clip_status.lock().total_clips_saved;
+        let ctx_clips = ui.ctx().clone();
 
-        left_panel_collapsing(ui, "clips_tab_library", "CLIP LIBRARY", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
-            ui.add_space(4.0);
-            let ctx_clips = ui.ctx().clone();
-            self.clip_playlist.show(ui, &ctx_clips, total_clips);
-        });
-        ui.add_space(LEFT_SECTION_STACK_GAP);
+        // Fixed top player for clips tab.
+        self.clip_playlist.show_player(ui, &ctx_clips, total_clips);
+        ui.add_space(10.0);
+        inset_horizontal_divider(ui);
+        ui.add_space(10.0);
 
-        left_panel_collapsing(ui, "clips_tab_save_folder", "SAVE FOLDER", width, LEFT_SECTION_CARD_BODY_PAD_X, |ui| {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Current location:")
-                    .color(LEFT_LABEL_SECONDARY)
-                    .size(9.5),
-            );
-            ui.add_space(5.0);
-            let clips_path_label = clips_path_display(&*self.user_settings.lock());
-            Frame::new()
-                .fill(LEFT_COMBO_BG)
-                .stroke(Stroke::new(1.0, LEFT_SECTION_INNER_BOX_STROKE))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(10, 10))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(clips_path_label)
-                            .size(9.5)
-                            .color(Color32::from_gray(210))
-                            .family(egui::FontFamily::Monospace),
-                    );
-                });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-                if ui
-                    .add_sized(
-                        [140.0, 28.0],
-                        egui::Button::new(RichText::new("Choose folder…").size(11.5)),
-                    )
-                    .clicked()
-                {
-                    let start = resolve_clips_dir(&*self.user_settings.lock());
-                    let mut dlg = rfd::FileDialog::new();
-                    if let Some(ref p) = start {
-                        dlg = dlg.set_directory(p);
+        // Everything below scrolls under the fixed player.
+        let scroll_h = ui.available_height().max(1.0);
+        ScrollArea::vertical()
+            .id_salt("clips_tab_body_scroll")
+            .max_height(scroll_h)
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                self.clip_playlist.show_clips_list(ui, &ctx_clips, total_clips);
+                ui.add_space(14.0);
+                inset_horizontal_divider(ui);
+                ui.add_space(12.0);
+
+                ui.label(
+                    RichText::new("SAVE FOLDER")
+                        .color(TITLE_COL)
+                        .size(12.5)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Current location:")
+                        .color(LEFT_LABEL_SECONDARY)
+                        .size(9.5),
+                );
+                ui.add_space(5.0);
+                let clips_path_label = clips_path_display(&*self.user_settings.lock());
+                Frame::new()
+                    .fill(LEFT_COMBO_BG)
+                    .stroke(Stroke::new(1.0, LEFT_SECTION_INNER_BOX_STROKE))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(10, 10))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(clips_path_label)
+                                .size(9.5)
+                                .color(Color32::from_gray(210))
+                                .family(egui::FontFamily::Monospace),
+                        );
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                    if ui
+                        .add_sized(
+                            [140.0, 28.0],
+                            egui::Button::new(RichText::new("Choose folder…").size(11.5)),
+                        )
+                        .clicked()
+                    {
+                        let start = resolve_clips_dir(&*self.user_settings.lock());
+                        let mut dlg = rfd::FileDialog::new();
+                        if let Some(ref p) = start {
+                            dlg = dlg.set_directory(p);
+                        }
+                        if let Some(folder) = dlg.pick_folder() {
+                            self.user_settings.lock().clips_save_dir = Some(folder);
+                            self.persist_user_settings();
+                            self.clip_playlist.reload_clip_list();
+                        }
                     }
-                    if let Some(folder) = dlg.pick_folder() {
-                        self.user_settings.lock().clips_save_dir = Some(folder);
+                    let custom = self
+                        .user_settings
+                        .lock()
+                        .clips_save_dir
+                        .is_some();
+                    if ui
+                        .add_enabled(
+                            custom,
+                            egui::Button::new(RichText::new("Use default folder").size(11.5)),
+                        )
+                        .clicked()
+                    {
+                        self.user_settings.lock().clips_save_dir = None;
                         self.persist_user_settings();
                         self.clip_playlist.reload_clip_list();
                     }
-                }
-                let custom = self
-                    .user_settings
-                    .lock()
-                    .clips_save_dir
-                    .is_some();
+                });
+                ui.add_space(10.0);
                 if ui
-                    .add_enabled(
-                        custom,
-                        egui::Button::new(RichText::new("Use default folder").size(11.5)),
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new(RichText::new("📂  Open clips folder").size(12.0)),
                     )
                     .clicked()
                 {
-                    self.user_settings.lock().clips_save_dir = None;
-                    self.persist_user_settings();
-                    self.clip_playlist.reload_clip_list();
+                    if let Some(p) = resolve_clips_dir(&*self.user_settings.lock()) {
+                        #[cfg(windows)]
+                        let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open").arg(&p).spawn();
+                        #[cfg(all(not(windows), not(target_os = "macos")))]
+                        let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                    }
                 }
-            });
-            ui.add_space(10.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), 34.0],
-                    egui::Button::new(RichText::new("📂  Open clips folder").size(12.0)),
-                )
-                .clicked()
-            {
-                if let Some(p) = resolve_clips_dir(&*self.user_settings.lock()) {
-                    #[cfg(windows)]
-                    let _ = std::process::Command::new("explorer").arg(&p).spawn();
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("open").arg(&p).spawn();
-                    #[cfg(all(not(windows), not(target_os = "macos")))]
-                    let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
-                }
-            }
-        });
-        ui.add_space(LEFT_SECTION_STACK_GAP);
 
-        left_panel_collapsing_with_default(
-            ui,
-            "clips_tab_how_capture",
-            "HOW CAPTURE WORKS",
-            width,
-            LEFT_SECTION_CARD_BODY_PAD_X,
-            false,
-            |ui| {
-                ui.add_space(4.0);
+                ui.add_space(14.0);
+                inset_horizontal_divider(ui);
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("HOW CAPTURE WORKS")
+                        .color(TITLE_COL)
+                        .size(12.5)
+                        .strong(),
+                );
+                ui.add_space(8.0);
                 ui.label(
                     RichText::new(clip_detail.as_str())
                         .size(11.0)
                         .color(crate::meter_widget::COL_RULER_TEXT),
                 );
-            },
-        );
+            });
     }
 
     fn left_controls_controls_tab(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -2269,7 +2285,7 @@ impl AudioMeterApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
                         for (tab, label) in [
-                            (LeftPanelTab::Controls, "CONTROLS"),
+                            (LeftPanelTab::Controls, "SETTINGS"),
                             (LeftPanelTab::Network, "NETWORK"),
                             (LeftPanelTab::Loudness, "LOUDNESS"),
                             (LeftPanelTab::Clips, "CLIPS"),
@@ -2289,45 +2305,52 @@ impl AudioMeterApp {
                     inset_horizontal_divider(ui);
                     ui.add_space(4.0);
 
-                    let avail_h = ui.available_height();
-                    ScrollArea::vertical()
-                        .id_salt("left_controls_scroll")
-                        .max_height(avail_h)
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-                                // Fixed width — same as `clips_library_panel` (differs by tab / scrollbar if
-                                // derived from `available_width()` only).
-                                let width = LEFT_COLUMN_CONTROL_W;
-                                ui.set_min_width(width);
-                                ui.set_max_width(width);
-                                match self.left_tab {
-                                    LeftPanelTab::Controls => {
-                                        self.left_controls_controls_tab(ui, width);
-                                    }
-                                    LeftPanelTab::Network => {
-                                        self.left_controls_network_tab(ui, width);
-                                    }
-                                    LeftPanelTab::Loudness => {
-                                        left_panel_collapsing(
-                                            ui,
-                                            "left_tab_loudness_r128",
-                                            "LOUDNESS  (EBU R128)",
-                                            width,
-                                            LEFT_SECTION_CARD_BODY_PAD_X,
-                                            |ui| {
-                                                ui.add_space(4.0);
-                                                self.loudness_panel(ui);
-                                            },
-                                        );
-                                    }
-                                    LeftPanelTab::Clips => {
-                                        self.clips_library_panel(ui, width);
-                                    }
-                                }
-                            });
+                    let width = LEFT_COLUMN_CONTROL_W;
+                    if self.left_tab == LeftPanelTab::Clips {
+                        // Clips tab owns its own internal scroll region so the player can stay fixed.
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                            ui.set_min_width(width);
+                            ui.set_max_width(width);
+                            self.clips_library_panel(ui, width);
                         });
+                    } else {
+                        let avail_h = ui.available_height();
+                        ScrollArea::vertical()
+                            .id_salt("left_controls_scroll")
+                            .max_height(avail_h)
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                    // Fixed width (differs by tab / scrollbar if derived from `available_width()` only).
+                                    ui.set_min_width(width);
+                                    ui.set_max_width(width);
+                                    match self.left_tab {
+                                        LeftPanelTab::Controls => {
+                                            self.left_controls_controls_tab(ui, width);
+                                        }
+                                        LeftPanelTab::Network => {
+                                            self.left_controls_network_tab(ui, width);
+                                        }
+                                        LeftPanelTab::Loudness => {
+                                            left_panel_collapsing(
+                                                ui,
+                                                "left_tab_loudness_r128",
+                                                "LOUDNESS  (EBU R128)",
+                                                width,
+                                                LEFT_SECTION_CARD_BODY_PAD_X,
+                                                |ui| {
+                                                    ui.add_space(4.0);
+                                                    self.loudness_panel(ui);
+                                                },
+                                            );
+                                        }
+                                        LeftPanelTab::Clips => {}
+                                    }
+                                });
+                            });
+                    }
                 });
             });
     }
@@ -2719,7 +2742,7 @@ impl AudioMeterApp {
         let tip = if !engine_on {
             "Start metering first to hear the signal.".to_string()
         } else if !has_target {
-            "Pick a monitor output in Controls > AUDIO MONITORING first.".to_string()
+            "Pick a monitor output in Settings > AUDIO MONITORING first.".to_string()
         } else if conflict {
             format!(
                 "Monitor device matches the capture source ({}). Pick a different output to avoid a feedback loop.",

@@ -93,6 +93,11 @@ enum PlayerCommand {
     },
     SetPlaying(bool),
     SetPositionFrames(f64),
+    /// Seek + play state in one step (avoids EOF race: play=true before pos resets).
+    SeekAndSetPlaying {
+        position_frames: f64,
+        playing: bool,
+    },
     Shutdown,
 }
 
@@ -408,8 +413,28 @@ impl ClipPlaybackHandle {
     }
 
     pub fn set_playing(&self, v: bool) {
-        self.playing.store(v, Ordering::Relaxed);
+        // Do not update `playing` here: the audio callback can run before the player thread
+        // applies the command. The player thread sets the atomic when it processes `SetPlaying`.
         let _ = self.tx.send(PlayerCommand::SetPlaying(v));
+    }
+
+    /// Seek (in seconds) and set play state in **one** player-thread step so the audio callback
+    /// never sees `playing == true` with `pos_frames` still parked at EOF.
+    pub fn seek_and_set_playing(&self, sec: f64, playing: bool) {
+        let (nf, sr) = *self.clip_meta.lock();
+        let sr_f = sr.max(1) as f64;
+        let mut frames = (sec * sr_f).clamp(0.0, nf as f64);
+        // `seek_sec` clamps to `nf` frames — but the render loop treats `pos_frames >= nf` as
+        // "already past the file" and clears playing on the first sample. Starting playback from
+        // that parked EOF position never produces audio; restart from 0 instead.
+        if playing && nf > 0 && frames >= nf as f64 - 0.5 {
+            frames = 0.0;
+        }
+        *self.playhead_sec.lock() = frames / sr_f;
+        let _ = self.tx.send(PlayerCommand::SeekAndSetPlaying {
+            position_frames: frames,
+            playing,
+        });
     }
 
     pub fn is_playing(&self) -> bool {
@@ -581,6 +606,24 @@ fn run_player_thread(
                 let mut g = inner.lock();
                 g.pos_frames = p.max(0.0);
                 g.scrub_rate_snap = true;
+            }
+            Ok(PlayerCommand::SeekAndSetPlaying {
+                position_frames,
+                playing,
+            }) => {
+                let mut g = inner.lock();
+                let nf = if g.channels > 0 {
+                    g.pcm.len() / g.channels
+                } else {
+                    0
+                };
+                let pf = position_frames.max(0.0).min(nf as f64);
+                g.pos_frames = pf;
+                g.scrub_rate_snap = true;
+                g.playing = playing;
+                playing_flag.store(playing, Ordering::Relaxed);
+                let sr = g.src_rate.max(1) as f64;
+                *playhead_sec.lock() = pf / sr;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,

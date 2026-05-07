@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use egui::{
-    Align, Button, Color32, CornerRadius, Frame, Key, Margin, Modal, PointerButton, RichText,
-    Sense, Stroke, Ui, Vec2,
+    Align, Align2, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Margin, Modal,
+    PointerButton, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 use crate::clip_capture::{
@@ -21,6 +21,13 @@ use crate::user_settings::SharedUserSettings;
 const PEAK_BUCKETS_MAX: usize = 1200;
 const WAVE_H: f32 = 76.0;
 const LISTEN_AFTER_WAVE_SPACER: f32 = 4.0;
+/// Timeline labels below the waveform (placeholder + loaded — keep identical layout).
+const CLIP_TIMELINE_LABEL_SIZE: f32 = 9.5;
+const CLIP_TIMELINE_LABEL_COLOR: Color32 = Color32::from_gray(140);
+/// Playhead nudge for ArrowLeft / ArrowRight when a clip is loaded.
+const ARROW_SCRUB_STEP_SEC: f64 = 0.05;
+/// Hold Shift for larger jumps (faster repositioning).
+const ARROW_SCRUB_SHIFT_FAST_SEC: f64 = 0.25;
 /// Half-width of the trigger highlight on the waveform (seconds each side of the crossing).
 const TRIGGER_HIGHLIGHT_PAD_SEC: f64 = 0.5;
 
@@ -32,11 +39,28 @@ const MIXXX_ERR_LP: f64 = 0.38;
 const MIXXX_KP: f64 = 42.0;
 const MIXXX_KD: f64 = 16.0;
 
-const LIST_SURFACE: Color32 = Color32::from_rgb(0x17, 0x18, 0x20);
-const LIST_SURFACE_STROKE: Color32 = Color32::from_rgb(0x34, 0x36, 0x44);
-
 fn split_casual_when(casual: &str) -> Option<(&str, &str)> {
     casual.split_once(" · ")
+}
+
+fn draw_clip_timeline_footer(ui: &mut Ui, left_sec: f64, right_sec: f64) {
+    ui.add_space(LISTEN_AFTER_WAVE_SPACER);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{:.2} s", left_sec))
+                .size(CLIP_TIMELINE_LABEL_SIZE)
+                .color(CLIP_TIMELINE_LABEL_COLOR)
+                .family(FontFamily::Monospace),
+        );
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("{:.2} s", right_sec))
+                    .size(CLIP_TIMELINE_LABEL_SIZE)
+                    .color(CLIP_TIMELINE_LABEL_COLOR)
+                    .family(FontFamily::Monospace),
+            );
+        });
+    });
 }
 
 /// Vertical gap between clip rows so rounded strokes do not read as one continuous frame.
@@ -173,6 +197,16 @@ pub struct ClipPlaylistState {
     player: Option<ClipPlaybackHandle>,
     player_err: Option<String>,
     delete_prompt: Option<DeletePrompt>,
+    /// Last clicked clip used as the shift-range anchor.
+    range_anchor_path: Option<PathBuf>,
+    /// Keyboard navigation endpoint (moves with arrow keys).
+    keyboard_focus_path: Option<PathBuf>,
+    /// While true, keep keyboard-focused row in view across held-key repeats.
+    follow_keyboard_focus: bool,
+    /// One-shot scroll target used to keep keyboard navigation in view.
+    scroll_to_path_once: Option<PathBuf>,
+    /// Edge alignment for one-shot keyboard scroll.
+    scroll_align_once: Option<Align>,
 }
 
 impl ClipPlaylistState {
@@ -196,6 +230,11 @@ impl ClipPlaylistState {
             player: None,
             player_err: None,
             delete_prompt: None,
+            range_anchor_path: None,
+            keyboard_focus_path: None,
+            follow_keyboard_focus: false,
+            scroll_to_path_once: None,
+            scroll_align_once: None,
         }
     }
 
@@ -267,20 +306,41 @@ impl ClipPlaylistState {
     }
 
     fn toggle_clip_preview_playback(&mut self) {
-        let playing_now = self
-            .player
-            .as_ref()
-            .is_some_and(|p| p.is_playing());
         let scrub = self.scrub_sec;
+        let loaded_duration = self.loaded.as_ref().map(|l| l.duration_sec());
         match self.ensure_player() {
             Ok(p) => {
                 p.set_scrub_active(false);
                 p.set_playback_rate_mul(1.0);
+
+                let dur_engine = p.duration_sec().max(1e-9);
+                let dur_loaded = loaded_duration
+                    .unwrap_or(dur_engine)
+                    .max(1e-9);
+                let dur = dur_engine.max(dur_loaded);
+                let ph = p.playhead_sec();
+                // Generous: float drift, UI vs engine duration, and “tail” of the file.
+                let end_eps = (0.35_f64).max(dur * 0.02).min(dur * 0.25);
+                let at_end = ph + end_eps >= dur
+                    || scrub + end_eps >= dur
+                    || (dur > 0.0 && ph / dur >= 0.985);
+
+                // Stopped (or DSP-stopped) at EOF but `is_playing()` can still read true until the
+                // player thread processes `SetPlaying(false)`. If the user hits Play in that window,
+                // we'd only send pause — feels like "nothing happens". Near-end always means restart.
+                // Do not assign `self.scrub_sec` here: `p` borrows `self.player` and would conflict
+                // with `&mut self`; playhead mutex is updated by `seek_and_set_playing`, then the
+                // waveform pass sets `scrub_sec` from `playhead_sec()`.
+                if at_end {
+                    p.seek_and_set_playing(0.0, true);
+                    return;
+                }
+
+                let playing_now = p.is_playing();
                 if playing_now {
                     p.set_playing(false);
                 } else {
-                    p.seek_sec(scrub);
-                    p.set_playing(true);
+                    p.seek_and_set_playing(scrub, true);
                 }
             }
             Err(e) => self.player_err = Some(e),
@@ -372,6 +432,9 @@ impl ClipPlaylistState {
         };
 
         let dlg = Modal::new(egui::Id::new("clip_delete_modal")).show(ctx, |ui| {
+            // Keep this confirm dialog compact so it doesn't dominate the left panel.
+            ui.set_max_width(320.0);
+            ui.set_min_width(320.0);
             ui.heading(RichText::new(&title).size(16.0));
             ui.add_space(8.0);
             ui.label(
@@ -400,6 +463,10 @@ impl ClipPlaylistState {
             }
             ui.add_space(16.0);
             let mut confirm_delete = false;
+            if ui.input(|i| i.key_pressed(Key::Enter)) {
+                confirm_delete = true;
+                ui.close();
+            }
             ui.horizontal(|ui| {
                 if ui
                     .add(egui::Button::new("Cancel").min_size(Vec2::new(88.0, 28.0)))
@@ -473,34 +540,18 @@ impl ClipPlaylistState {
             ],
             Stroke::new(1.0, Color32::from_rgb(0x18, 0x1a, 0x24)),
         );
-        ui.allocate_ui_at_rect(wave_rect.shrink2(Vec2::new(6.0, 6.0)), |ui| {
-            ui.with_layout(
-                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                |ui| {
-                    ui.label(
-                        RichText::new("Select a clip to listen.")
-                            .size(14.0)
-                            .color(Color32::from_gray(120)),
-                    );
-                },
-            );
-        });
+        // Paint hint with the painter only (no `allocate_ui_at_rect`) so vertical flow matches
+        // `draw_loaded_waveform_preview`, which ends the wave row with `allocate_exact_size` + `interact`.
+        let inner_hint = wave_rect.shrink2(Vec2::new(6.0, 6.0));
+        painter.text(
+            inner_hint.center(),
+            Align2::CENTER_CENTER,
+            "Select a clip to listen.",
+            FontId::proportional(14.0),
+            Color32::from_gray(120),
+        );
 
-        ui.add_space(LISTEN_AFTER_WAVE_SPACER);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("0.00 s")
-                    .size(9.5)
-                    .color(Color32::from_gray(85)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new("—")
-                        .size(9.5)
-                        .color(Color32::from_gray(85)),
-                );
-            });
-        });
+        draw_clip_timeline_footer(ui, 0.0, 0.0);
     }
 
     fn draw_loaded_waveform_preview(
@@ -520,6 +571,31 @@ impl ClipPlaylistState {
         if ui.input(|i| i.key_pressed(Key::Space)) && !ctx.egui_wants_keyboard_input() {
             self.toggle_clip_preview_playback();
             ctx.request_repaint();
+        }
+
+        // Move playhead with ArrowLeft / ArrowRight (Shift = faster / larger steps).
+        if !ctx.egui_wants_keyboard_input() {
+            let step = if ctx.input(|i| i.modifiers.shift) {
+                ARROW_SCRUB_SHIFT_FAST_SEC
+            } else {
+                ARROW_SCRUB_STEP_SEC
+            };
+            let mut delta: Option<f64> = None;
+            if ui.input(|i| i.key_pressed(Key::ArrowRight)) {
+                delta = Some(step);
+            } else if ui.input(|i| i.key_pressed(Key::ArrowLeft)) {
+                delta = Some(-step);
+            }
+            if let Some(d) = delta {
+                let t = (self.scrub_sec + d).clamp(0.0, dur);
+                self.scrub_sec = t;
+                if let Ok(p) = self.ensure_player() {
+                    p.set_scrub_active(false);
+                    p.set_playback_rate_mul(1.0);
+                    p.seek_sec(t);
+                }
+                ctx.request_repaint();
+            }
         }
 
         ui.horizontal(|ui| {
@@ -703,85 +779,18 @@ impl ClipPlaylistState {
             }
         }
 
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{:.2} s", self.scrub_sec))
-                    .size(9.5)
-                    .color(Color32::from_gray(140)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("{:.2} s", dur))
-                        .size(9.5)
-                        .color(Color32::from_gray(140)),
-                );
-            });
-        });
+        draw_clip_timeline_footer(ui, self.scrub_sec, dur);
     }
 
-    /// Draw playlist + waveform. `total_clips_saved` keeps the list in sync after captures.
-    pub fn show(&mut self, ui: &mut Ui, ctx: &egui::Context, total_clips_saved: u64) {
+    fn begin_frame(&mut self, ctx: &egui::Context, total_clips_saved: u64) {
         self.sync_saved_count(total_clips_saved);
 
         if self.player.as_ref().is_some_and(|p| p.is_playing() || p.is_scrub_active()) {
             ctx.request_repaint();
         }
+    }
 
-        ui.label(
-            RichText::new("Listen")
-                .size(15.0)
-                .strong()
-                .color(crate::app::TITLE_COL),
-        );
-        ui.add_space(12.0);
-
-        if let Some(ref e) = self.player_err {
-            ui.label(
-                RichText::new(format!("Could not load clip: {e}"))
-                    .size(9.5)
-                    .color(Color32::from_rgb(220, 120, 120)),
-            );
-            ui.add_space(6.0);
-        }
-
-        let sel_n_listen = self.selected_paths.len();
-        let show_waveform = self.loaded.is_some() && sel_n_listen == 1;
-        if show_waveform {
-            let (dur, ch, sr, samples_len) = {
-                let l = self.loaded.as_ref().unwrap();
-                (
-                    l.duration_sec().max(1e-6),
-                    l.channels,
-                    l.sample_rate,
-                    l.samples.len(),
-                )
-            };
-            self.draw_loaded_waveform_preview(ui, ctx, dur, ch, sr, samples_len);
-        } else {
-            self.draw_preview_placeholder(ui);
-        }
-
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(14.0);
-
-        ui.label(
-            RichText::new("Clips")
-                .size(15.0)
-                .strong()
-                .color(crate::app::TITLE_COL),
-        );
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(
-                "Newest first. Click a row to select or deselect; ⌘/Ctrl+click to multi-select.",
-            )
-            .size(9.5)
-            .color(Color32::from_gray(125)),
-        );
-        ui.add_space(12.0);
-
+    fn draw_clips_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
             if ui
@@ -835,73 +844,254 @@ impl ClipPlaylistState {
                 let paths: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
                 self.delete_prompt = Some(DeletePrompt::Batch { paths });
             }
-        });
 
-        ui.add_space(12.0);
-
-        // Inline list — no inner scroll area; the outer left-column scroll handles overflow
-        // so the card grows with the clip count.
-        let mut row_action: Option<(PathBuf, bool)> = None;
-        Frame::new()
-            .fill(LIST_SURFACE)
-            .stroke(Stroke::new(1.0, LIST_SURFACE_STROKE))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::same(8))
-            .show(ui, |ui| {
-                // `left_panel_collapsing` zeros item_spacing on nested uis, so rely on explicit
-                // `add_space` calls to separate the stroked row frames instead of item_spacing.
-                if self.entries.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "No clips yet — arm capture and let the meter cross the threshold.",
-                        )
-                        .size(9.5)
-                        .color(Color32::from_gray(125)),
-                    );
-                } else {
-                    for (idx, ent) in self.entries.iter().enumerate() {
-                        if idx > 0 {
-                            ui.add_space(CLIP_ROW_GAP);
-                        }
-                        let selected = self.selected_paths.contains(&ent.path);
-                        let casual = format_clip_captured_casual(ent.modified);
-                        let r = draw_clip_row(ui, idx + 1, &casual, selected, idx == 0);
-                        if r.clicked() {
-                            let cmd = r.ctx.input(|i| i.modifiers.command);
-                            row_action = Some((ent.path.clone(), cmd));
-                        }
-                    }
-                }
-
-                if let Some((path, cmd_multi)) = row_action {
-                    if cmd_multi {
-                        if self.selected_paths.contains(&path) {
-                            self.selected_paths.remove(&path);
-                        } else {
-                            self.selected_paths.insert(path);
-                        }
-                    } else if self.selected_paths.contains(&path) {
-                        self.selected_paths.remove(&path);
+            let rest_h = ui.spacing().interact_size.y;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width().max(0.0), rest_h),
+                egui::Layout::right_to_left(Align::Center),
+                |ui| {
+                    let clip_lbl = if n == 1 {
+                        "1 clip".to_string()
                     } else {
-                        self.selected_paths.clear();
-                        self.selected_paths.insert(path);
-                    }
-                    self.sync_preview_for_selection();
-                }
-
-                let sel_n = self.selected_paths.len();
-                if sel_n > 1 {
-                    ui.add_space(6.0);
+                        format!("{n} clips")
+                    };
                     ui.label(
-                        RichText::new(format!(
-                            "{sel_n} selected — preview listens to one clip at a time."
-                        ))
-                        .size(9.0)
-                        .color(Color32::from_rgb(0xc8, 0xb8, 0x90)),
+                        RichText::new(clip_lbl)
+                            .size(12.0)
+                            .color(Color32::from_gray(130)),
                     );
+                },
+            );
+        });
+    }
+
+    fn select_range_to(&mut self, to_path: &Path) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let anchor_path = self
+            .range_anchor_path
+            .as_ref()
+            .cloned()
+            .or_else(|| self.selected_paths.first().cloned())
+            .unwrap_or_else(|| to_path.to_path_buf());
+        let Some(from_idx) = self.entries.iter().position(|e| e.path == anchor_path) else {
+            return;
+        };
+        let Some(to_idx) = self.entries.iter().position(|e| e.path == to_path) else {
+            return;
+        };
+        let (a, b) = if from_idx <= to_idx {
+            (from_idx, to_idx)
+        } else {
+            (to_idx, from_idx)
+        };
+        self.selected_paths.clear();
+        for ent in &self.entries[a..=b] {
+            self.selected_paths.insert(ent.path.clone());
+        }
+    }
+
+    fn nudge_selection_by(&mut self, delta: isize, extend_range: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let current_idx = self
+            .keyboard_focus_path
+            .as_ref()
+            .and_then(|p| self.entries.iter().position(|e| &e.path == p))
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|e| self.selected_paths.contains(&e.path))
+            })
+            .unwrap_or(0);
+        let next_idx = (current_idx as isize + delta)
+            .clamp(0, self.entries.len().saturating_sub(1) as isize) as usize;
+        let next_path = self.entries[next_idx].path.clone();
+        if extend_range {
+            if self.range_anchor_path.is_none() {
+                self.range_anchor_path = Some(self.entries[current_idx].path.clone());
+            }
+            self.select_range_to(&next_path);
+        } else {
+            self.selected_paths.clear();
+            self.selected_paths.insert(next_path.clone());
+            self.range_anchor_path = Some(next_path.clone());
+        }
+        self.keyboard_focus_path = Some(next_path);
+        self.follow_keyboard_focus = true;
+        self.scroll_to_path_once = self.keyboard_focus_path.clone();
+        self.scroll_align_once = Some(if delta >= 0 { Align::BOTTOM } else { Align::TOP });
+        self.sync_preview_for_selection();
+    }
+
+    /// Fixed top block: player / waveform preview.
+    pub fn show_player(&mut self, ui: &mut Ui, ctx: &egui::Context, total_clips_saved: u64) {
+        self.begin_frame(ctx, total_clips_saved);
+        ui.add_space(2.0);
+
+        if let Some(ref e) = self.player_err {
+            ui.label(
+                RichText::new(format!("Could not load clip: {e}"))
+                    .size(9.5)
+                    .color(Color32::from_rgb(220, 120, 120)),
+            );
+            ui.add_space(6.0);
+        }
+
+        let sel_n_listen = self.selected_paths.len();
+        let show_waveform = self.loaded.is_some() && sel_n_listen == 1;
+        if show_waveform {
+            let (dur, ch, sr, samples_len) = {
+                let l = self.loaded.as_ref().unwrap();
+                (
+                    l.duration_sec().max(1e-6),
+                    l.channels,
+                    l.sample_rate,
+                    l.samples.len(),
+                )
+            };
+            self.draw_loaded_waveform_preview(ui, ctx, dur, ch, sr, samples_len);
+        } else {
+            self.draw_preview_placeholder(ui);
+        }
+        ui.add_space(12.0);
+        self.draw_clips_toolbar(ui);
+    }
+
+    /// Ever-extending rows list + row actions (no inner scroller, no boxed card).
+    pub fn show_clips_list(&mut self, ui: &mut Ui, ctx: &egui::Context, total_clips_saved: u64) {
+        self.begin_frame(ctx, total_clips_saved);
+        ui.add_space(2.0);
+
+        // Keep follow mode active only while arrow navigation is physically held.
+        // This avoids snap-back when the user later scrolls manually.
+        self.follow_keyboard_focus = ctx.input(|i| i.key_down(Key::ArrowUp) || i.key_down(Key::ArrowDown));
+
+        if !ctx.egui_wants_keyboard_input() {
+            let shift_held = ctx.input(|i| i.modifiers.shift);
+            if ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
+                self.nudge_selection_by(1, shift_held);
+            } else if ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
+                self.nudge_selection_by(-1, shift_held);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.selected_paths.clear();
+                self.keyboard_focus_path = None;
+                self.follow_keyboard_focus = false;
+                self.range_anchor_path = None;
+                self.scroll_to_path_once = None;
+                self.scroll_align_once = None;
+                self.sync_preview_for_selection();
+            }
+            if ctx.input(|i| i.key_pressed(Key::Delete)) && !self.selected_paths.is_empty() {
+                let paths: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
+                self.delete_prompt = Some(DeletePrompt::Batch { paths });
+            }
+        }
+
+        // Inline list — caller controls scrolling at the tab/panel level.
+        let mut row_action: Option<(PathBuf, bool, bool)> = None;
+        // Any pointer press should cancel pending keyboard follow jumps.
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.follow_keyboard_focus = false;
+            self.scroll_to_path_once = None;
+            self.scroll_align_once = None;
+        }
+        // `left_panel_collapsing` zeros item_spacing on nested uis, so rely on explicit
+        // `add_space` calls to separate the stroked row frames instead of item_spacing.
+        if self.entries.is_empty() {
+            ui.label(
+                RichText::new("No clips yet — arm capture and let the meter cross the threshold.")
+                    .size(9.5)
+                    .color(Color32::from_gray(125)),
+            );
+        } else {
+            for (idx, ent) in self.entries.iter().enumerate() {
+                if idx > 0 {
+                    ui.add_space(CLIP_ROW_GAP);
                 }
-            });
+                let selected = self.selected_paths.contains(&ent.path);
+                let casual = format_clip_captured_casual(ent.modified);
+                let r = draw_clip_row(ui, idx + 1, &casual, selected, idx == 0);
+                let should_follow = self
+                    .scroll_to_path_once
+                    .as_ref()
+                    .or_else(|| {
+                        if self.follow_keyboard_focus {
+                            self.keyboard_focus_path.as_ref()
+                        } else {
+                            None
+                        }
+                    })
+                    .is_some_and(|p| p == &ent.path);
+                if should_follow {
+                    let clip = ui.clip_rect();
+                    let should_scroll = match self.scroll_align_once {
+                        Some(Align::BOTTOM) => r.rect.bottom() > clip.bottom(),
+                        Some(Align::TOP) => r.rect.top() < clip.top(),
+                        _ => !clip.contains_rect(r.rect),
+                    };
+                    if should_scroll {
+                        ui.scroll_to_rect(r.rect, self.scroll_align_once);
+                    }
+                }
+                if r.clicked() {
+                    let mods = r.ctx.input(|i| i.modifiers);
+                    row_action = Some((ent.path.clone(), mods.command, mods.shift));
+                }
+            }
+        }
+        self.scroll_to_path_once = None;
+        self.scroll_align_once = None;
+
+        if let Some((path, cmd_multi, shift_range)) = row_action {
+            if shift_range {
+                self.select_range_to(&path);
+            } else if cmd_multi {
+                if self.selected_paths.contains(&path) {
+                    self.selected_paths.remove(&path);
+                } else {
+                    self.selected_paths.insert(path.clone());
+                }
+            } else if self.selected_paths.contains(&path) {
+                self.selected_paths.remove(&path);
+            } else {
+                self.selected_paths.clear();
+                self.selected_paths.insert(path.clone());
+            }
+            if !shift_range {
+                self.range_anchor_path = Some(path.clone());
+            } else if self.range_anchor_path.is_none() {
+                self.range_anchor_path = Some(path.clone());
+            }
+            self.keyboard_focus_path = Some(path.clone());
+            self.follow_keyboard_focus = false;
+            self.sync_preview_for_selection();
+        }
+
+        let sel_n = self.selected_paths.len();
+        if sel_n > 1 {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "{sel_n} selected — preview listens to one clip at a time."
+                ))
+                .size(9.0)
+                .color(Color32::from_rgb(0xc8, 0xb8, 0x90)),
+            );
+        }
 
         self.draw_delete_prompts(ctx);
+    }
+
+    /// Backward-compatible full layout.
+    pub fn show(&mut self, ui: &mut Ui, ctx: &egui::Context, total_clips_saved: u64) {
+        self.show_player(ui, ctx, total_clips_saved);
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(14.0);
+        self.show_clips_list(ui, ctx, total_clips_saved);
     }
 }
